@@ -9,6 +9,9 @@ export type PresetId =
   | "humid-continental"
   | "tropical-savanna"
 
+/** Northern and southern limit of the latitude slider and the climate model. */
+export const MAX_LATITUDE = 80
+
 export type ClimatePreset = {
   id: PresetId
   name: string
@@ -137,7 +140,7 @@ export function sanitizeMonth(month: MonthClimate): MonthClimate {
 }
 
 function daylightHours(latitude: number, dayOfYear: number): number {
-  const phi = (clamp(latitude, -66, 66) * Math.PI) / 180
+  const phi = (clamp(latitude, -MAX_LATITUDE, MAX_LATITUDE) * Math.PI) / 180
   const decl =
     ((23.45 * Math.PI) / 180) * Math.sin((2 * Math.PI * (284 + dayOfYear)) / 365)
   const cosHour = -Math.tan(phi) * Math.tan(decl)

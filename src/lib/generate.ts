@@ -1,4 +1,4 @@
-import { climateFactor, deriveClimate, lakeMinDepth } from "@/lib/climate"
+import { MAX_LATITUDE, climateFactor, deriveClimate, lakeMinDepth } from "@/lib/climate"
 import { clamp, createNoise, hashSeed, mulberry32, smoothstep } from "@/lib/noise"
 import {
   Feature,
@@ -121,6 +121,40 @@ function coastAmount(
   return smoothstep(shore + 0.07, shore - 0.05, across)
 }
 
+/** Drop sea that cannot reach the map border through other sea. */
+function keepSeaOnEdge(sea: Uint8Array, width: number, height: number) {
+  const n = width * height
+  const open = new Uint8Array(n)
+  const stack = new Int32Array(n)
+  let top = 0
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      if (x !== 0 && y !== 0 && x !== width - 1 && y !== height - 1) continue
+      const i = y * width + x
+      if (!sea[i]) continue
+      open[i] = 1
+      stack[top++] = i
+    }
+  }
+  while (top > 0) {
+    const i = stack[--top]
+    const x = i % width
+    const y = (i / width) | 0
+    for (let k = 0; k < 4; k++) {
+      const nx = x + DX[k]
+      const ny = y + DY[k]
+      if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue
+      const j = ny * width + nx
+      if (!sea[j] || open[j]) continue
+      open[j] = 1
+      stack[top++] = j
+    }
+  }
+  for (let i = 0; i < n; i++) {
+    if (sea[i] && !open[i]) sea[i] = 0
+  }
+}
+
 function buildElevation(
   width: number,
   height: number,
@@ -128,16 +162,38 @@ function buildElevation(
   coast: Coast,
   seed: number,
   onProgress?: ProgressFn,
-): { elev: Float32Array; sea: Uint8Array } {
+): { elev: Float32Array; sea: Uint8Array; shore: Uint8Array } {
   const noise = createNoise(seed)
-  const elev = new Float32Array(width * height)
-  const sea = new Uint8Array(width * height)
+  const n = width * height
+  const elev = new Float32Array(n)
+  const sea = new Uint8Array(n)
+  const shore = new Uint8Array(n)
   const reliefAmp = 0.06 + (clamp(relief, 0, 100) / 100) * 0.52
+  const alongCoast = coast === "north" || coast === "south"
+  const acrossCoast = coast === "east" || coast === "west"
+  const span = Math.min(width, height)
+  const riseFull = span * 0.55
+  const ridgeStart = span * 0.18
+  const ridgeFull = span * 0.4
+
+  if (coast !== "none") {
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const seaAmt = coastAmount(noise.fbm01, x, y, width, height, coast)
+        if (seaAmt > 0.58) sea[y * width + x] = 1
+      }
+    }
+    keepSeaOnEdge(sea, width, height)
+  }
+
+  const fromSea = coast === "none" ? null : edt(sea, width, height)
+
   for (let y = 0; y < height; y++) {
     if (onProgress && y % 64 === 0) {
       onProgress(0.04 + 0.18 * (y / height), "Shaping terrain")
     }
     for (let x = 0; x < width; x++) {
+      const i = y * width + x
       const warp = 1 / 150
       const wx = noise.simplex(x * warp, y * warp)
       const wy = noise.simplex(x * warp + 19.2, y * warp + 7.4)
@@ -146,38 +202,58 @@ function buildElevation(
       const roll = noise.fbm01(px / 96, py / 96, 5)
       const clump = noise.fbm01(x / 168 + 40, y / 168 + 13, 3)
       const mask = smoothstep(0.56, 0.8, clump)
-      const ridge = noise.ridged(px / 34, py / 34, 4)
-      const mountains = mask * ridge * reliefAmp
+      const ridgeScaleX = alongCoast ? 84 : 34
+      const ridgeScaleY = acrossCoast ? 84 : 34
+      const ridge = noise.ridged(px / ridgeScaleX, py / ridgeScaleY, 4)
       const bowlN = noise.fbm01(x / 120 + 17, y / 120 + 4, 4)
       const bowl = smoothstep(0.48, 0.22, bowlN)
       const bowlIrreg = noise.fbm01(px / 42 + 6, py / 42, 3)
       const bowlDepth = bowl * (0.05 + 0.2 * smoothstep(0.22, 0.82, bowlIrreg))
-      const bowls = bowlDepth * (1 - mask * 0.8)
+      let mountains = mask * ridge * reliefAmp
+      let bowls = bowlDepth * (1 - mask * 0.8)
       let value = 0.5 + (roll - 0.5) * 0.16 + mountains - bowls
-      const seaAmt = coastAmount(noise.fbm01, x, y, width, height, coast)
-      if (seaAmt > 0) {
-        const seaElev = 0.16 + noise.fbm01(x / 40 + 2, y / 40, 3) * 0.06
-        value = value * (1 - seaAmt) + seaElev * seaAmt
+      if (fromSea) {
+        if (sea[i]) {
+          value = 0.16 + noise.fbm01(x / 40 + 2, y / 40, 3) * 0.06
+        } else {
+          const distance = fromSea[i]
+          const shelf = smoothstep(0, riseFull, distance)
+          const ridgeGate = smoothstep(ridgeStart, ridgeFull, distance)
+          mountains *= ridgeGate
+          bowls *= ridgeGate
+          value = 0.26 + shelf * 0.24 + (roll - 0.5) * 0.1 + mountains - bowls
+          if (distance < ridgeStart) shore[i] = 1
+        }
       }
-      const i = y * width + x
       elev[i] = clamp(value, 0, 1)
-      sea[i] = seaAmt > 0.58 ? 1 : 0
     }
   }
-  return { elev, sea }
+  return { elev, sea, shore }
 }
 
-function slopeAt(elev: Float32Array, width: number, height: number, x: number, y: number): {
+function slopeAt(
+  elev: Float32Array,
+  sea: Uint8Array,
+  width: number,
+  height: number,
+  x: number,
+  y: number,
+): {
   slope: number
   gdx: number
   gdy: number
 } {
+  const center = elev[y * width + x]
+  const at = (sx: number, sy: number) => {
+    const index = sy * width + sx
+    return sea[index] ? center : elev[index]
+  }
   const xm = x > 0 ? x - 1 : x
   const xp = x + 1 < width ? x + 1 : x
   const ym = y > 0 ? y - 1 : y
   const yp = y + 1 < height ? y + 1 : y
-  const gdx = elev[y * width + xp] - elev[y * width + xm]
-  const gdy = elev[yp * width + x] - elev[ym * width + x]
+  const gdx = at(xp, y) - at(xm, y)
+  const gdy = at(x, yp) - at(x, ym)
   const slope = Math.hypot(gdx / (xp - xm || 1), gdy / (yp - ym || 1))
   return { slope, gdx, gdy }
 }
@@ -694,13 +770,20 @@ export function generateDetailed(
   const height = size
   const n = width * height
   const months = request.months.map((month) => ({ ...month }))
-  const latitude = clamp(request.latitude, -55, 55)
+  const latitude = clamp(request.latitude, -MAX_LATITUDE, MAX_LATITUDE)
   const indices = deriveClimate(latitude, months)
   const factor = climateFactor(indices)
   const seed = hashSeed(request.seed.trim() || "0")
   onProgress?.(0.02, "Reading the climate")
 
-  const { elev, sea } = buildElevation(width, height, request.relief, request.coast, seed, onProgress)
+  const { elev, sea, shore } = buildElevation(
+    width,
+    height,
+    request.relief,
+    request.coast,
+    seed,
+    onProgress,
+  )
   onProgress?.(0.24, "Classing slopes")
 
   const slope = new Float32Array(n)
@@ -714,12 +797,14 @@ export function generateDetailed(
         landform[i] = Terrain.Sea
         continue
       }
-      const sample = slopeAt(elev, width, height, x, y)
+      const sample = slopeAt(elev, sea, width, height, x, y)
       slope[i] = sample.slope
       const bucket = clamp(Math.floor(sample.slope / 0.0005), 0, 199)
       slopeBuckets[bucket]++
       slopeSamples++
-      if (elev[i] >= MOUNTAIN_ELEV || sample.slope >= MOUNTAIN_SLOPE) landform[i] = Terrain.Mountain
+      const mountain =
+        !shore[i] && (elev[i] >= MOUNTAIN_ELEV || sample.slope >= MOUNTAIN_SLOPE)
+      if (mountain) landform[i] = Terrain.Mountain
       else if (elev[i] >= HILL_ELEV || sample.slope >= HILL_SLOPE) landform[i] = Terrain.Hill
       else landform[i] = Terrain.Flat
     }
@@ -805,7 +890,7 @@ export function generateDetailed(
         feature[i] = Feature.Barren
         continue
       }
-      const gradient = slopeAt(elev, width, height, x, y)
+      const gradient = slopeAt(elev, sea, width, height, x, y)
       const score = indices.aridity + aspectAdjust(gradient.gdx, gradient.gdy, slope[i], latitude)
       const field = noise.fbm01(x / 84, y / 84, 3)
       const clearing = noise.fbm01(x / 30 + 20, y / 30 + 9, 2)

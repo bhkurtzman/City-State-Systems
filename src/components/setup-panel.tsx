@@ -14,6 +14,7 @@ import {
 } from "@/components/ui/select"
 import { Slider } from "@/components/ui/slider"
 import {
+  MAX_LATITUDE,
   MONTH_LABELS,
   PRESETS,
   aridityLabel,
@@ -58,6 +59,16 @@ type SetupPanelProps = {
   onRelief: (value: number) => void
   onCoast: (coast: Coast) => void
   onGenerate: () => void
+}
+
+function randomSeed(): string {
+  const alphabet = "abcdefghijkmnopqrstuvwxyz23456789"
+  let seed = ""
+  for (let i = 0; i < 8; i++) {
+    if (i === 4) seed += "-"
+    seed += alphabet[Math.floor(Math.random() * alphabet.length)]
+  }
+  return seed
 }
 
 function numberValue(raw: string, fallback: number): number {
@@ -108,8 +119,8 @@ export function SetupPanel(props: SetupPanelProps) {
             </div>
             <Slider
               id="latitude"
-              min={-55}
-              max={55}
+              min={-MAX_LATITUDE}
+              max={MAX_LATITUDE}
               step={0.1}
               value={[props.latitude]}
               onValueChange={(value) => {
@@ -209,7 +220,18 @@ export function SetupPanel(props: SetupPanelProps) {
 
         <div className="grid gap-3">
           <div className="grid gap-1.5">
-            <Label htmlFor="seed">Seed</Label>
+            <div className="flex items-center justify-between gap-2">
+              <Label htmlFor="seed">Seed</Label>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                disabled={props.generating}
+                onClick={() => props.onSeed(randomSeed())}
+              >
+                Randomize
+              </Button>
+            </div>
             <Input
               id="seed"
               value={props.seed}
