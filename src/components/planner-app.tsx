@@ -10,6 +10,7 @@ import {
   deriveClimate,
   presetById,
   sanitizeMonth,
+  temperaturesForLatitude,
   type PresetId,
 } from "@/lib/climate"
 import { runGeneration } from "@/lib/run-generation"
@@ -21,6 +22,7 @@ const INITIAL = presetById("mediterranean")
 export function PlannerApp() {
   const [presetId, setPresetId] = useState<PresetId>(INITIAL.id)
   const [latitude, setLatitude] = useState(INITIAL.latitude)
+  const [latitudeDrivesTemp, setLatitudeDrivesTemp] = useState(false)
   const [months, setMonths] = useState<MonthClimate[]>(cloneMonths(INITIAL.months))
   const [seed, setSeed] = useState("cistern-4")
   const [size, setSize] = useState<MapSize>(256)
@@ -85,6 +87,7 @@ export function PlannerApp() {
           <SetupPanel
             presetId={presetId}
             latitude={latitude}
+            latitudeDrivesTemp={latitudeDrivesTemp}
             months={months}
             indices={indices}
             seed={seed}
@@ -101,7 +104,16 @@ export function PlannerApp() {
               setLatitude(preset.latitude)
               setMonths(cloneMonths(preset.months))
             }}
-            onLatitude={setLatitude}
+            onLatitude={(next) => {
+              setLatitude(next)
+              if (!latitudeDrivesTemp) return
+              setMonths((current) => temperaturesForLatitude(presetById(presetId), next, current))
+            }}
+            onLatitudeDrivesTemp={(drives) => {
+              setLatitudeDrivesTemp(drives)
+              if (!drives) return
+              setMonths((current) => temperaturesForLatitude(presetById(presetId), latitude, current))
+            }}
             onMonth={(index, key, value) => {
               setMonths((current) =>
                 current.map((month, monthIndex) =>

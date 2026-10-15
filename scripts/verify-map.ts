@@ -172,7 +172,7 @@ const mediterranean = PRESETS.find((preset) => preset.id === "mediterranean")!
 const med = deriveClimate(mediterranean.latitude, mediterranean.months)
 check(Math.round(med.annualPrecip) === 804, `Mediterranean rain ${med.annualPrecip}`)
 check(Math.abs(med.meanTemp - 15.7) < 0.15, `Mediterranean mean ${med.meanTemp}`)
-check(med.frostMonths === 0 && med.growingMonths === 12, "Mediterranean frost and growing season")
+check(med.frostMonths === 1 && med.growingMonths === 11, "Mediterranean frost and growing season")
 check(med.aridity > 0.9 && med.aridity < 1.05, `Mediterranean aridity ${med.aridity}`)
 
 const desertPreset = PRESETS.find((preset) => preset.id === "hot-desert")!
@@ -210,15 +210,22 @@ check(humidRun.diagnostics.lakeBasins >= 1 && humidRun.diagnostics.lakeCells > 8
 check(humidCover.hill > 0 && humidCover.hillForest / humidCover.hill >= 0.7, "Humid hills are not forested")
 check(humidCover.flatPrairie > 800, `Humid prairie ${humidCover.flatPrairie}`)
 check(humidCover.wetFar > 40, `Humid sink wetlands ${humidCover.wetFar}`)
-check(desertRun.diagnostics.maxMountainSpan < 180, `Mountain span ${desertRun.diagnostics.maxMountainSpan}`)
+const desertMountains = desertRun.diagnostics.terrain[Terrain.Mountain]
+check(
+  desertMountains > 500 && desertMountains < 14000,
+  `Desert mountain cells ${desertMountains}`,
+)
+check(
+  desertRun.diagnostics.maxMountainSpan > 70,
+  `Mountain span ${desertRun.diagnostics.maxMountainSpan}`,
+)
 
 const deposits = resourceStats(desertRun.world)
 console.log("deposits", deposits)
-check(deposits.blobs >= 3 && deposits.blobs <= 8, `Blob count ${deposits.blobs}`)
-check(deposits.meanSpan >= 40 && deposits.meanSpan <= 75, `Blob span ${deposits.meanSpan}`)
+check(deposits.blobs === 1, `Blob count ${deposits.blobs}`)
+check(deposits.meanSpan >= 40 && deposits.meanSpan <= 280, `Blob span ${deposits.meanSpan}`)
 check(deposits.holes === 0, `Resource holes ${deposits.holes}`)
-check(deposits.seaWith === 0, "Sea received a deposit")
-check(deposits.freshWith > 0, "No river cell kept a mineral")
+check(deposits.seaWith === 0, "A map with no sea still received a sea deposit")
 check(desertCover.freshFertility === 0 && desertCover.seaGroundwater === 0, "Water fertility or sea groundwater")
 check(humidCover.freshGroundwater === 0, "Open water groundwater is not full")
 
@@ -236,6 +243,17 @@ for (let y = 0; y < 256; y++) {
 }
 check(sea > 4000 && sea < 40000, `Coast sea cells ${sea}`)
 check(shoreMax - shoreMin > 30, "Coast is not a rough shoreline")
+let coastSeaResource = 0
+for (let i = 0; i < 256 * 256; i++) {
+  if (coast.world.terrain[i] === Terrain.Sea && coast.world.resourceType[i] !== 0) coastSeaResource++
+}
+let humidFreshResource = 0
+for (let i = 0; i < humidRun.world.resourceType.length; i++) {
+  if (humidRun.world.terrain[i] === Terrain.Fresh && humidRun.world.resourceType[i] !== 0) humidFreshResource++
+}
+console.log("coast deposits", { seaWith: coastSeaResource, humidFreshWith: humidFreshResource })
+check(coastSeaResource > 0, "A coastal map kept every deposit on land")
+check(humidFreshResource > 0, "No river cell kept a mineral")
 
 const medium = generateWorld(request("humid-subtropical", 512))
 check(medium.terrain.length === 512 * 512, "Medium map has the wrong length")

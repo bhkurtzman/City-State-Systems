@@ -41,6 +41,7 @@ const SIZES: { id: MapSize; label: string }[] = [
 type SetupPanelProps = {
   presetId: PresetId
   latitude: number
+  latitudeDrivesTemp: boolean
   months: MonthClimate[]
   indices: ClimateIndices
   seed: string
@@ -53,6 +54,7 @@ type SetupPanelProps = {
   error: string | null
   onPreset: (id: PresetId) => void
   onLatitude: (value: number) => void
+  onLatitudeDrivesTemp: (drives: boolean) => void
   onMonth: (index: number, key: keyof MonthClimate, value: number) => void
   onSeed: (value: string) => void
   onSize: (size: MapSize) => void
@@ -113,8 +115,18 @@ export function SetupPanel(props: SetupPanelProps) {
           </div>
 
           <div className="grid gap-1.5">
-            <div className="flex items-center justify-between">
+            <div className="flex items-center justify-between gap-2">
               <Label htmlFor="latitude">Latitude</Label>
+              <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                <input
+                  id="latitude-drives-temp"
+                  type="checkbox"
+                  className="size-3.5 accent-primary"
+                  checked={props.latitudeDrivesTemp}
+                  onChange={(event) => props.onLatitudeDrivesTemp(event.target.checked)}
+                />
+                Temps follow latitude
+              </label>
               <span className="text-xs text-muted-foreground">{props.latitude.toFixed(1)}°</span>
             </div>
             <Slider
@@ -152,6 +164,7 @@ export function SetupPanel(props: SetupPanelProps) {
                   type="number"
                   min={-45}
                   max={55}
+                  disabled={props.latitudeDrivesTemp}
                   value={month.high}
                   onChange={(event) =>
                     props.onMonth(index, "high", numberValue(event.target.value, month.high))
@@ -163,6 +176,7 @@ export function SetupPanel(props: SetupPanelProps) {
                   type="number"
                   min={-55}
                   max={45}
+                  disabled={props.latitudeDrivesTemp}
                   value={month.low}
                   onChange={(event) =>
                     props.onMonth(index, "low", numberValue(event.target.value, month.low))
@@ -198,7 +212,10 @@ export function SetupPanel(props: SetupPanelProps) {
             ))}
           </div>
           <p className="text-xs text-muted-foreground">
-            High and low are °C. Rain is mm, from 0 to 800. Humidity is a percent.
+            {props.latitudeDrivesTemp
+              ? "High and low follow this preset at the chosen latitude. "
+              : "High and low are °C. "}
+            Rain is mm, from 0 to 800. Humidity is a percent.
           </p>
         </div>
 

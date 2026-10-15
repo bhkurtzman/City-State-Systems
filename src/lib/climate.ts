@@ -1,4 +1,4 @@
-import { clamp } from "@/lib/noise"
+import { clamp, smoothstep } from "@/lib/noise"
 import type { ClimateIndices, MonthClimate } from "@/lib/types"
 
 export type PresetId =
@@ -130,6 +130,47 @@ export function cloneMonths(monthsIn: MonthClimate[]): MonthClimate[] {
   return monthsIn.map((month) => ({ ...month }))
 }
 
+/** Annual-mean cooling, °C, for each degree of latitude away from the equator. */
+const COOLING_PER_DEGREE = 0.35
+
+function roundTenth(value: number): number {
+  return Math.round(value * 10) / 10
+}
+
+/**
+ * High and low for a preset placed at `latitude`.
+ * The preset's own latitude reproduces its table. Farther from the equator is cooler
+ * and more seasonal. The opposite hemisphere swaps the warm and cold months.
+ * Rain and humidity stay on `monthsIn`.
+ */
+export function temperaturesForLatitude(
+  preset: ClimatePreset,
+  latitude: number,
+  monthsIn: MonthClimate[],
+): MonthClimate[] {
+  const lat = clamp(latitude, -MAX_LATITUDE, MAX_LATITUDE)
+  const baseLat = preset.latitude
+  const means = preset.months.map((month) => (month.high + month.low) / 2)
+  const annual = means.reduce((sum, mean) => sum + mean, 0) / means.length
+  const season = Math.abs(lat) / MAX_LATITUDE
+  const baseSeason = Math.abs(baseLat) / MAX_LATITUDE
+  const scale = baseSeason === 0 ? 1 : season / baseSeason
+  const cool = COOLING_PER_DEGREE * (Math.abs(lat) - Math.abs(baseLat))
+  const flip = lat !== 0 && baseLat !== 0 && Math.sign(lat) !== Math.sign(baseLat)
+  return monthsIn.map((month, index) => {
+    const source = preset.months[flip ? (index + 6) % 12 : index]
+    const mean = (source.high + source.low) / 2
+    const shifted = annual + (mean - annual) * scale - cool
+    const delta = shifted - mean
+    return sanitizeMonth({
+      high: roundTenth(source.high + delta),
+      low: roundTenth(source.low + delta),
+      precip: month.precip,
+      humidity: month.humidity,
+    })
+  })
+}
+
 export function sanitizeMonth(month: MonthClimate): MonthClimate {
   return {
     high: clamp(month.high, -45, 55),
@@ -174,8 +215,9 @@ export function deriveClimate(latitude: number, monthsIn: MonthClimate[]): Clima
   }
   const annualPrecip = clean.reduce((sum, month) => sum + month.precip, 0)
   const meanTemp = means.reduce((sum, mean) => sum + mean, 0) / 12
-  const frostMonths = clean.filter((month) => month.low <= 0).length
-  const growingMonths = means.filter((mean) => mean >= 5).length
+  const frostFree = (month: MonthClimate) => month.low >= 4
+  const frostMonths = clean.filter((month) => !frostFree(month)).length
+  const growingMonths = clean.filter((month) => frostFree(month) && month.high >= 10).length
   const aridity = pet < 1 ? (annualPrecip > 0 ? 99 : 0) : annualPrecip / pet
   const summerIdx = latitude >= 0 ? [5, 6, 7] : [11, 0, 1]
   const summerHigh =
@@ -221,8 +263,8 @@ export function formatFrost(monthsCount: number): string {
   return monthsCount === 1 ? "1 month" : `${monthsCount} months`
 }
 
+/** Shallow ponds in humid climates, deep basins only where it is arid. */
 export function lakeMinDepth(aridity: number): number {
-  if (aridity >= 0.4) return 0.18
-  if (aridity >= 0.1) return 0.38
-  return 0.55
+  const humid = smoothstep(0.08, 1.05, aridity)
+  return 0.46 - 0.34 * humid
 }

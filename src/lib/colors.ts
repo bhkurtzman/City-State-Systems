@@ -70,8 +70,9 @@ function ramp(value: number, low: RGB, mid: RGB, high: RGB): RGB {
 export function sampleCell(world: World, layer: LayerId, index: number): RGB {
   const terrain = world.terrain[index]
   if (layer === "resources") {
-    if (terrain === Terrain.Sea) return [176, 196, 206]
-    return RESOURCE_RGB[world.resourceType[index] as ResourceId] ?? RESOURCE_RGB[Resource.None]
+    const resource = world.resourceType[index]
+    if (terrain === Terrain.Sea && resource === 0) return [176, 196, 206]
+    return RESOURCE_RGB[resource as ResourceId] ?? RESOURCE_RGB[Resource.None]
   }
   if (terrain === Terrain.Sea) return TERRAIN_RGB[Terrain.Sea]
   if (terrain === Terrain.Fresh && layer !== "terrain") return TERRAIN_RGB[Terrain.Fresh]
@@ -137,7 +138,7 @@ export function legendFor(layer: LayerId): { swatches: Swatch[]; note?: string }
     }
   }
   return {
-    note: "Each blob is one mineral. A river keeps the deposit; the sea has none.",
+    note: "Each blob is one mineral. A deposit continues under a river and under the sea.",
     swatches: [
       { label: "Limestone", hex: hex(RESOURCE_RGB[Resource.Limestone]) },
       { label: "Iron", hex: hex(RESOURCE_RGB[Resource.Iron]) },

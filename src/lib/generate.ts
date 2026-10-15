@@ -1,5 +1,5 @@
 import { MAX_LATITUDE, climateFactor, deriveClimate, lakeMinDepth } from "@/lib/climate"
-import { clamp, createNoise, hashSeed, mulberry32, smoothstep } from "@/lib/noise"
+import { clamp, createNoise, hashSeed, mulberry32, smoothstep, type Noise } from "@/lib/noise"
 import {
   Feature,
   Resource,
@@ -30,11 +30,8 @@ const DX = [1, -1, 0, 0, 1, 1, -1, -1]
 const DY = [0, 0, 1, -1, 1, -1, 1, -1]
 
 const HILL_SLOPE = 0.0075
-const MOUNTAIN_SLOPE = 0.016
-const HILL_ELEV = 0.6
-const MOUNTAIN_ELEV = 0.72
-const RIVER_SOURCE = 70
 const FLOOD_EPS = 0.012
+const SEA_LEVEL = 0.32
 const LAKE_MIN_AREA = 16
 const OPEN_RADIUS = 6
 
@@ -115,9 +112,11 @@ function coastAmount(
         : coast === "west"
           ? x / (width - 1)
           : 1 - x / (width - 1)
-  const bay = noise01(x / 46 + 3.2, y / 46 + 8.4, 5)
-  const detail = noise01(x / 18 + 11, y / 18 + 2.5, 3)
-  const shore = 0.3 + (bay - 0.5) * 0.34 + (detail - 0.5) * 0.12
+  const span = Math.min(width, height)
+  const bay = noise01(x / (span * 0.24) + 3.2, y / (span * 0.24) + 8.4, 2)
+  const rough = smoothstep(0.4, 0.74, noise01(x / (span * 0.42) + 1.4, y / (span * 0.42) + 6.2, 2))
+  const teeth = noise01(x / (span * 0.1) + 11, y / (span * 0.1) + 2.5, 2)
+  const shore = 0.3 + (bay - 0.5) * 0.36 + rough * (teeth - 0.5) * 0.28
   return smoothstep(shore + 0.07, shore - 0.05, across)
 }
 
@@ -155,26 +154,82 @@ function keepSeaOnEdge(sea: Uint8Array, width: number, height: number) {
   }
 }
 
+function uplandAt(
+  noise: Noise,
+  x: number,
+  y: number,
+  span: number,
+  coast: Coast,
+  relief: number,
+  reliefAmp: number,
+  ridgeGate: number,
+): { lift: number; kind: number } {
+  const reliefT = clamp(relief, 0, 100) / 100
+  if (reliefT < 0.1 || ridgeGate <= 0) return { lift: 0, kind: Terrain.Flat }
+
+  const hillPresence = smoothstep(0.1, 0.36, reliefT)
+  const mountainPresence = smoothstep(0.26, 0.55, reliefT)
+  const band = smoothstep(0.5, 0.95, reliefT)
+  const warpFreq = 1 / (span * 0.6)
+  const wx = noise.simplex(x * warpFreq, y * warpFreq)
+  const wy = noise.simplex(x * warpFreq + 19.2, y * warpFreq + 7.4)
+  const px = x + wx * span * 0.05
+  const py = y + wy * span * 0.05
+  const along = coast === "east" || coast === "west" ? Math.PI / 2 : 0
+  const bend = coast === "none" ? 0.45 : 0.35
+  const turn = along + noise.simplex(x / (span * 0.8) + 4.2, y / (span * 0.8) + 8.1) * bend
+  const c = Math.cos(turn)
+  const s = Math.sin(turn)
+  const length = span * 0.85
+  const width = span * 0.82
+  const rx = px * c - py * s
+  const ry = px * s + py * c
+  const sharp = noise.ridged(rx / length, ry / width, 1)
+  const spine = Math.pow(Math.max(sharp, 0), 0.84 - 0.3 * band)
+  const faded = spine * (0.55 + 0.45 * ridgeGate) * (0.72 + 0.28 * hillPresence)
+  const roughScale = span * (0.1 + 0.04 * (1 - reliefT))
+  const rough = Math.pow(
+    Math.max(noise.ridged(px / roughScale + 6, py / (roughScale * 0.85) + 14, 1), 0),
+    0.75,
+  )
+  const jagged = smoothstep(0.55, 0.84, rough)
+  const crestBase = smoothstep(0.72 - 0.24 * band, 0.9 - 0.1 * band, faded)
+  const breakT = smoothstep(0.32, 0.5, reliefT) * (1 - smoothstep(0.6, 0.84, reliefT))
+  const crest = crestBase * (1 - breakT * 0.5 * (1 - jagged))
+  const foothill = smoothstep(0.58 - 0.22 * band, 0.78 - 0.14 * band, faded)
+  const broad = Math.pow(
+    Math.max(noise.ridged(px / (span * 0.22) + 3, py / (span * 0.18) + 11, 1), 0),
+    0.65,
+  )
+  const clump = noise.fbm01(px / (span * 0.34) + 2, py / (span * 0.34) + 8, 2)
+  const hillMask = smoothstep(0.55 - 0.16 * reliefT, 0.78 - 0.1 * reliefT, clump)
+  const extra = smoothstep(0.66, 0.86, broad) * hillMask * smoothstep(0.34, 0.75, reliefT) * ridgeGate
+  const lift = (crest + foothill * 0.48) * reliefAmp + extra * reliefAmp * 0.55
+  if (crest >= 0.4 && mountainPresence >= 0.4) return { lift, kind: Terrain.Mountain }
+  if (foothill >= 0.4 || extra >= 0.48) return { lift, kind: Terrain.Hill }
+  return { lift, kind: Terrain.Flat }
+}
+
 function buildElevation(
   width: number,
   height: number,
   relief: number,
   coast: Coast,
   seed: number,
+  aridity: number,
   onProgress?: ProgressFn,
-): { elev: Float32Array; sea: Uint8Array; shore: Uint8Array } {
+): { elev: Float32Array; sea: Uint8Array; upland: Uint8Array } {
   const noise = createNoise(seed)
   const n = width * height
   const elev = new Float32Array(n)
   const sea = new Uint8Array(n)
-  const shore = new Uint8Array(n)
-  const reliefAmp = 0.06 + (clamp(relief, 0, 100) / 100) * 0.52
-  const alongCoast = coast === "north" || coast === "south"
-  const acrossCoast = coast === "east" || coast === "west"
+  const upland = new Uint8Array(n)
+  const reliefAmp = 0.05 + (clamp(relief, 0, 100) / 100) * 0.58
+  const humid = smoothstep(0.08, 1.05, aridity)
   const span = Math.min(width, height)
   const riseFull = span * 0.55
-  const ridgeStart = span * 0.18
-  const ridgeFull = span * 0.4
+  const taperNear = span * 0.012
+  const taperFar = span * 0.45
 
   if (coast !== "none") {
     for (let y = 0; y < height; y++) {
@@ -194,41 +249,31 @@ function buildElevation(
     }
     for (let x = 0; x < width; x++) {
       const i = y * width + x
-      const warp = 1 / 150
-      const wx = noise.simplex(x * warp, y * warp)
-      const wy = noise.simplex(x * warp + 19.2, y * warp + 7.4)
-      const px = x + wx * 26
-      const py = y + wy * 26
-      const roll = noise.fbm01(px / 96, py / 96, 5)
-      const clump = noise.fbm01(x / 168 + 40, y / 168 + 13, 3)
-      const mask = smoothstep(0.56, 0.8, clump)
-      const ridgeScaleX = alongCoast ? 84 : 34
-      const ridgeScaleY = acrossCoast ? 84 : 34
-      const ridge = noise.ridged(px / ridgeScaleX, py / ridgeScaleY, 4)
-      const bowlN = noise.fbm01(x / 120 + 17, y / 120 + 4, 4)
+      const roll = noise.fbm01(x / (span * 0.42), y / (span * 0.42), 3)
+      const bowlN = noise.fbm01(x / (span * 0.5) + 17, y / (span * 0.5) + 4, 3)
       const bowl = smoothstep(0.48, 0.22, bowlN)
-      const bowlIrreg = noise.fbm01(px / 42 + 6, py / 42, 3)
-      const bowlDepth = bowl * (0.05 + 0.2 * smoothstep(0.22, 0.82, bowlIrreg))
-      let mountains = mask * ridge * reliefAmp
-      let bowls = bowlDepth * (1 - mask * 0.8)
-      let value = 0.5 + (roll - 0.5) * 0.16 + mountains - bowls
-      if (fromSea) {
-        if (sea[i]) {
-          value = 0.16 + noise.fbm01(x / 40 + 2, y / 40, 3) * 0.06
-        } else {
-          const distance = fromSea[i]
-          const shelf = smoothstep(0, riseFull, distance)
-          const ridgeGate = smoothstep(ridgeStart, ridgeFull, distance)
-          mountains *= ridgeGate
-          bowls *= ridgeGate
-          value = 0.26 + shelf * 0.24 + (roll - 0.5) * 0.1 + mountains - bowls
-          if (distance < ridgeStart) shore[i] = 1
-        }
+      const bowlIrreg = noise.fbm01(x / (span * 0.18) + 6, y / (span * 0.18), 2)
+      const bowlDepth = bowl * (0.03 + 0.08 * humid + 0.09 * smoothstep(0.22, 0.82, bowlIrreg))
+      if (sea[i]) {
+        const bath = noise.fbm01(x / (span * 0.16) + 2, y / (span * 0.16), 2)
+        elev[i] = clamp(SEA_LEVEL - 0.02 - bath * 0.035, 0, SEA_LEVEL - 0.008)
+        continue
       }
-      elev[i] = clamp(value, 0, 1)
+      let ridgeGate = 1
+      let base = 0.5 + (roll - 0.5) * 0.1
+      if (fromSea) {
+        const distance = fromSea[i]
+        const shelf = smoothstep(0, riseFull, distance)
+        ridgeGate = smoothstep(taperNear, taperFar, distance)
+        base = SEA_LEVEL + 0.012 + shelf * 0.055 + (roll - 0.5) * 0.035
+      }
+      const range = uplandAt(noise, x, y, span, coast, relief, reliefAmp, ridgeGate)
+      const bowls = bowlDepth * (range.kind === Terrain.Mountain ? 0.25 : 1) * ridgeGate
+      upland[i] = range.kind
+      elev[i] = clamp(base + range.lift - bowls, 0, 1)
     }
   }
-  return { elev, sea, shore }
+  return { elev, sea, upland }
 }
 
 function slopeAt(
@@ -396,14 +441,86 @@ function markBasins(
   return { lake, failed, lakeBasins }
 }
 
+function boxBlur(src: Float32Array, width: number, height: number, radius: number): Float32Array {
+  const tmp = new Float32Array(src.length)
+  const out = new Float32Array(src.length)
+  const prefixW = new Float64Array(width + 1)
+  for (let y = 0; y < height; y++) {
+    const row = y * width
+    prefixW[0] = 0
+    for (let x = 0; x < width; x++) prefixW[x + 1] = prefixW[x] + src[row + x]
+    for (let x = 0; x < width; x++) {
+      const a = Math.max(0, x - radius)
+      const b = Math.min(width - 1, x + radius)
+      tmp[row + x] = (prefixW[b + 1] - prefixW[a]) / (b - a + 1)
+    }
+  }
+  const prefixH = new Float64Array(height + 1)
+  for (let x = 0; x < width; x++) {
+    prefixH[0] = 0
+    for (let y = 0; y < height; y++) prefixH[y + 1] = prefixH[y] + tmp[y * width + x]
+    for (let y = 0; y < height; y++) {
+      const a = Math.max(0, y - radius)
+      const b = Math.min(height - 1, y + radius)
+      out[y * width + x] = (prefixH[b + 1] - prefixH[a]) / (b - a + 1)
+    }
+  }
+  return out
+}
+
+function hash01(x: number, y: number): number {
+  let h = Math.imul(x | 0, 374761393) + Math.imul(y | 0, 668265263)
+  h = Math.imul(h ^ (h >>> 13), 1274126177)
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296
+}
+
+function valueNoise(x: number, y: number, scale: number): number {
+  const fx = x / scale
+  const fy = y / scale
+  const x0 = Math.floor(fx)
+  const y0 = Math.floor(fy)
+  const tx = fx - x0
+  const ty = fy - y0
+  const sx = tx * tx * (3 - 2 * tx)
+  const sy = ty * ty * (3 - 2 * ty)
+  const v00 = hash01(x0, y0)
+  const v10 = hash01(x0 + 1, y0)
+  const v01 = hash01(x0, y0 + 1)
+  const v11 = hash01(x0 + 1, y0 + 1)
+  return v00 + (v10 - v00) * sx + (v01 - v00) * sy + (v00 - v10 - v01 + v11) * sx * sy
+}
+
+function outletDistance(parent: Int32Array, n: number): Int32Array {
+  const dist = new Int32Array(n)
+  dist.fill(-1)
+  const state = new Uint8Array(n)
+  const stack: number[] = []
+  for (let i = 0; i < n; i++) {
+    let j = i
+    stack.length = 0
+    while (j >= 0 && state[j] === 0) {
+      state[j] = 1
+      stack.push(j)
+      j = parent[j]
+    }
+    let base = j >= 0 && state[j] === 2 ? dist[j] + 1 : 0
+    for (let s = stack.length - 1; s >= 0; s--) {
+      dist[stack[s]] = base
+      base++
+      state[stack[s]] = 2
+    }
+  }
+  return dist
+}
+
 function flowDown(
   elev: Float32Array,
   water: Float32Array,
-  pfDown: Int32Array,
   sea: Uint8Array,
   lake: Uint8Array,
   width: number,
   height: number,
+  guide: Uint8Array | null,
 ): Int32Array {
   const n = width * height
   const surface = new Float32Array(n)
@@ -414,45 +531,98 @@ function flowDown(
     else if (lake[i]) surface[i] = elev[i]
     else surface[i] = water[i]
   }
+  const span = Math.min(width, height)
+  const radius = guide ? 2 : Math.max(4, Math.round(span * 0.028))
+  const field = boxBlur(surface, width, height, radius)
+  const meanderScale = Math.max(16, Math.round(span * 0.14))
+  const valleyScale = Math.max(28, Math.round(span * 0.22))
+  const meanderAmp = guide ? 0.003 : 0.02
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const i = y * width + x
+      if (sea[i]) field[i] = -0.25
+      else if (lake[i]) field[i] = elev[i] - 0.04
+      else {
+        if (!guide) field[i] += (valueNoise(x + 8, y + 63, valleyScale) - 0.5) * 0.04
+        field[i] += (valueNoise(x, y, meanderScale) - 0.5) * meanderAmp
+      }
+    }
+  }
+  const drained = priorityFlood(field, sea, width, height)
+  const heightField = drained.water
+  const dist = outletDistance(drained.pfDown, n)
+  const at = (grid: Float32Array, x: number, y: number) =>
+    grid[Math.max(0, Math.min(height - 1, y)) * width + Math.max(0, Math.min(width - 1, x))]
+
   for (let y = 0; y < height; y++) {
     for (let x = 0; x < width; x++) {
       const i = y * width + x
       if (sea[i] || lake[i]) continue
+      let gx = at(heightField, x + 1, y) - at(heightField, x - 1, y)
+      let gy = at(heightField, x, y + 1) - at(heightField, x, y - 1)
+      const mag = Math.hypot(gx, gy)
+      if (mag > 1e-8) {
+        gx = -gx / mag
+        gy = -gy / mag
+      }
       let best = -1
-      let bestSlope = 0
+      let bestScore = -Infinity
       for (let k = 0; k < 8; k++) {
         const nx = x + DX[k]
         const ny = y + DY[k]
         if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue
         const j = ny * width + nx
-        const dist = k < 4 ? 1 : Math.SQRT2
-        const slope = (surface[i] - surface[j]) / dist
-        if (slope > bestSlope + 1e-8) {
-          bestSlope = slope
+        const intoLake = lake[j] === 1
+        const dropField = heightField[i] - heightField[j]
+        const closer = dist[j] >= 0 && dist[i] >= 0 && dist[j] < dist[i]
+        if (!intoLake && !(dropField > 1e-7 || (dropField >= -1e-7 && closer))) continue
+        if (intoLake && surface[j] > surface[i] + 0.02) continue
+        const step = k < 4 ? 1 : Math.SQRT2
+        const toward = mag > 1e-8 ? (DX[k] * gx + DY[k] * gy) / step : 0
+        if (!intoLake && mag > 0.004 && toward < 0.55) continue
+        let score = toward + ((surface[i] - surface[j]) / step) * 3
+        if (guide?.[j]) score += guide[i] ? 1.5 : 0.8
+        if (j === drained.pfDown[i]) score += 0.04
+        if (score > bestScore) {
+          bestScore = score
           best = j
         }
       }
-      down[i] = bestSlope > 1e-7 ? best : pfDown[i]
+      down[i] = best >= 0 ? best : drained.pfDown[i]
     }
   }
   return down
 }
 
-function paintRivers(
+function streamMoisture(annualPrecip: number, aridity: number): number {
+  const rain = smoothstep(40, 1500, annualPrecip)
+  const humid = smoothstep(0.05, 1, aridity)
+  return clamp(0.7 * rain + 0.3 * humid, 0, 1)
+}
+
+function traceRivers(
   down: Int32Array,
   sea: Uint8Array,
   lake: Uint8Array,
+  failed: Uint8Array,
   landform: Uint8Array,
   width: number,
   height: number,
-): Uint8Array {
+  relief: number,
+  annualPrecip: number,
+  aridity: number,
+): { channel: Uint8Array; accum: Int32Array } {
   const n = width * height
   const indeg = new Int32Array(n)
+  const joins = new Int32Array(n)
   const accum = new Int32Array(n)
   for (let i = 0; i < n; i++) {
     accum[i] = 1
     const d = down[i]
-    if (d >= 0 && d !== i) indeg[d]++
+    if (d >= 0 && d !== i) {
+      indeg[d]++
+      joins[d]++
+    }
   }
   const queue = new Int32Array(n)
   let qh = 0
@@ -467,13 +637,21 @@ function paintRivers(
     if (indeg[d] === 0) queue[qt++] = d
   }
 
+  const span = Math.min(width, height)
+  const reliefT = clamp(relief, 0, 100) / 100
+  const areaScale = (span / 256) * (span / 256)
+  // Cells are 10 m on every map, so a catchment that grows with map area
+  // hides hill and mountain streams on large maps. Ease that growth.
+  const steepScale = (span / 256) ** 1.5
+  const moisture = streamMoisture(annualPrecip, aridity)
+  const drain = 2.4 - 2 * moisture
+  const steepMin = Math.max(20, Math.round((70 + 260 * reliefT * reliefT) * steepScale * drain))
+  const flatMin = Math.max(steepMin, Math.round(1600 * areaScale * drain))
+  const wetlandMin = Math.max(24, Math.round(140 * areaScale * drain))
   const channel = new Uint8Array(n)
-  for (let i = 0; i < n; i++) {
-    if (sea[i] || lake[i]) continue
-    const form = landform[i]
-    if (form !== Terrain.Hill && form !== Terrain.Mountain) continue
-    if (accum[i] < RIVER_SOURCE) continue
-    let j = i
+
+  const start = (origin: number) => {
+    let j = origin
     for (let guard = 0; guard < n && j >= 0; guard++) {
       if (sea[j] || lake[j]) break
       channel[j] = 1
@@ -482,8 +660,166 @@ function paintRivers(
       j = next
     }
   }
-  assertRivers(channel, down, sea, lake, landform, width, height)
-  return channel
+
+  for (let i = 0; i < n; i++) {
+    if (sea[i] || lake[i]) continue
+    const steep = landform[i] === Terrain.Hill || landform[i] === Terrain.Mountain
+    const converged = joins[i] >= 2 || accum[i] >= steepMin * 3
+    if (steep && accum[i] >= steepMin && (reliefT < 0.55 || converged)) start(i)
+    else if (!steep && reliefT <= 0.4 && accum[i] >= flatMin) start(i)
+  }
+  if (reliefT <= 0.35) {
+    const seen = new Uint8Array(n)
+    const stack = new Int32Array(n)
+    for (let i = 0; i < n; i++) {
+      if (!failed[i] || seen[i]) continue
+      let top = 0
+      stack[top++] = i
+      seen[i] = 1
+      let bestExit = -1
+      let bestAccum = -1
+      while (top > 0) {
+        const c = stack[--top]
+        const next = down[c]
+        if (
+          accum[c] >= wetlandMin &&
+          next >= 0 &&
+          !sea[next] &&
+          !lake[next] &&
+          !failed[next] &&
+          accum[c] > bestAccum
+        ) {
+          bestAccum = accum[c]
+          bestExit = next
+        }
+        const x = c % width
+        const y = (c / width) | 0
+        for (let k = 0; k < 4; k++) {
+          const nx = x + DX[k]
+          const ny = y + DY[k]
+          if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue
+          const j = ny * width + nx
+          if (!failed[j] || seen[j]) continue
+          seen[j] = 1
+          stack[top++] = j
+        }
+      }
+      if (bestExit >= 0) start(bestExit)
+    }
+  }
+
+  return { channel, accum }
+}
+
+function channelWidths(channel: Uint8Array, down: Int32Array, n: number): Int32Array {
+  const width = new Int32Array(n)
+  const incoming = new Int32Array(n)
+  const pending = new Int32Array(n)
+  for (let i = 0; i < n; i++) {
+    if (!channel[i]) continue
+    const d = down[i]
+    if (d >= 0 && d !== i && channel[d]) pending[d]++
+  }
+  const queue = new Int32Array(n)
+  let qh = 0
+  let qt = 0
+  for (let i = 0; i < n; i++) if (channel[i] && pending[i] === 0) queue[qt++] = i
+  while (qh < qt) {
+    const i = queue[qh++]
+    width[i] = incoming[i] > 0 ? incoming[i] : 1
+    const d = down[i]
+    if (d < 0 || d === i || !channel[d]) continue
+    incoming[d] += width[i]
+    pending[d]--
+    if (pending[d] === 0) queue[qt++] = d
+  }
+  return width
+}
+
+function widenChannels(
+  channel: Uint8Array,
+  width: Int32Array,
+  sea: Uint8Array,
+  mapW: number,
+  mapH: number,
+): Uint8Array {
+  const wide = new Uint8Array(channel)
+  for (let i = 0; i < channel.length; i++) {
+    if (!channel[i]) continue
+    const span = width[i] > 1 ? width[i] : 1
+    if (span <= 1) continue
+    const x = i % mapW
+    const y = (i / mapW) | 0
+    const radius = span / 2
+    const reach = Math.ceil(radius)
+    const limit2 = radius * radius + 1e-4
+    for (let oy = -reach; oy <= reach; oy++) {
+      const ny = y + oy
+      if (ny < 0 || ny >= mapH) continue
+      for (let ox = -reach; ox <= reach; ox++) {
+        if (ox * ox + oy * oy > limit2) continue
+        const nx = x + ox
+        if (nx < 0 || nx >= mapW) continue
+        const j = ny * mapW + nx
+        if (sea[j]) continue
+        wide[j] = 1
+      }
+    }
+  }
+  for (let y = 0; y < mapH; y++) {
+    for (let x = 0; x < mapW; x++) {
+      const i = y * mapW + x
+      if (wide[i] || sea[i]) continue
+      const has = (ox: number, oy: number) => {
+        const nx = x + ox
+        const ny = y + oy
+        if (nx < 0 || ny < 0 || nx >= mapW || ny >= mapH) return false
+        return wide[ny * mapW + nx] === 1
+      }
+      if ((has(-1, 0) && has(1, 0)) || (has(0, -1) && has(0, 1))) wide[i] = 1
+    }
+  }
+  return wide
+}
+
+function carveValleys(
+  elev: Float32Array,
+  channel: Uint8Array,
+  accum: Int32Array,
+  landform: Uint8Array,
+  sea: Uint8Array,
+  width: number,
+  height: number,
+  reliefT: number,
+) {
+  const n = width * height
+  let maxAccum = 1
+  for (let i = 0; i < n; i++) if (channel[i] && accum[i] > maxAccum) maxAccum = accum[i]
+  const logMax = Math.log2(1 + maxAccum)
+  const cut = new Float32Array(n)
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const i = y * width + x
+      if (!channel[i]) continue
+      const share = Math.log2(1 + accum[i]) / logMax
+      const inRange = landform[i] === Terrain.Hill || landform[i] === Terrain.Mountain
+      const depth = (0.018 + 0.06 * reliefT) * (0.4 + 0.6 * share) * (inRange ? 1.7 : 0.7)
+      if (depth > cut[i]) cut[i] = depth
+      for (let k = 0; k < 4; k++) {
+        const nx = x + DX[k]
+        const ny = y + DY[k]
+        if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue
+        const j = ny * width + nx
+        if (sea[j] || channel[j]) continue
+        const shoulder = depth * 0.45
+        if (shoulder > cut[j]) cut[j] = shoulder
+        if (inRange && landform[j] === Terrain.Mountain && depth >= 0.016) landform[j] = Terrain.Hill
+      }
+    }
+  }
+  for (let i = 0; i < n; i++) {
+    if (cut[i] > 0) elev[i] = clamp(elev[i] - cut[i], 0, 1)
+  }
 }
 
 function assertRivers(
@@ -491,7 +827,6 @@ function assertRivers(
   down: Int32Array,
   sea: Uint8Array,
   lake: Uint8Array,
-  landform: Uint8Array,
   width: number,
   height: number,
 ) {
@@ -525,19 +860,6 @@ function assertRivers(
         break
       }
       j = step
-    }
-  }
-  const inflow = new Uint8Array(n)
-  for (let i = 0; i < n; i++) {
-    if (!channel[i]) continue
-    const d = down[i]
-    if (d >= 0 && channel[d]) inflow[d] = 1
-  }
-  for (let i = 0; i < n; i++) {
-    if (!channel[i] || inflow[i]) continue
-    const form = landform[i]
-    if (form !== Terrain.Hill && form !== Terrain.Mountain) {
-      throw new Error("A river headwater is not on steep ground.")
     }
   }
 }
@@ -639,8 +961,15 @@ function aspectAdjust(gdx: number, gdy: number, slope: number, latitude: number)
   return facesSouth ? 0.2 : -0.2
 }
 
+function gaussian(rng: () => number): number {
+  let u = 0
+  let v = 0
+  while (u === 0) u = rng()
+  while (v === 0) v = rng()
+  return Math.sqrt(-2 * Math.log(u)) * Math.cos(Math.PI * 2 * v)
+}
+
 function placeResources(
-  sea: Uint8Array,
   width: number,
   height: number,
   seed: number,
@@ -668,15 +997,14 @@ function placeResources(
     }
     return Resource.Limestone
   }
-  const blobCount = Math.max(1, Math.round((5 * width * height) / (256 * 256)))
-  const centers: { x: number; y: number; type: number }[] = []
+  const blobCount = Math.max(1, Math.round((width * height) / (256 * 256)))
+  const centers: { x: number; y: number; type: number; scale: number }[] = []
   let sep = 76 * (width / 256)
   let guard = 0
   while (centers.length < blobCount && guard < 12000) {
     guard++
     const x = Math.floor(rng() * width)
     const y = Math.floor(rng() * height)
-    if (sea[y * width + x]) continue
     let clear = true
     for (const center of centers) {
       const dx = center.x - x
@@ -690,11 +1018,13 @@ function placeResources(
       if (guard % 500 === 0) sep *= 0.86
       continue
     }
-    centers.push({ x, y, type: pick() })
+    // Current outline is the low end. A normal draw reaches about five times that.
+    const scale = clamp(3 + gaussian(rng), 1, 5)
+    centers.push({ x, y, type: pick(), scale })
   }
   const noise = createNoise(seed ^ 0x27d4eb2f)
-  const reach = 40
   for (const center of centers) {
+    const reach = Math.ceil(center.scale * 26 * 1.08)
     const x0 = Math.max(0, center.x - reach)
     const x1 = Math.min(width - 1, center.x + reach)
     const y0 = Math.max(0, center.y - reach)
@@ -702,12 +1032,14 @@ function placeResources(
     for (let y = y0; y <= y1; y++) {
       for (let x = x0; x <= x1; x++) {
         const i = y * width + x
-        if (sea[i]) continue
         const dx = x - center.x
         const dy = y - center.y
         const dist = Math.hypot(dx, dy)
-        const warp = noise.simplex(x / 16, y / 16)
-        const radius = 26 * (0.88 + 0.2 * (warp * 0.5 + 0.5))
+        const nominal = center.scale * 26
+        const px = dist === 0 ? center.x : center.x + (dx / dist) * nominal
+        const py = dist === 0 ? center.y : center.y + (dy / dist) * nominal
+        const warp = noise.simplex(px / 16, py / 16)
+        const radius = nominal * (0.88 + 0.2 * (warp * 0.5 + 0.5))
         if (dist > radius) continue
         const norm = dist / radius
         if (norm >= claim[i]) continue
@@ -776,46 +1108,62 @@ export function generateDetailed(
   const seed = hashSeed(request.seed.trim() || "0")
   onProgress?.(0.02, "Reading the climate")
 
-  const { elev, sea, shore } = buildElevation(
+  const { elev, sea, upland } = buildElevation(
     width,
     height,
     request.relief,
     request.coast,
     seed,
+    indices.aridity,
     onProgress,
   )
   onProgress?.(0.24, "Classing slopes")
 
   const slope = new Float32Array(n)
   const landform = new Uint8Array(n)
-  const slopeBuckets = new Int32Array(200)
-  let slopeSamples = 0
-  for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) {
-      const i = y * width + x
-      if (sea[i]) {
-        landform[i] = Terrain.Sea
-        continue
-      }
-      const sample = slopeAt(elev, sea, width, height, x, y)
-      slope[i] = sample.slope
-      const bucket = clamp(Math.floor(sample.slope / 0.0005), 0, 199)
-      slopeBuckets[bucket]++
-      slopeSamples++
-      const mountain =
-        !shore[i] && (elev[i] >= MOUNTAIN_ELEV || sample.slope >= MOUNTAIN_SLOPE)
-      if (mountain) landform[i] = Terrain.Mountain
-      else if (elev[i] >= HILL_ELEV || sample.slope >= HILL_SLOPE) landform[i] = Terrain.Hill
-      else landform[i] = Terrain.Flat
-    }
+  for (let i = 0; i < n; i++) {
+    if (sea[i]) landform[i] = Terrain.Sea
+    else if (upland[i] === Terrain.Mountain) landform[i] = Terrain.Mountain
+    else if (upland[i] === Terrain.Hill) landform[i] = Terrain.Hill
+    else landform[i] = Terrain.Flat
   }
 
   onProgress?.(0.36, "Finding lakes")
   const { water, pfDown } = priorityFlood(elev, sea, width, height)
   const basins = markBasins(elev, water, pfDown, sea, indices.aridity, width, height)
-  const down = flowDown(elev, water, pfDown, sea, basins.lake, width, height)
-  onProgress?.(0.58, "Tracing rivers")
-  const channel = paintRivers(down, sea, basins.lake, landform, width, height)
+  const draftDown = flowDown(elev, water, sea, basins.lake, width, height, null)
+  onProgress?.(0.5, "Tracing rivers")
+  const draft = traceRivers(
+    draftDown,
+    sea,
+    basins.lake,
+    basins.failed,
+    landform,
+    width,
+    height,
+    request.relief,
+    indices.annualPrecip,
+    indices.aridity,
+  )
+  carveValleys(elev, draft.channel, draft.accum, landform, sea, width, height, request.relief / 100)
+  const channel = draft.channel
+  assertRivers(channel, draftDown, sea, basins.lake, width, height)
+  const sized = channelWidths(channel, draftDown, n)
+  const wide = widenChannels(channel, sized, sea, width, height)
+
+  const slopeBuckets = new Int32Array(200)
+  let slopeSamples = 0
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const i = y * width + x
+      if (sea[i]) continue
+      const sample = slopeAt(elev, sea, width, height, x, y)
+      slope[i] = sample.slope
+      const bucket = clamp(Math.floor(sample.slope / 0.0005), 0, 199)
+      slopeBuckets[bucket]++
+      slopeSamples++
+    }
+  }
 
   const terrain = new Uint8Array(landform)
   let lakeCells = 0
@@ -831,7 +1179,7 @@ export function generateDetailed(
       lakeCells++
       continue
     }
-    if (channel[i]) {
+    if (wide[i]) {
       terrain[i] = Terrain.Fresh
       riverCells++
     }
@@ -953,7 +1301,7 @@ export function generateDetailed(
   }
 
   onProgress?.(0.92, "Placing deposits")
-  const resources = placeResources(sea, width, height, seed)
+  const resources = placeResources(width, height, seed)
   onProgress?.(1, "Map ready")
 
   const terrainCounts = [0, 0, 0, 0, 0]
