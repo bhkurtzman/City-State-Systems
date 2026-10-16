@@ -537,14 +537,28 @@ function flowDown(
   const meanderScale = Math.max(16, Math.round(span * 0.14))
   const valleyScale = Math.max(28, Math.round(span * 0.22))
   const meanderAmp = guide ? 0.003 : 0.02
+  const flatness = new Float32Array(n)
+  const atBlur = (x: number, y: number) =>
+    field[Math.max(0, Math.min(height - 1, y)) * width + Math.max(0, Math.min(width - 1, x))]
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const i = y * width + x
+      if (sea[i] || lake[i]) continue
+      const gx = atBlur(x + 1, y) - atBlur(x - 1, y)
+      const gy = atBlur(x, y + 1) - atBlur(x, y - 1)
+      flatness[i] = 1 - smoothstep(0.0008, 0.004, Math.hypot(gx, gy))
+    }
+  }
   for (let y = 0; y < height; y++) {
     for (let x = 0; x < width; x++) {
       const i = y * width + x
       if (sea[i]) field[i] = -0.25
       else if (lake[i]) field[i] = elev[i] - 0.04
       else {
-        if (!guide) field[i] += (valueNoise(x + 8, y + 63, valleyScale) - 0.5) * 0.04
-        field[i] += (valueNoise(x, y, meanderScale) - 0.5) * meanderAmp
+        const flat = flatness[i]
+        const meanderKeep = 0.3 + 0.7 * (1 - flat)
+        if (!guide) field[i] += (valueNoise(x + 8, y + 63, valleyScale) - 0.5) * 0.04 * (1 - flat)
+        field[i] += (valueNoise(x, y, meanderScale) - 0.5) * meanderAmp * meanderKeep
       }
     }
   }
@@ -582,7 +596,7 @@ function flowDown(
         if (!intoLake && mag > 0.004 && toward < 0.55) continue
         let score = toward + ((surface[i] - surface[j]) / step) * 3
         if (guide?.[j]) score += guide[i] ? 1.5 : 0.8
-        if (j === drained.pfDown[i]) score += 0.04
+        if (j === drained.pfDown[i]) score += 0.04 + 0.85 * flatness[i]
         if (score > bestScore) {
           bestScore = score
           best = j

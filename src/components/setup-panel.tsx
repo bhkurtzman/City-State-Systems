@@ -48,10 +48,6 @@ type SetupPanelProps = {
   size: MapSize
   relief: number
   coast: Coast
-  generating: boolean
-  progress: number
-  stage: string
-  error: string | null
   onPreset: (id: PresetId) => void
   onLatitude: (value: number) => void
   onLatitudeDrivesTemp: (drives: boolean) => void
@@ -60,7 +56,6 @@ type SetupPanelProps = {
   onSize: (size: MapSize) => void
   onRelief: (value: number) => void
   onCoast: (coast: Coast) => void
-  onGenerate: () => void
 }
 
 function randomSeed(): string {
@@ -84,14 +79,6 @@ export function SetupPanel(props: SetupPanelProps) {
   return (
     <ScrollArea className="h-full">
       <div className="flex flex-col gap-4 p-4">
-        <div className="space-y-1">
-          <h2 className="text-sm font-semibold">Ground before the city</h2>
-          <p className="text-sm leading-relaxed text-muted-foreground">
-            Choose a climate, then generate the 10 m grid the city-state would sit on.
-            The same seed and settings always rebuild the same terrain, water, cover, and deposits.
-          </p>
-        </div>
-
         <div className="grid gap-3">
           <div className="grid gap-1.5">
             <Label htmlFor="preset">Climate preset</Label>
@@ -243,7 +230,6 @@ export function SetupPanel(props: SetupPanelProps) {
                 type="button"
                 variant="outline"
                 size="sm"
-                disabled={props.generating}
                 onClick={() => props.onSeed(randomSeed())}
               >
                 Randomize
@@ -316,39 +302,6 @@ export function SetupPanel(props: SetupPanelProps) {
               </SelectContent>
             </Select>
           </div>
-        </div>
-
-        <div className="grid gap-2">
-          <Button
-            id="generate-map"
-            type="button"
-            className="w-full"
-            size="lg"
-            disabled={props.generating}
-            onClick={props.onGenerate}
-          >
-            {props.generating ? "Generating…" : "Generate map"}
-          </Button>
-          {props.generating ? (
-            <div className="grid gap-1">
-              <div className="h-1.5 overflow-hidden rounded-full bg-muted">
-                <div
-                  className="h-full bg-primary transition-[width]"
-                  style={{ width: `${Math.round(props.progress * 100)}%` }}
-                />
-              </div>
-              <p className="text-xs text-muted-foreground">{props.stage}</p>
-            </div>
-          ) : null}
-          {props.error ? (
-            <p className="text-sm text-destructive" role="alert">
-              {props.error}
-            </p>
-          ) : null}
-          <p className="text-xs leading-relaxed text-muted-foreground">
-            Nothing is stored. The grid stays in this tab. Cover, fertility, and groundwater
-            read the indices above, not the month table itself.
-          </p>
         </div>
       </div>
     </ScrollArea>

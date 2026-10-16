@@ -1,38 +1,45 @@
 "use client"
 
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
-import { ScrollArea } from "@/components/ui/scroll-area"
+import { Button } from "@/components/ui/button"
+import { Card, CardAction, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { CELL_M, FEATURE_NAME, RESOURCE_NAME, TERRAIN_NAME, type FeatureId, type ResourceId, type TerrainId, type World } from "@/lib/types"
 
 type InspectorPanelProps = {
   world: World | null
   cell: { x: number; y: number } | null
+  open: boolean
+  onToggle: () => void
 }
 
-export function InspectorPanel({ world, cell }: InspectorPanelProps) {
+export function InspectorPanel({ world, cell, open, onToggle }: InspectorPanelProps) {
+  if (!open) {
+    return (
+      <Button type="button" variant="outline" size="sm" onClick={onToggle}>
+        Cell inspector
+      </Button>
+    )
+  }
+
   return (
-    <ScrollArea className="h-full">
-      <div className="p-4">
-        <Card>
-          <CardHeader>
-            <CardTitle>Cell inspector</CardTitle>
-            <CardDescription>
-              {world
-                ? "Choose a cell on the map."
-                : "Generate a grid, then choose a cell."}
-            </CardDescription>
-          </CardHeader>
-          <CardContent>
-            {world && cell ? <CellReadout world={world} x={cell.x} y={cell.y} /> : (
-              <p className="text-sm leading-relaxed text-muted-foreground">
-                The readout lists terrain, cover, fertility, groundwater, and any mineral under
-                the pointer. It does not list people or ownership. Those records are not on this grid.
-              </p>
-            )}
-          </CardContent>
-        </Card>
-      </div>
-    </ScrollArea>
+    <Card className="max-h-full w-72 overflow-auto shadow-md">
+      <CardHeader>
+        <CardTitle>Cell inspector</CardTitle>
+        <CardDescription>Choose a cell on the map.</CardDescription>
+        <CardAction>
+          <Button type="button" variant="outline" size="sm" onClick={onToggle}>
+            Minimize
+          </Button>
+        </CardAction>
+      </CardHeader>
+      <CardContent>
+        {world && cell ? <CellReadout world={world} x={cell.x} y={cell.y} /> : (
+          <p className="text-sm leading-relaxed text-muted-foreground">
+            The readout lists terrain, cover, fertility, groundwater, and any mineral under
+            the pointer. It does not list people or ownership. Those records are not on this grid.
+          </p>
+        )}
+      </CardContent>
+    </Card>
   )
 }
 

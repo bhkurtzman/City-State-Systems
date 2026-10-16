@@ -1,9 +1,21 @@
 "use client"
 
-import { useMemo, useState } from "react"
+import { useMemo, useRef, useState } from "react"
 import { InspectorPanel } from "@/components/inspector-panel"
-import { MapPane } from "@/components/map-pane"
+import { LedgerPanel, type LedgerId } from "@/components/ledger-panel"
+import { MapPane, type MapPaneHandle } from "@/components/map-pane"
 import { SetupPanel } from "@/components/setup-panel"
+import { WeatherIcon } from "@/components/weather-icon"
+import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
+import { Label } from "@/components/ui/label"
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import {
   cloneMonths,
@@ -13,11 +25,121 @@ import {
   temperaturesForLatitude,
   type PresetId,
 } from "@/lib/climate"
+import {
+  advancePeople,
+  beginFertility,
+  citizenCensus,
+  DIFFICULTIES,
+  foundPeople,
+  noteMonth,
+  type DifficultyId,
+  type FertilityLedger,
+  type People,
+} from "@/lib/people"
 import { runGeneration } from "@/lib/run-generation"
-import type { Coast, LayerId, MapSize, MonthClimate, World } from "@/lib/types"
+import { monthWeather } from "@/lib/weather"
+import { LAYERS, type Coast, type LayerId, type MapSize, type MonthClimate, type World } from "@/lib/types"
 import { cn } from "@/lib/utils"
 
 const INITIAL = presetById("mediterranean")
+const CALENDAR_MONTHS = [
+  "January",
+  "February",
+  "March",
+  "April",
+  "May",
+  "June",
+  "July",
+  "August",
+  "September",
+  "October",
+  "November",
+  "December",
+] as const
+const OPENING_MONTH = 6
+
+const LINEAGES = [
+  "Nordic",
+  "Germanic",
+  "Celtic",
+  "Slavic",
+  "Latin",
+  "Turkic",
+  "Steppe nomad",
+  "Levantine",
+  "Far-Eastern",
+  "Bantu",
+  "Nilotic",
+  "Melanesian",
+] as const
+
+type Lineage = (typeof LINEAGES)[number]
+
+const FOUNDERS = [
+  { id: "warrior", label: "Warrior", treasury: 50_000, families: 30 },
+  { id: "merchant", label: "Merchant", treasury: 200_000, families: 10 },
+  { id: "explorer", label: "Explorer", treasury: 25_000, families: 40 },
+] as const
+
+type FounderId = (typeof FOUNDERS)[number]["id"]
+
+const REGIONS = [
+  "West Europe",
+  "East Europe",
+  "MENA",
+  "South Asia",
+  "East Asia",
+  "North America",
+  "South America",
+  "Oceania",
+  "Sub-Sahara",
+] as const
+
+type Region = (typeof REGIONS)[number]
+
+function founderById(id: FounderId) {
+  return FOUNDERS.find((founder) => founder.id === id) ?? FOUNDERS[0]
+}
+
+function formatMoney(value: number): string {
+  return `$${value.toLocaleString("en-US")}`
+}
+
+function BarStat({
+  label,
+  value,
+  pressed,
+  onClick,
+}: {
+  label: string
+  value: string
+  pressed: boolean
+  onClick: () => void
+}) {
+  return (
+    <button
+      type="button"
+      aria-pressed={pressed}
+      onClick={onClick}
+      className={cn(
+        "rounded-md px-1.5 py-0.5 text-left leading-tight hover:bg-muted",
+        pressed && "bg-muted",
+      )}
+    >
+      <div className="text-[10px] font-medium tracking-wide text-muted-foreground uppercase">
+        {label}
+      </div>
+      <div className="text-sm font-medium tabular-nums">{value}</div>
+    </button>
+  )
+}
+
+function readYear(raw: string): number | null {
+  if (!/^-?\d+$/.test(raw.trim())) return null
+  const year = Number(raw)
+  if (!Number.isSafeInteger(year) || year < -9999 || year > 9999) return null
+  return year
+}
 
 export function PlannerApp() {
   const [presetId, setPresetId] = useState<PresetId>(INITIAL.id)
@@ -31,14 +153,37 @@ export function PlannerApp() {
   const [world, setWorld] = useState<World | null>(null)
   const [layer, setLayer] = useState<LayerId>("terrain")
   const [cell, setCell] = useState<{ x: number; y: number } | null>(null)
-  const [panel, setPanel] = useState("setup")
+  const [screen, setScreen] = useState<"start" | "play">("start")
+  const [inspectorOpen, setInspectorOpen] = useState(true)
   const [generating, setGenerating] = useState(false)
   const [progress, setProgress] = useState(0)
   const [stage, setStage] = useState("Preparing the grid")
   const [error, setError] = useState<string | null>(null)
   const [generation, setGeneration] = useState(0)
+  const [stateName, setStateName] = useState("")
+  const [foundedName, setFoundedName] = useState("")
+  const [nationalityName, setNationalityName] = useState("")
+  const [lineages, setLineages] = useState<Lineage[]>([])
+  const [founderId, setFounderId] = useState<FounderId>("warrior")
+  const [difficulty, setDifficulty] = useState<DifficultyId>("medium")
+  const [region, setRegion] = useState<Region>("West Europe")
+  const [treasury, setTreasury] = useState(FOUNDERS[0].treasury)
+  const [people, setPeople] = useState<People | null>(null)
+  const [fertility, setFertility] = useState<FertilityLedger | null>(null)
+  const [ledger, setLedger] = useState<LedgerId | null>(null)
+  const [foundingYear, setFoundingYear] = useState(1)
+  const [foundedYear, setFoundedYear] = useState(1)
+  const [calendarMonth, setCalendarMonth] = useState(OPENING_MONTH)
+  const [calendarYear, setCalendarYear] = useState(1)
+  const mapRef = useRef<MapPaneHandle>(null)
 
+  const population = people?.age.length ?? 0
+  const citizens = useMemo(() => (people ? citizenCensus(people) : null), [people])
   const indices = useMemo(() => deriveClimate(latitude, months), [latitude, months])
+  const weather = useMemo(
+    () => monthWeather(seed.trim() || "0", calendarYear, calendarMonth, months[calendarMonth]),
+    [seed, calendarYear, calendarMonth, months],
+  )
 
   async function generate() {
     setGenerating(true)
@@ -65,7 +210,24 @@ export function PlannerApp() {
       setCell((current) =>
         current && current.x < next.size && current.y < next.size ? current : null,
       )
-      if (window.matchMedia("(max-width: 767px)").matches) setPanel("map")
+      const founder = founderById(founderId)
+      setFoundedName(stateName.trim())
+      setTreasury(founder.treasury)
+      const founded = foundPeople(
+        seed.trim() || "0",
+        founder.id,
+        founder.families,
+        foundingYear,
+        OPENING_MONTH,
+        difficulty,
+      )
+      setPeople(founded)
+      setFertility(beginFertility(foundingYear, OPENING_MONTH, founded))
+      setLedger(null)
+      setFoundedYear(foundingYear)
+      setCalendarMonth(OPENING_MONTH)
+      setCalendarYear(foundingYear)
+      setScreen("play")
     } catch (caught) {
       const message = caught instanceof Error ? caught.message : "The generator failed."
       setError(`The map could not be generated. ${message}`)
@@ -74,96 +236,370 @@ export function PlannerApp() {
     }
   }
 
-  return (
-    <div className="flex h-dvh flex-col bg-background text-foreground">
-      <header className="shrink-0 border-b px-4 py-3">
-        <h1 className="text-lg font-semibold tracking-tight">City-state planning map</h1>
-        <p className="text-sm text-muted-foreground">
-          A 10 m grid for the ground under a city that does not exist yet.
-        </p>
-      </header>
-      <div className="grid min-h-0 flex-1 grid-rows-[minmax(0,1fr)] md:grid-cols-[minmax(300px,380px)_minmax(0,1fr)_minmax(240px,320px)] md:grid-rows-1">
-        <section className={cn("min-h-0", panel === "setup" ? "block" : "hidden", "md:block")}>
-          <SetupPanel
-            presetId={presetId}
-            latitude={latitude}
-            latitudeDrivesTemp={latitudeDrivesTemp}
-            months={months}
-            indices={indices}
-            seed={seed}
-            size={size}
-            relief={relief}
-            coast={coast}
-            generating={generating}
-            progress={progress}
-            stage={stage}
-            error={error}
-            onPreset={(id) => {
-              const preset = presetById(id)
-              setPresetId(preset.id)
-              setLatitude(preset.latitude)
-              setMonths(cloneMonths(preset.months))
+  if (screen === "play" && world) {
+    return (
+      <div className="flex h-dvh flex-col bg-background text-foreground">
+        <header className="flex shrink-0 flex-wrap items-center gap-2 border-b px-2 py-1.5">
+          <Button type="button" variant="outline" size="sm" onClick={() => setScreen("start")}>
+            Menu
+          </Button>
+          <Tabs
+            value={layer}
+            onValueChange={(value) => {
+              if (typeof value === "string") setLayer(value as LayerId)
             }}
-            onLatitude={(next) => {
-              setLatitude(next)
-              if (!latitudeDrivesTemp) return
-              setMonths((current) => temperaturesForLatitude(presetById(presetId), next, current))
-            }}
-            onLatitudeDrivesTemp={(drives) => {
-              setLatitudeDrivesTemp(drives)
-              if (!drives) return
-              setMonths((current) => temperaturesForLatitude(presetById(presetId), latitude, current))
-            }}
-            onMonth={(index, key, value) => {
-              setMonths((current) =>
-                current.map((month, monthIndex) =>
-                  monthIndex === index ? sanitizeMonth({ ...month, [key]: value }) : month,
-                ),
-              )
-            }}
-            onSeed={setSeed}
-            onSize={setSize}
-            onRelief={setRelief}
-            onCoast={setCoast}
-            onGenerate={() => {
-              void generate()
-            }}
-          />
-        </section>
-        <section
-          className={cn(
-            "min-h-0",
-            panel === "map" ? "flex flex-col" : "hidden",
-            "md:flex md:flex-col",
-          )}
-        >
+          >
+            <TabsList className="h-auto flex-wrap">
+              {LAYERS.map((item) => (
+                <TabsTrigger key={item.id} value={item.id}>
+                  {item.label}
+                </TabsTrigger>
+              ))}
+            </TabsList>
+          </Tabs>
+          <div className="ml-auto flex items-center gap-3">
+            <div className="flex items-center gap-2 border-r pr-3">
+              <BarStat
+                label="Population"
+                value={population.toLocaleString("en-US")}
+                pressed={ledger === "population"}
+                onClick={() => setLedger((current) => (current === "population" ? null : "population"))}
+              />
+              <BarStat
+                label="Treasury"
+                value={formatMoney(treasury)}
+                pressed={ledger === "treasury"}
+                onClick={() => setLedger((current) => (current === "treasury" ? null : "treasury"))}
+              />
+            </div>
+            <div className="flex items-center gap-1">
+              <Button type="button" variant="outline" size="sm" onClick={() => mapRef.current?.zoomBy(1 / 1.2)}>
+                −
+              </Button>
+              <Button type="button" variant="outline" size="sm" onClick={() => mapRef.current?.zoomBy(1.2)}>
+                +
+              </Button>
+              <Button type="button" variant="outline" size="sm" onClick={() => mapRef.current?.fit()}>
+                Fit
+              </Button>
+            </div>
+            <div className="flex items-start gap-3">
+              {foundedName ? (
+                <div className="max-w-40 truncate pt-px text-sm font-medium" title={foundedName}>
+                  {foundedName}
+                </div>
+              ) : null}
+              <div className="w-40 shrink-0 text-right text-sm leading-tight whitespace-nowrap">
+                <div className="font-medium">Founded {foundedYear}</div>
+                <div>
+                  {CALENDAR_MONTHS[calendarMonth]} {calendarYear}
+                </div>
+                <div className="mt-0.5 flex items-center justify-end gap-1">
+                  <WeatherIcon sky={weather.sky} />
+                  <span>
+                    {weather.high}° / {weather.low}°
+                  </span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </header>
+        <div className="relative min-h-0 flex-1">
           <MapPane
+            handle={mapRef}
             world={world}
             layer={layer}
             cell={cell}
             generation={generation}
-            onLayer={setLayer}
             onSelect={setCell}
           />
+          <div
+            className={cn(
+              "absolute top-2 right-2 z-10 flex w-72 flex-col items-end gap-2",
+              ledger && "bottom-2",
+            )}
+          >
+            <div className={cn("w-full", ledger && "max-h-[46%] min-h-0 overflow-auto")}>
+              <InspectorPanel
+                world={world}
+                cell={cell}
+                open={inspectorOpen}
+                onToggle={() => setInspectorOpen((open) => !open)}
+              />
+            </div>
+            {ledger ? (
+              <div className="min-h-0 w-full flex-1 overflow-auto">
+                <LedgerPanel
+                  kind={ledger}
+                  population={population}
+                  citizens={citizens}
+                  cash={formatMoney(treasury)}
+                  lastBirths={fertility?.lastBirths ?? null}
+                  lastRate={fertility?.lastRate ?? null}
+                  onClose={() => setLedger(null)}
+                />
+              </div>
+            ) : null}
+          </div>
+        </div>
+        <footer className="flex h-16 shrink-0 items-center justify-between border-t px-4">
+          <span className="text-sm text-muted-foreground">Buildings</span>
+          <Button
+            type="button"
+            onClick={() => {
+              if (!people) return
+              const nextMonth = calendarMonth === 11 ? 0 : calendarMonth + 1
+              const nextYear = calendarMonth === 11 ? calendarYear + 1 : calendarYear
+              const gameSeed = seed.trim() || "0"
+              const next = advancePeople(people, nextYear, nextMonth, gameSeed)
+              setCalendarMonth(nextMonth)
+              setCalendarYear(nextYear)
+              setPeople(next)
+              setFertility((current) => (current ? noteMonth(current, nextYear, nextMonth, next) : current))
+            }}
+          >
+            Advance Month
+          </Button>
+        </footer>
+      </div>
+    )
+  }
+
+  return (
+    <div className="flex h-dvh flex-col bg-background text-foreground">
+      <header className="shrink-0 border-b px-4 py-3">
+        <h1 className="text-lg font-semibold tracking-tight">Found a city-state</h1>
+        <p className="text-sm text-muted-foreground">
+          Set the ground, the people, and the terms you start under.
+        </p>
+      </header>
+      <div className="grid min-h-0 flex-1 grid-cols-1 grid-rows-[minmax(0,1fr)_minmax(0,1fr)_minmax(0,1fr)] overflow-hidden lg:grid-cols-3 lg:grid-rows-[minmax(0,1fr)]">
+        <section className="flex min-h-0 flex-col overflow-hidden border-b lg:border-r lg:border-b-0">
+          <h2 className="shrink-0 px-4 pt-4 text-sm font-semibold">Climate and map</h2>
+          <div className="min-h-0 flex-1">
+            <SetupPanel
+              presetId={presetId}
+              latitude={latitude}
+              latitudeDrivesTemp={latitudeDrivesTemp}
+              months={months}
+              indices={indices}
+              seed={seed}
+              size={size}
+              relief={relief}
+              coast={coast}
+              onPreset={(id) => {
+                const preset = presetById(id)
+                setPresetId(preset.id)
+                setLatitude(preset.latitude)
+                setMonths(cloneMonths(preset.months))
+              }}
+              onLatitude={(next) => {
+                setLatitude(next)
+                if (!latitudeDrivesTemp) return
+                setMonths((current) => temperaturesForLatitude(presetById(presetId), next, current))
+              }}
+              onLatitudeDrivesTemp={(drives) => {
+                setLatitudeDrivesTemp(drives)
+                if (!drives) return
+                setMonths((current) => temperaturesForLatitude(presetById(presetId), latitude, current))
+              }}
+              onMonth={(index, key, value) => {
+                setMonths((current) =>
+                  current.map((month, monthIndex) =>
+                    monthIndex === index ? sanitizeMonth({ ...month, [key]: value }) : month,
+                  ),
+                )
+              }}
+              onSeed={setSeed}
+              onSize={setSize}
+              onRelief={setRelief}
+              onCoast={setCoast}
+            />
+          </div>
         </section>
-        <section className={cn("min-h-0", panel === "cell" ? "block" : "hidden", "md:block")}>
-          <InspectorPanel world={world} cell={cell} />
+        <section className="flex min-h-0 flex-col overflow-hidden border-b lg:border-r lg:border-b-0">
+          <h2 className="shrink-0 px-4 pt-4 text-sm font-semibold">Demographics</h2>
+          <div className="grid max-w-xs gap-4 px-4 py-3">
+            <div className="grid gap-1.5">
+              <Label htmlFor="nationality-name">Nationality name</Label>
+              <Input
+                id="nationality-name"
+                value={nationalityName}
+                maxLength={40}
+                placeholder="Name your people"
+                autoComplete="off"
+                onChange={(event) => setNationalityName(event.target.value)}
+              />
+              <p className="text-sm leading-relaxed text-muted-foreground">
+                The name associated with your people.
+              </p>
+            </div>
+            <div className="grid gap-1.5">
+              <Label htmlFor="lineage">Lineage</Label>
+              <Select
+                multiple
+                value={lineages}
+                onValueChange={(value) => {
+                  if (value.length > 2) return
+                  setLineages(value)
+                }}
+              >
+                <SelectTrigger id="lineage" className="w-full">
+                  <SelectValue placeholder="Choose up to 2">
+                    {(value: Lineage[]) => (value.length > 0 ? value.join(", ") : "Choose up to 2")}
+                  </SelectValue>
+                </SelectTrigger>
+                <SelectContent>
+                  {LINEAGES.map((lineage) => (
+                    <SelectItem
+                      key={lineage}
+                      value={lineage}
+                      disabled={lineages.length >= 2 && !lineages.includes(lineage)}
+                    >
+                      {lineage}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <p className="text-sm leading-relaxed text-muted-foreground">
+                Check up to two.
+              </p>
+            </div>
+          </div>
+        </section>
+        <section className="flex min-h-0 flex-col overflow-hidden">
+          <h2 className="shrink-0 px-4 pt-4 text-sm font-semibold">Game options</h2>
+          <div className="grid max-w-xs gap-4 px-4 py-3">
+            <div className="grid gap-1.5">
+              <Label htmlFor="state-name">State name</Label>
+              <Input
+                id="state-name"
+                value={stateName}
+                maxLength={40}
+                placeholder="Name your state"
+                autoComplete="off"
+                onChange={(event) => setStateName(event.target.value)}
+              />
+            </div>
+            <div className="grid gap-1.5">
+              <Label htmlFor="founding-year">Founding year</Label>
+            <Input
+              id="founding-year"
+              type="number"
+              inputMode="numeric"
+              step={1}
+              min={-9999}
+              max={9999}
+              value={foundingYear}
+              onChange={(event) => {
+                const year = readYear(event.target.value)
+                if (year !== null) setFoundingYear(year)
+              }}
+            />
+            <p className="text-sm leading-relaxed text-muted-foreground">
+              The calendar opens in July of this year.
+            </p>
+            </div>
+            <div className="grid gap-1.5">
+              <Label htmlFor="founder-type">Founder type</Label>
+              <Select
+                value={founderId}
+                onValueChange={(value) => {
+                  if (value) setFounderId(value as FounderId)
+                }}
+              >
+                <SelectTrigger id="founder-type" className="w-full">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {FOUNDERS.map((founder) => (
+                    <SelectItem key={founder.id} value={founder.id}>
+                      {founder.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <p className="text-sm leading-relaxed text-muted-foreground">
+                Starts with {formatMoney(founderById(founderId).treasury)} and{" "}
+                {founderById(founderId).families} families. Infrastructure and bonuses follow later.
+              </p>
+            </div>
+            <div className="grid gap-1.5">
+              <Label htmlFor="difficulty">Difficulty</Label>
+              <Select
+                value={DIFFICULTIES.find((option) => option.id === difficulty)?.label}
+                onValueChange={(value) => {
+                  const match = DIFFICULTIES.find((option) => option.label === value)
+                  if (match) setDifficulty(match.id)
+                }}
+              >
+                <SelectTrigger id="difficulty" className="w-full">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {DIFFICULTIES.map((option) => (
+                    <SelectItem key={option.id} value={option.label}>
+                      {option.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <p className="text-sm leading-relaxed text-muted-foreground">
+                Most founders score 2. Easy shifts the rest toward 3, Hard toward 1.
+              </p>
+            </div>
+            <div className="grid gap-1.5">
+              <Label htmlFor="region">Region</Label>
+              <Select
+                value={region}
+                onValueChange={(value) => {
+                  if (value) setRegion(value as Region)
+                }}
+              >
+                <SelectTrigger id="region" className="w-full">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {REGIONS.map((option) => (
+                    <SelectItem key={option} value={option}>
+                      {option}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
         </section>
       </div>
-      <div className="shrink-0 border-t p-2 md:hidden">
-        <Tabs
-          value={panel}
-          onValueChange={(value) => {
-            if (typeof value === "string") setPanel(value)
+      <footer className="flex shrink-0 flex-col items-center gap-2 border-t px-4 py-3">
+        <Button
+          id="found-state"
+          type="button"
+          size="lg"
+          disabled={generating}
+          onClick={() => {
+            void generate()
           }}
         >
-          <TabsList className="grid w-full grid-cols-3">
-            <TabsTrigger value="setup">Setup</TabsTrigger>
-            <TabsTrigger value="map">Map</TabsTrigger>
-            <TabsTrigger value="cell">Cell</TabsTrigger>
-          </TabsList>
-        </Tabs>
-      </div>
+          {generating ? "Founding…" : "Found New State"}
+        </Button>
+        {generating ? (
+          <div className="grid w-full max-w-sm gap-1">
+            <div className="h-1.5 overflow-hidden rounded-full bg-muted">
+              <div
+                className="h-full bg-primary transition-[width]"
+                style={{ width: `${Math.round(progress * 100)}%` }}
+              />
+            </div>
+            <p className="text-center text-xs text-muted-foreground">{stage}</p>
+          </div>
+        ) : null}
+        {error ? (
+          <p className="text-sm text-destructive" role="alert">
+            {error}
+          </p>
+        ) : null}
+      </footer>
     </div>
   )
 }

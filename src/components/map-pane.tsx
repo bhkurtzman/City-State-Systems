@@ -1,22 +1,25 @@
 "use client"
 
-import { useEffect, useRef } from "react"
-import { Button } from "@/components/ui/button"
+import { useEffect, useImperativeHandle, useRef, type Ref } from "react"
 import { Card, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
-import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { legendFor, paintLayer } from "@/lib/colors"
-import { LAYERS, type LayerId, type World } from "@/lib/types"
+import type { LayerId, World } from "@/lib/types"
+
+export type MapPaneHandle = {
+  zoomBy: (factor: number) => void
+  fit: () => void
+}
 
 type MapPaneProps = {
   world: World | null
   layer: LayerId
   cell: { x: number; y: number } | null
   generation: number
-  onLayer: (layer: LayerId) => void
   onSelect: (cell: { x: number; y: number }) => void
+  handle: Ref<MapPaneHandle>
 }
 
-export function MapPane({ world, layer, cell, generation, onLayer, onSelect }: MapPaneProps) {
+export function MapPane({ world, layer, cell, generation, onSelect, handle }: MapPaneProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const bitmapRef = useRef<HTMLCanvasElement | null>(null)
   const viewRef = useRef({ x: 0, y: 0, zoom: 1 })
@@ -94,6 +97,8 @@ export function MapPane({ world, layer, cell, generation, onLayer, onSelect }: M
     draw()
   }
 
+  useImperativeHandle(handle, () => ({ zoomBy, fit }))
+
   useEffect(() => {
     if (!world) {
       bitmapRef.current = null
@@ -145,33 +150,6 @@ export function MapPane({ world, layer, cell, generation, onLayer, onSelect }: M
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <div className="flex flex-wrap items-center gap-2 border-b px-3 py-2">
-        <Tabs
-          value={layer}
-          onValueChange={(value) => {
-            if (typeof value === "string") onLayer(value as LayerId)
-          }}
-        >
-          <TabsList className="h-auto flex-wrap">
-            {LAYERS.map((item) => (
-              <TabsTrigger key={item.id} value={item.id}>
-                {item.label}
-              </TabsTrigger>
-            ))}
-          </TabsList>
-        </Tabs>
-        <div className="ml-auto flex items-center gap-1">
-          <Button type="button" variant="outline" size="sm" onClick={() => zoomBy(1 / 1.2)} disabled={!world}>
-            −
-          </Button>
-          <Button type="button" variant="outline" size="sm" onClick={() => zoomBy(1.2)} disabled={!world}>
-            +
-          </Button>
-          <Button type="button" variant="outline" size="sm" onClick={fit} disabled={!world}>
-            Fit
-          </Button>
-        </div>
-      </div>
       <div className="relative min-h-0 flex-1">
         {world ? (
           <canvas
