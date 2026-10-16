@@ -22,6 +22,7 @@ export function LedgerPanel({
   citizens,
   cash,
   lastBirths,
+  lastDeaths,
   lastRate,
   onClose,
 }: {
@@ -30,10 +31,14 @@ export function LedgerPanel({
   citizens: CitizenCensus | null
   cash: string
   lastBirths: number | null
+  lastDeaths: number | null
   lastRate: number | null
   onClose: () => void
 }) {
-  const rows = kind === "population" ? populationRows(population, citizens, lastBirths, lastRate) : treasuryRows(cash)
+  const rows =
+    kind === "population"
+      ? populationRows(population, citizens, lastBirths, lastDeaths, lastRate)
+      : treasuryRows(cash)
   return (
     <Card className="w-full shadow-md">
       <CardHeader>
@@ -71,6 +76,7 @@ function populationRows(
   population: number,
   citizens: CitizenCensus | null,
   lastBirths: number | null,
+  lastDeaths: number | null,
   lastRate: number | null,
 ): Row[] {
   const age =
@@ -109,7 +115,10 @@ function populationRows(
       label: "Last year's births",
       value: lastBirths === null ? BLANK : lastBirths.toLocaleString("en-US"),
     },
-    { label: "Last year's deaths", value: BLANK },
+    {
+      label: "Last year's deaths",
+      value: lastDeaths === null ? BLANK : lastDeaths.toLocaleString("en-US"),
+    },
     { label: "Last year's emigrants", value: BLANK },
     { label: "Last year's immigrants", value: BLANK },
   ]

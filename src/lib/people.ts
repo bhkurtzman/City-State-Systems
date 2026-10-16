@@ -72,6 +72,8 @@ export type People = {
   vigor: Uint8Array
   intellect: Uint8Array
   willpower: Uint8Array
+  /** 1 while living. Dead rows stay until the January purge. */
+  alive: Uint8Array
   spouse: Int32Array
   mother: Int32Array
   father: Int32Array
@@ -82,6 +84,7 @@ const FERTILITY_BAND_YEARS = [8, 10, 10] as const
 
 export type FertilityYear = {
   births: number
+  deaths: number
   bandBirths: [number, number, number]
   /** Woman-months of exposure, ages 18–25, 26–35, and 36–45. */
   bandMonths: [number, number, number]
@@ -92,6 +95,7 @@ export type FertilityLedger = {
   current: FertilityYear
   /** Null until a calendar year has closed. */
   lastBirths: number | null
+  lastDeaths: number | null
   lastRate: number | null
 }
 
@@ -103,7 +107,7 @@ export function motherFertility(age: number): number {
 }
 
 function emptyFertilityYear(): FertilityYear {
-  return { births: 0, bandBirths: [0, 0, 0], bandMonths: [0, 0, 0] }
+  return { births: 0, deaths: 0, bandBirths: [0, 0, 0], bandMonths: [0, 0, 0] }
 }
 
 /** 0 for ages 18–25, 1 for 26–35, 2 for 36–45. */
@@ -131,45 +135,55 @@ export function fertilityRate(year: FertilityYear): number | null {
 }
 
 /** Count this resolved month. A newborn is age 0 and shares the month. */
-export function observeMonth(year: FertilityYear, people: People, month: number): FertilityYear {
+export function observeMonth(year: FertilityYear, people: People, month: number, deaths: number): FertilityYear {
   const bandBirths: [number, number, number] = [...year.bandBirths]
   const bandMonths: [number, number, number] = [...year.bandMonths]
   let births = year.births
   for (let i = 0; i < people.age.length; i++) {
-    if (people.sex[i] !== Sex.Female) continue
+    if (people.alive[i] === 0 || people.sex[i] !== Sex.Female) continue
     const band = fertilityBand(people.age[i])
     if (band >= 0) bandMonths[band] += 1
   }
   for (let i = 0; i < people.age.length; i++) {
-    if (people.age[i] !== 0 || people.birthMonth[i] !== month) continue
+    if (people.alive[i] === 0 || people.age[i] !== 0 || people.birthMonth[i] !== month) continue
     births += 1
     const motherId = people.mother[i]
     if (motherId < 0) continue
     const band = fertilityBand(people.age[motherId])
     if (band >= 0) bandBirths[band] += 1
   }
-  return { births, bandBirths, bandMonths }
+  return { births, deaths: year.deaths + deaths, bandBirths, bandMonths }
 }
 
 /** Opening month is already resolved inside the founded population. */
 export function beginFertility(year: number, month: number, people: People): FertilityLedger {
+  let deaths = 0
+  for (let i = 0; i < people.alive.length; i++) if (people.alive[i] === 0) deaths += 1
   return {
     year,
-    current: observeMonth(emptyFertilityYear(), people, month),
+    current: observeMonth(emptyFertilityYear(), people, month, deaths),
     lastBirths: null,
+    lastDeaths: null,
     lastRate: null,
   }
 }
 
 /** Fold in one month. A new calendar year closes the previous one first. */
-export function noteMonth(ledger: FertilityLedger, year: number, month: number, people: People): FertilityLedger {
+export function noteMonth(
+  ledger: FertilityLedger,
+  year: number,
+  month: number,
+  people: People,
+  deaths: number,
+): FertilityLedger {
   if (year === ledger.year) {
-    return { ...ledger, current: observeMonth(ledger.current, people, month) }
+    return { ...ledger, current: observeMonth(ledger.current, people, month, deaths) }
   }
   return {
     year,
-    current: observeMonth(emptyFertilityYear(), people, month),
+    current: observeMonth(emptyFertilityYear(), people, month, deaths),
     lastBirths: ledger.current.births,
+    lastDeaths: ledger.current.deaths,
     lastRate: fertilityRate(ledger.current),
   }
 }
@@ -207,7 +221,10 @@ export function citizenCensus(people: People): CitizenCensus {
   let youngAdults = 0
   let matureAdults = 0
   let elderly = 0
+  let count = 0
   for (let i = 0; i < people.age.length; i++) {
+    if (people.alive[i] === 0) continue
+    count += 1
     const age = people.age[i]
     sum += age
     vigor += people.vigor[i]
@@ -221,7 +238,6 @@ export function citizenCensus(people: People): CitizenCensus {
     else if (age <= 64) matureAdults += 1
     else elderly += 1
   }
-  const count = people.age.length
   return {
     averageAge: count === 0 ? 0 : sum / count,
     averageVigor: count === 0 ? 0 : vigor / count,
@@ -254,7 +270,7 @@ export function foundPeople(
   openingYear: number,
   openingMonth: number,
   difficulty: DifficultyId,
-): People {
+): { people: People; epidemic: Epidemic } {
   const rng = mulberry32(hashSeed(`${seed}|${founderId}|families`))
   const age: number[] = []
   const sex: number[] = []
@@ -310,21 +326,61 @@ export function foundPeople(
     cooldown[mother[i]] = postpartumRemaining(openingMonth, birthMonth[i])
   }
 
-  return advancePeople(
+  const step = advancePeople(
     pack(age, sex, birthMonth, cooldown, vigor, intellect, willpower, spouse, mother, father),
     openingYear,
     openingMonth,
     seed,
+    emptyEpidemic(),
   )
+  return { people: step.people, epidemic: step.epidemic }
+}
+
+/** Town illness. A declaration waits until the following month, then runs for its rolled length. */
+export type Epidemic = {
+  /** Boosted months left after the month just resolved. */
+  remaining: number
+  /** The month just resolved used the epidemic illness rules. */
+  active: boolean
+  /** Length of a wave that begins next month, or 0 if none was declared. */
+  declared: number
+}
+
+export function emptyEpidemic(): Epidemic {
+  return { remaining: 0, active: false, declared: 0 }
+}
+
+const EPIDEMIC_CHANCE = 0.001
+const EPIDEMIC_ILLNESS = 10
+const EPIDEMIC_KILL = 10
+const EPIDEMIC_MIN_MONTHS = 2
+const EPIDEMIC_MAX_MONTHS = 6
+
+export type MonthStep = {
+  people: People
+  /** Deaths resolved this month, before the January purge. */
+  deaths: number
+  epidemic: Epidemic
 }
 
 /**
- * Resolve the start of one calendar month. Ages tick on birthdays, then unmarried men
- * aged 18–50 may marry, then married women aged 18–45 may try for a child.
- * A birth skips her for the next 12 months.
+ * Resolve the start of one calendar month. Living people age on their birthday.
+ * An epidemic declared last month raises illness, and the kill chance of that illness,
+ * for its rolled length. Each person then rolls illness and injury. A hit rolls again
+ * for death. The dead stay in the table, so spouse and parent ids keep working.
+ * Unmarried living men aged 18–50 may marry, then living wives aged 18–45 may try
+ * for a child. A birth skips her for the next 12 months. In January, a dead person
+ * whom no living spouse or child still points at is removed and the remaining ids
+ * are rewritten. A new epidemic may be declared for the following month.
  * The same people, seed, year, and month always rebuild the same result.
  */
-export function advancePeople(people: People, year: number, month: number, seed: string): People {
+export function advancePeople(
+  people: People,
+  year: number,
+  month: number,
+  seed: string,
+  epidemic: Epidemic,
+): MonthStep {
   const count = people.age.length
   const age = new Uint8Array(people.age)
   const sex = new Uint8Array(people.sex)
@@ -333,20 +389,41 @@ export function advancePeople(people: People, year: number, month: number, seed:
   const vigor = new Uint8Array(people.vigor)
   const intellect = new Uint8Array(people.intellect)
   const willpower = new Uint8Array(people.willpower)
+  const alive = new Uint8Array(people.alive)
   const spouse = new Int32Array(people.spouse)
   const mother = new Int32Array(people.mother)
   const father = new Int32Array(people.father)
+  const wave = resolveEpidemic(epidemic, year, month, seed)
 
   for (let i = 0; i < count; i++) {
-    if (birthMonth[i] === month) age[i] += 1
+    if (alive[i] === 0) continue
+    if (birthMonth[i] === month && age[i] < 255) age[i] += 1
+  }
+
+  const deathRng = mulberry32(hashSeed(`${seed}|${year}|${month}|deaths`))
+  let deaths = 0
+  for (let i = 0; i < count; i++) {
+    if (alive[i] === 0) continue
+    const hazard = monthlyHazards(age[i], sex[i], vigor[i], intellect[i])
+    const kill = killChance(age[i], sex[i])
+    const illness = wave.active ? hazard.illness * EPIDEMIC_ILLNESS : hazard.illness
+    const illnessKill = wave.active ? Math.min(0.9, kill * EPIDEMIC_KILL) : kill
+    const ill = deathRng() < illness
+    const inj = deathRng() < hazard.injury
+    let dead = false
+    if (ill) dead = deathRng() < illnessKill
+    if (inj) dead = deathRng() < kill || dead
+    if (!dead) continue
+    alive[i] = 0
+    deaths += 1
   }
 
   const marriages = mulberry32(hashSeed(`${seed}|${year}|${month}|marriages`))
   for (let i = 0; i < count; i++) {
-    if (sex[i] !== Sex.Male || spouse[i] >= 0) continue
+    if (alive[i] === 0 || sex[i] !== Sex.Male || spouse[i] >= 0) continue
     const look = marriageLookChance(age[i])
     if (look === 0 || marriages() >= look) continue
-    const wife = pickWife(i, age, sex, spouse, mother, father, marriages)
+    const wife = pickWife(i, age, sex, alive, spouse, mother, father, marriages)
     if (wife < 0 || marriages() >= MARRIAGE_ACCEPT) continue
     spouse[i] = wife
     spouse[wife] = i
@@ -356,13 +433,14 @@ export function advancePeople(people: People, year: number, month: number, seed:
   const traitRng = mulberry32(hashSeed(`${seed}|${year}|${month}|traits`))
   const born: { motherId: number; fatherId: number; childSex: SexId; vigor: number; intellect: number; willpower: number }[] = []
   for (let i = 0; i < count; i++) {
+    if (alive[i] === 0) continue
     if (cooldown[i] > 0) {
       cooldown[i] -= 1
       continue
     }
     if (sex[i] !== Sex.Female || age[i] < MIN_ADULT_AGE || age[i] > 45) continue
     const fatherId = spouse[i]
-    if (fatherId < 0) continue
+    if (fatherId < 0 || alive[fatherId] === 0) continue
     if (rng() >= TRY_CHANCE) continue
     if (rng() >= motherFertility(age[i])) continue
     born.push({
@@ -376,47 +454,145 @@ export function advancePeople(people: People, year: number, month: number, seed:
     cooldown[i] = POSTPARTUM_MONTHS
   }
 
+  let next: People
   if (born.length === 0) {
-    return { age, sex, birthMonth, cooldown, vigor, intellect, willpower, spouse, mother, father }
+    next = { age, sex, birthMonth, cooldown, vigor, intellect, willpower, alive, spouse, mother, father }
+  } else {
+    const grownCount = count + born.length
+    const grown = {
+      age: new Uint8Array(grownCount),
+      sex: new Uint8Array(grownCount),
+      birthMonth: new Uint8Array(grownCount),
+      cooldown: new Uint8Array(grownCount),
+      vigor: new Uint8Array(grownCount),
+      intellect: new Uint8Array(grownCount),
+      willpower: new Uint8Array(grownCount),
+      alive: new Uint8Array(grownCount),
+      spouse: new Int32Array(grownCount),
+      mother: new Int32Array(grownCount),
+      father: new Int32Array(grownCount),
+    }
+    grown.age.set(age)
+    grown.sex.set(sex)
+    grown.birthMonth.set(birthMonth)
+    grown.cooldown.set(cooldown)
+    grown.vigor.set(vigor)
+    grown.intellect.set(intellect)
+    grown.willpower.set(willpower)
+    grown.alive.set(alive)
+    grown.spouse.set(spouse)
+    grown.mother.set(mother)
+    grown.father.set(father)
+    for (let i = 0; i < born.length; i++) {
+      const at = count + i
+      const child = born[i]
+      grown.age[at] = 0
+      grown.sex[at] = child.childSex
+      grown.birthMonth[at] = month
+      grown.vigor[at] = child.vigor
+      grown.intellect[at] = child.intellect
+      grown.willpower[at] = child.willpower
+      grown.alive[at] = 1
+      grown.spouse[at] = -1
+      grown.mother[at] = child.motherId
+      grown.father[at] = child.fatherId
+    }
+    next = grown
   }
 
-  const next = count + born.length
-  const grown = {
-    age: new Uint8Array(next),
-    sex: new Uint8Array(next),
-    birthMonth: new Uint8Array(next),
-    cooldown: new Uint8Array(next),
-    vigor: new Uint8Array(next),
-    intellect: new Uint8Array(next),
-    willpower: new Uint8Array(next),
-    spouse: new Int32Array(next),
-    mother: new Int32Array(next),
-    father: new Int32Array(next),
+  if (month === 0) next = purgeUnlinkedDead(next)
+  return { people: next, deaths, epidemic: wave }
+}
+
+/** A declared wave starts this month. A new roll, if it hits, waits until next month. */
+function resolveEpidemic(previous: Epidemic, year: number, month: number, seed: string): Epidemic {
+  const scheduled = previous.declared > 0 ? previous.declared : previous.remaining
+  const active = scheduled > 0
+  const remaining = active ? scheduled - 1 : 0
+  const rng = mulberry32(hashSeed(`${seed}|${year}|${month}|epidemic`))
+  const span = EPIDEMIC_MAX_MONTHS - EPIDEMIC_MIN_MONTHS + 1
+  const declared = rng() < EPIDEMIC_CHANCE ? EPIDEMIC_MIN_MONTHS + Math.floor(rng() * span) : 0
+  return { remaining, active, declared }
+}
+
+/** Sentence for the current month, or null when no epidemic is scheduled or underway. */
+export function epidemicNotice(epidemic: Epidemic): string | null {
+  if (epidemic.declared > 0) {
+    const length = monthCount(epidemic.declared)
+    if (epidemic.active) {
+      return `A new epidemic starts next month and lasts ${length}. This month is still part of the current one.`
+    }
+    return `An epidemic starts next month and lasts ${length}.`
   }
-  grown.age.set(age)
-  grown.sex.set(sex)
-  grown.birthMonth.set(birthMonth)
-  grown.cooldown.set(cooldown)
-  grown.vigor.set(vigor)
-  grown.intellect.set(intellect)
-  grown.willpower.set(willpower)
-  grown.spouse.set(spouse)
-  grown.mother.set(mother)
-  grown.father.set(father)
-  for (let i = 0; i < born.length; i++) {
-    const at = count + i
-    const child = born[i]
-    grown.age[at] = 0
-    grown.sex[at] = child.childSex
-    grown.birthMonth[at] = month
-    grown.vigor[at] = child.vigor
-    grown.intellect[at] = child.intellect
-    grown.willpower[at] = child.willpower
-    grown.spouse[at] = -1
-    grown.mother[at] = child.motherId
-    grown.father[at] = child.fatherId
+  if (!epidemic.active) return null
+  return `The epidemic has ${monthCount(epidemic.remaining + 1)} left.`
+}
+
+function monthCount(count: number): string {
+  return count === 1 ? "1 month" : `${count} months`
+}
+
+/** Living citizens. Dead rows still sitting in the table are not counted. */
+export function livingCount(people: People): number {
+  let count = 0
+  for (let i = 0; i < people.alive.length; i++) if (people.alive[i] !== 0) count += 1
+  return count
+}
+
+/**
+ * Remove a dead person only when no living spouse, mother, or father field
+ * still names them. Surviving ids are packed from the front. A pointer at
+ * someone who was removed becomes −1.
+ */
+export function purgeUnlinkedDead(people: People): People {
+  const count = people.age.length
+  const keep = new Uint8Array(count)
+  for (let i = 0; i < count; i++) if (people.alive[i] !== 0) keep[i] = 1
+  for (let i = 0; i < count; i++) {
+    if (people.alive[i] === 0) continue
+    const spouseId = people.spouse[i]
+    if (spouseId >= 0) keep[spouseId] = 1
+    const motherId = people.mother[i]
+    if (motherId >= 0) keep[motherId] = 1
+    const fatherId = people.father[i]
+    if (fatherId >= 0) keep[fatherId] = 1
   }
-  return grown
+  let kept = 0
+  for (let i = 0; i < count; i++) if (keep[i] !== 0) kept += 1
+  if (kept === count) return people
+
+  const map = new Int32Array(count)
+  map.fill(-1)
+  let nextId = 0
+  for (let i = 0; i < count; i++) if (keep[i] !== 0) map[i] = nextId++
+
+  const age = new Uint8Array(kept)
+  const sex = new Uint8Array(kept)
+  const birthMonth = new Uint8Array(kept)
+  const cooldown = new Uint8Array(kept)
+  const vigor = new Uint8Array(kept)
+  const intellect = new Uint8Array(kept)
+  const willpower = new Uint8Array(kept)
+  const alive = new Uint8Array(kept)
+  const spouse = new Int32Array(kept)
+  const mother = new Int32Array(kept)
+  const father = new Int32Array(kept)
+  for (let i = 0; i < count; i++) {
+    const at = map[i]
+    if (at < 0) continue
+    age[at] = people.age[i]
+    sex[at] = people.sex[i]
+    birthMonth[at] = people.birthMonth[i]
+    cooldown[at] = people.cooldown[i]
+    vigor[at] = people.vigor[i]
+    intellect[at] = people.intellect[i]
+    willpower[at] = people.willpower[i]
+    alive[at] = people.alive[i]
+    spouse[at] = people.spouse[i] < 0 ? -1 : map[people.spouse[i]]
+    mother[at] = people.mother[i] < 0 ? -1 : map[people.mother[i]]
+    father[at] = people.father[i] < 0 ? -1 : map[people.father[i]]
+  }
+  return { age, sex, birthMonth, cooldown, vigor, intellect, willpower, alive, spouse, mother, father }
 }
 
 function marriageLookChance(age: number): number {
@@ -436,18 +612,19 @@ function pickWife(
   man: number,
   age: Uint8Array,
   sex: Uint8Array,
+  alive: Uint8Array,
   spouse: Int32Array,
   mother: Int32Array,
   father: Int32Array,
   rng: () => number,
 ): number {
-  const preferred = wivesInRange(man, PREFERRED_YOUNGER, PREFERRED_OLDER, age, sex, spouse, mother, father)
+  const preferred = wivesInRange(man, PREFERRED_YOUNGER, PREFERRED_OLDER, age, sex, alive, spouse, mother, father)
   const pool =
     preferred.length > 0
       ? preferred
       : age[man] <= 22
-        ? wivesInRange(man, PREFERRED_YOUNGER, YOUNG_FALLBACK_OLDER, age, sex, spouse, mother, father)
-        : wivesInRange(man, WIDE_GAP, WIDE_GAP, age, sex, spouse, mother, father)
+        ? wivesInRange(man, PREFERRED_YOUNGER, YOUNG_FALLBACK_OLDER, age, sex, alive, spouse, mother, father)
+        : wivesInRange(man, WIDE_GAP, WIDE_GAP, age, sex, alive, spouse, mother, father)
   if (pool.length === 0) return -1
   return pool[Math.floor(rng() * pool.length)]
 }
@@ -458,6 +635,7 @@ function wivesInRange(
   older: number,
   age: Uint8Array,
   sex: Uint8Array,
+  alive: Uint8Array,
   spouse: Int32Array,
   mother: Int32Array,
   father: Int32Array,
@@ -467,13 +645,72 @@ function wivesInRange(
   const oldest = manAge + older
   const found: number[] = []
   for (let j = 0; j < age.length; j++) {
-    if (sex[j] !== Sex.Female || spouse[j] >= 0) continue
+    if (alive[j] === 0 || sex[j] !== Sex.Female || spouse[j] >= 0) continue
     const hers = age[j]
     if (hers < youngest || hers > oldest) continue
     if (sharesParent(mother, father, man, j)) continue
     found.push(j)
   }
   return found
+}
+
+/** Monthly illness chance before vigor. */
+function illnessChance(age: number): number {
+  if (age <= 5) return 0.005
+  if (age <= 12) return 0.0015
+  if (age <= 25) return 0.001
+  if (age <= 40) return 0.0015
+  if (age <= 55) return 0.003
+  if (age <= 65) return 0.005
+  if (age <= 79) return 0.01
+  return 0.015
+}
+
+/** Monthly injury chance before sex and trait multipliers. */
+function injuryChance(age: number): number {
+  if (age <= 5) return 0.001
+  if (age <= 12) return 0.0025
+  if (age <= 25) return 0.005
+  if (age <= 40) return 0.0025
+  if (age <= 55) return 0.003
+  if (age <= 65) return 0.005
+  if (age <= 79) return 0.01
+  return 0.015
+}
+
+/** Chance a hit kills. From 56 the 7% band keeps climbing, capped at 90%. */
+function killChance(age: number, sex: number): number {
+  if (age <= 5) return 0.07
+  if (age <= 12) return 0.0025
+  if (age <= 25) return 0.015
+  if (age <= 40) return 0.03
+  if (age <= 55) return 0.07
+  const step = sex === Sex.Female ? 0.0135 : 0.015
+  const chance = 0.07 + step * (age - 55)
+  return chance > 0.9 ? 0.9 : chance
+}
+
+/** Vigor 1 and intellect 1 raise a hazard. A 3 lowers it. A 2 leaves it alone. */
+function traitHazard(score: number): number {
+  if (score <= 1) return 1.2
+  if (score >= 3) return 0.8
+  return 1
+}
+
+/**
+ * Illness uses vigor. Injury uses vigor and intellect, and women take half
+ * the injury chance from ages 6 through 55.
+ */
+function monthlyHazards(
+  age: number,
+  sex: number,
+  vigor: number,
+  intellect: number,
+): { illness: number; injury: number } {
+  const vigorScale = traitHazard(vigor)
+  let injury = injuryChance(age) * vigorScale * traitHazard(intellect)
+  if (sex === Sex.Female && age >= 6 && age <= 55) injury *= 0.5
+  return { illness: illnessChance(age) * vigorScale, injury }
 }
 
 /** Same mother or same father. A missing parent (−1) never counts as shared. */
@@ -535,6 +772,12 @@ function rollCouple(rng: () => number): { mother: number; father: number } {
   }
 }
 
+function filledAlive(count: number): Uint8Array {
+  const alive = new Uint8Array(count)
+  alive.fill(1)
+  return alive
+}
+
 function pack(
   age: number[],
   sex: number[],
@@ -555,6 +798,7 @@ function pack(
     vigor: Uint8Array.from(vigor),
     intellect: Uint8Array.from(intellect),
     willpower: Uint8Array.from(willpower),
+    alive: filledAlive(age.length),
     spouse: Int32Array.from(spouse),
     mother: Int32Array.from(mother),
     father: Int32Array.from(father),

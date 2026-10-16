@@ -7,6 +7,7 @@ import { MapPane, type MapPaneHandle } from "@/components/map-pane"
 import { SetupPanel } from "@/components/setup-panel"
 import { WeatherIcon } from "@/components/weather-icon"
 import { Button } from "@/components/ui/button"
+import { Card, CardAction, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import {
@@ -30,9 +31,13 @@ import {
   beginFertility,
   citizenCensus,
   DIFFICULTIES,
+  emptyEpidemic,
+  epidemicNotice,
   foundPeople,
+  livingCount,
   noteMonth,
   type DifficultyId,
+  type Epidemic,
   type FertilityLedger,
   type People,
 } from "@/lib/people"
@@ -99,6 +104,27 @@ type Region = (typeof REGIONS)[number]
 
 function founderById(id: FounderId) {
   return FOUNDERS.find((founder) => founder.id === id) ?? FOUNDERS[0]
+}
+
+function lineagePhrase(groups: readonly string[]): string {
+  if (groups.length === 0) return "many origins"
+  if (groups.length === 1) return `the ${groups[0]}`
+  return `the ${groups[0]} and the ${groups[1]}`
+}
+
+function foundingStory(founderId: FounderId, year: number, groups: readonly string[], nationality: string): string {
+  const founder = founderById(founderId)
+  const people = nationality.trim() || "a people as yet unnamed"
+  const descent = `Your people descend from ${lineagePhrase(groups)} but together will form a new people known as ${people}.`
+  const close = "The future of your lands and people is in your hands."
+  const opening = `The year is ${year}.`
+  if (founder.id === "merchant") {
+    return `${opening} After years of trade, you have founded a small merchant republic on marginal lands. You are joined by ${founder.families} of your most trusted employees and their families who have sworn loyalty to you. ${descent} ${close}`
+  }
+  if (founder.id === "explorer") {
+    return `${opening} After years of exploration, you have settled a new colony in these newly discovered lands. You are joined by ${founder.families} pioneers and their families who have sworn loyalty to you. ${descent} ${close}`
+  }
+  return `${opening} After years of warfare, you have been granted a small principality from among the conquered lands as compensation for your leadership in battle. You are joined by ${founder.families} of your most trusted men and their families who have sworn loyalty to you. ${descent} ${close}`
 }
 
 function formatMoney(value: number): string {
@@ -170,6 +196,9 @@ export function PlannerApp() {
   const [treasury, setTreasury] = useState(FOUNDERS[0].treasury)
   const [people, setPeople] = useState<People | null>(null)
   const [fertility, setFertility] = useState<FertilityLedger | null>(null)
+  const [epidemic, setEpidemic] = useState<Epidemic>(emptyEpidemic())
+  const [epidemicDismissed, setEpidemicDismissed] = useState<string | null>(null)
+  const [charterOpen, setCharterOpen] = useState(false)
   const [ledger, setLedger] = useState<LedgerId | null>(null)
   const [foundingYear, setFoundingYear] = useState(1)
   const [foundedYear, setFoundedYear] = useState(1)
@@ -177,7 +206,7 @@ export function PlannerApp() {
   const [calendarYear, setCalendarYear] = useState(1)
   const mapRef = useRef<MapPaneHandle>(null)
 
-  const population = people?.age.length ?? 0
+  const population = people ? livingCount(people) : 0
   const citizens = useMemo(() => (people ? citizenCensus(people) : null), [people])
   const indices = useMemo(() => deriveClimate(latitude, months), [latitude, months])
   const weather = useMemo(
@@ -221,12 +250,15 @@ export function PlannerApp() {
         OPENING_MONTH,
         difficulty,
       )
-      setPeople(founded)
-      setFertility(beginFertility(foundingYear, OPENING_MONTH, founded))
+      setPeople(founded.people)
+      setEpidemic(founded.epidemic)
+      setEpidemicDismissed(null)
+      setFertility(beginFertility(foundingYear, OPENING_MONTH, founded.people))
       setLedger(null)
       setFoundedYear(foundingYear)
       setCalendarMonth(OPENING_MONTH)
       setCalendarYear(foundingYear)
+      setCharterOpen(true)
       setScreen("play")
     } catch (caught) {
       const message = caught instanceof Error ? caught.message : "The generator failed."
@@ -237,6 +269,9 @@ export function PlannerApp() {
   }
 
   if (screen === "play" && world) {
+    const notice = epidemicNotice(epidemic)
+    const epidemicKey = `${calendarYear}-${calendarMonth}`
+    const showEpidemic = notice !== null && epidemicDismissed !== epidemicKey
     return (
       <div className="flex h-dvh flex-col bg-background text-foreground">
         <header className="flex shrink-0 flex-wrap items-center gap-2 border-b px-2 py-1.5">
@@ -335,12 +370,66 @@ export function PlannerApp() {
                   citizens={citizens}
                   cash={formatMoney(treasury)}
                   lastBirths={fertility?.lastBirths ?? null}
+                  lastDeaths={fertility?.lastDeaths ?? null}
                   lastRate={fertility?.lastRate ?? null}
                   onClose={() => setLedger(null)}
                 />
               </div>
             ) : null}
           </div>
+          {charterOpen ? (
+            <div className="absolute inset-0 z-30 flex items-center justify-center bg-black/40 p-4">
+              <Card className="w-full max-w-lg shadow-lg">
+                <CardHeader>
+                  <CardTitle>{founderById(founderId).label}</CardTitle>
+                  <CardAction>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      aria-label="Close founding"
+                      onClick={() => setCharterOpen(false)}
+                    >
+                      X
+                    </Button>
+                  </CardAction>
+                </CardHeader>
+                <CardContent className="grid gap-4">
+                  <p className="leading-relaxed">
+                    {foundingStory(founderId, foundedYear, lineages, nationalityName)}
+                  </p>
+                  <div className="flex justify-end">
+                    <Button type="button" onClick={() => setCharterOpen(false)}>
+                      Begin
+                    </Button>
+                  </div>
+                </CardContent>
+              </Card>
+            </div>
+          ) : null}
+          {showEpidemic && notice ? (
+            <div className="absolute bottom-3 left-3 z-20 w-72">
+              <Card size="sm" className="shadow-md">
+                <CardHeader>
+                  <CardTitle>Epidemic</CardTitle>
+                  <CardAction>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      aria-label="Dismiss epidemic notice"
+                      onClick={() => setEpidemicDismissed(epidemicKey)}
+                    >
+                      X
+                    </Button>
+                  </CardAction>
+                </CardHeader>
+                <CardContent>
+                  <p>{notice}</p>
+                </CardContent>
+              </Card>
+            </div>
+          ) : null}
         </div>
         <footer className="flex h-16 shrink-0 items-center justify-between border-t px-4">
           <span className="text-sm text-muted-foreground">Buildings</span>
@@ -351,11 +440,14 @@ export function PlannerApp() {
               const nextMonth = calendarMonth === 11 ? 0 : calendarMonth + 1
               const nextYear = calendarMonth === 11 ? calendarYear + 1 : calendarYear
               const gameSeed = seed.trim() || "0"
-              const next = advancePeople(people, nextYear, nextMonth, gameSeed)
+              const step = advancePeople(people, nextYear, nextMonth, gameSeed, epidemic)
               setCalendarMonth(nextMonth)
               setCalendarYear(nextYear)
-              setPeople(next)
-              setFertility((current) => (current ? noteMonth(current, nextYear, nextMonth, next) : current))
+              setPeople(step.people)
+              setEpidemic(step.epidemic)
+              setFertility((current) =>
+                current ? noteMonth(current, nextYear, nextMonth, step.people, step.deaths) : current,
+              )
             }}
           >
             Advance Month
