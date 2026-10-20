@@ -1,7 +1,8 @@
 "use client"
 
 import { useMemo, useRef, useState } from "react"
-import { InspectorPanel } from "@/components/inspector-panel"
+import { BuildingMenu, CategoryBar } from "@/components/building-bars"
+import { BuildingInspector, InspectorPanel } from "@/components/inspector-panel"
 import { LedgerPanel, type LedgerId } from "@/components/ledger-panel"
 import { MapPane, type MapPaneHandle } from "@/components/map-pane"
 import { SetupPanel } from "@/components/setup-panel"
@@ -30,6 +31,8 @@ import {
   advancePeople,
   beginFertility,
   citizenCensus,
+  economyCensus,
+  educationCensus,
   DIFFICULTIES,
   emptyEpidemic,
   epidemicNotice,
@@ -41,6 +44,9 @@ import {
   type FertilityLedger,
   type People,
 } from "@/lib/people"
+import { applyBuild, commitSettlement, emptySettlement, structureAt, structureLabel, type BuildTool } from "@/lib/buildings"
+import { defaultLandSchedule, emptyHoldings, propertyLines, settleHoldings, type LandSchedule } from "@/lib/land"
+import { emptyFarms, productionLines, workFarms } from "@/lib/produce"
 import { runGeneration } from "@/lib/run-generation"
 import { monthWeather } from "@/lib/weather"
 import { LAYERS, type Coast, type LayerId, type MapSize, type MonthClimate, type World } from "@/lib/types"
@@ -131,6 +137,12 @@ function formatMoney(value: number): string {
   return `$${value.toLocaleString("en-US")}`
 }
 
+function literacyLabel(schooling: { adults: number; literateAdults: number } | null): string {
+  if (schooling === null || schooling.adults <= 0) return "—"
+  const share = (schooling.literateAdults / schooling.adults) * 100
+  return share.toLocaleString("en-US", { maximumFractionDigits: 0 }) + "%"
+}
+
 function BarStat({
   label,
   value,
@@ -181,6 +193,7 @@ export function PlannerApp() {
   const [cell, setCell] = useState<{ x: number; y: number } | null>(null)
   const [screen, setScreen] = useState<"start" | "play">("start")
   const [inspectorOpen, setInspectorOpen] = useState(true)
+  const [buildingOpen, setBuildingOpen] = useState(false)
   const [generating, setGenerating] = useState(false)
   const [progress, setProgress] = useState(0)
   const [stage, setStage] = useState("Preparing the grid")
@@ -200,6 +213,12 @@ export function PlannerApp() {
   const [epidemicDismissed, setEpidemicDismissed] = useState<string | null>(null)
   const [charterOpen, setCharterOpen] = useState(false)
   const [ledger, setLedger] = useState<LedgerId | null>(null)
+  const [tool, setTool] = useState<BuildTool | null>(null)
+  const [settlement, setSettlement] = useState(emptySettlement)
+  const [landSchedule, setLandSchedule] = useState<LandSchedule>(defaultLandSchedule)
+  const [holdings, setHoldings] = useState(emptyHoldings)
+  const [farms, setFarms] = useState(emptyFarms)
+  const [landIncome, setLandIncome] = useState<number | null>(null)
   const [foundingYear, setFoundingYear] = useState(1)
   const [foundedYear, setFoundedYear] = useState(1)
   const [calendarMonth, setCalendarMonth] = useState(OPENING_MONTH)
@@ -208,6 +227,8 @@ export function PlannerApp() {
 
   const population = people ? livingCount(people) : 0
   const citizens = useMemo(() => (people ? citizenCensus(people) : null), [people])
+  const schooling = useMemo(() => (people ? educationCensus(people) : null), [people])
+  const economy = useMemo(() => (people ? economyCensus(people) : null), [people])
   const indices = useMemo(() => deriveClimate(latitude, months), [latitude, months])
   const weather = useMemo(
     () => monthWeather(seed.trim() || "0", calendarYear, calendarMonth, months[calendarMonth]),
@@ -255,6 +276,12 @@ export function PlannerApp() {
       setEpidemicDismissed(null)
       setFertility(beginFertility(foundingYear, OPENING_MONTH, founded.people))
       setLedger(null)
+      setTool(null)
+      setSettlement(emptySettlement())
+      setLandSchedule(defaultLandSchedule())
+      setHoldings(emptyHoldings())
+      setFarms(emptyFarms())
+      setLandIncome(null)
       setFoundedYear(foundingYear)
       setCalendarMonth(OPENING_MONTH)
       setCalendarYear(foundingYear)
@@ -272,6 +299,14 @@ export function PlannerApp() {
     const notice = epidemicNotice(epidemic)
     const epidemicKey = `${calendarYear}-${calendarMonth}`
     const showEpidemic = notice !== null && epidemicDismissed !== epidemicKey
+    const selected = cell ? structureAt(settlement, cell.y * world.size + cell.x) : null
+    const property =
+      selected && people
+        ? [
+            ...propertyLines(selected, holdings, people, world.terrain, world.feature, world.size, landSchedule),
+            ...productionLines(selected, farms, people),
+          ]
+        : []
     return (
       <div className="flex h-dvh flex-col bg-background text-foreground">
         <header className="flex shrink-0 flex-wrap items-center gap-2 border-b px-2 py-1.5">
@@ -299,6 +334,18 @@ export function PlannerApp() {
                 value={population.toLocaleString("en-US")}
                 pressed={ledger === "population"}
                 onClick={() => setLedger((current) => (current === "population" ? null : "population"))}
+              />
+              <BarStat
+                label="Education"
+                value={literacyLabel(schooling)}
+                pressed={ledger === "education"}
+                onClick={() => setLedger((current) => (current === "education" ? null : "education"))}
+              />
+              <BarStat
+                label="Economy"
+                value={economy ? formatMoney(economy.total) : "—"}
+                pressed={ledger === "economy"}
+                onClick={() => setLedger((current) => (current === "economy" ? null : "economy"))}
               />
               <BarStat
                 label="Treasury"
@@ -346,21 +393,66 @@ export function PlannerApp() {
             layer={layer}
             cell={cell}
             generation={generation}
+            structures={settlement.structures}
+            tool={tool}
             onSelect={setCell}
+            onBuild={(cells, mode, latch, allowNew) => {
+              setSettlement((current) =>
+                applyBuild(current, tool, cells, world.terrain, world.feature, world.size, mode, latch, allowNew),
+              )
+            }}
           />
-          <div
-            className={cn(
-              "absolute top-2 right-2 z-10 flex w-72 flex-col items-end gap-2",
-              ledger && "bottom-2",
-            )}
-          >
-            <div className={cn("w-full", ledger && "max-h-[46%] min-h-0 overflow-auto")}>
-              <InspectorPanel
-                world={world}
-                cell={cell}
-                open={inspectorOpen}
-                onToggle={() => setInspectorOpen((open) => !open)}
-              />
+          <div className="absolute top-2 right-2 bottom-2 z-10 flex w-72 flex-col items-end gap-2">
+            {!inspectorOpen || !buildingOpen ? (
+              <div className="flex justify-end gap-2">
+                {!inspectorOpen ? (
+                  <InspectorPanel
+                    world={world}
+                    cell={cell}
+                    layer={layer}
+                    structure={null}
+                    open={false}
+                    onToggle={() => setInspectorOpen(true)}
+                  />
+                ) : null}
+                {!buildingOpen ? (
+                  <BuildingInspector
+                    structure={null}
+                    size={world.size}
+                    chosen={false}
+                    lines={[]}
+                    open={false}
+                    onToggle={() => setBuildingOpen(true)}
+                  />
+                ) : null}
+              </div>
+            ) : null}
+            <div
+              className={cn(
+                "flex w-full min-h-0 flex-col gap-2 overflow-auto",
+                ledger ? "max-h-[46%]" : "max-h-full",
+              )}
+            >
+              {inspectorOpen ? (
+                <InspectorPanel
+                  world={world}
+                  cell={cell}
+                  layer={layer}
+                  structure={cell ? structureLabel(settlement, cell.y * world.size + cell.x) : null}
+                  open
+                  onToggle={() => setInspectorOpen(false)}
+                />
+              ) : null}
+              {buildingOpen ? (
+                <BuildingInspector
+                  structure={selected}
+                  size={world.size}
+                  chosen={cell !== null}
+                  lines={property}
+                  open
+                  onToggle={() => setBuildingOpen(false)}
+                />
+              ) : null}
             </div>
             {ledger ? (
               <div className="min-h-0 w-full flex-1 overflow-auto">
@@ -372,6 +464,13 @@ export function PlannerApp() {
                   lastBirths={fertility?.lastBirths ?? null}
                   lastDeaths={fertility?.lastDeaths ?? null}
                   lastRate={fertility?.lastRate ?? null}
+                  schooling={schooling}
+                  economy={economy}
+                  landIncome={landIncome}
+                  land={landSchedule}
+                  onLand={(type, patch) =>
+                    setLandSchedule((current) => ({ ...current, [type]: { ...current[type], ...patch } }))
+                  }
                   onClose={() => setLedger(null)}
                 />
               </div>
@@ -431,20 +530,55 @@ export function PlannerApp() {
             </div>
           ) : null}
         </div>
-        <footer className="flex h-16 shrink-0 items-center justify-between border-t px-4">
-          <span className="text-sm text-muted-foreground">Buildings</span>
+        <CategoryBar tool={tool} onTool={(next) => setTool((current) => (current === next ? null : next))} />
+        <footer className="flex h-16 shrink-0 items-center gap-2 border-t px-3">
+          <BuildingMenu tool={tool} onTool={(next) => setTool((current) => (current === next ? null : next))} />
           <Button
             type="button"
+            className="shrink-0"
             onClick={() => {
               if (!people) return
               const nextMonth = calendarMonth === 11 ? 0 : calendarMonth + 1
               const nextYear = calendarMonth === 11 ? calendarYear + 1 : calendarYear
               const gameSeed = seed.trim() || "0"
               const step = advancePeople(people, nextYear, nextMonth, gameSeed, epidemic)
+              const committed = commitSettlement(settlement, world.terrain, world.feature, world.size)
+              const landStep = settleHoldings(
+                holdings,
+                committed.structures,
+                step.people,
+                world.terrain,
+                world.feature,
+                world.size,
+                landSchedule,
+                nextMonth,
+                nextYear,
+                gameSeed,
+                step.idMap,
+              )
               setCalendarMonth(nextMonth)
               setCalendarYear(nextYear)
-              setPeople(step.people)
+              setPeople(landStep.people)
               setEpidemic(step.epidemic)
+              setTreasury((cash) => cash + step.toTreasury + landStep.toTreasury)
+              setSettlement(committed)
+              const worked = workFarms(
+                farms,
+                committed.structures,
+                landStep.holdings.rows,
+                world.terrain,
+                world.feature,
+                world.fertility,
+                presetId,
+                nextMonth,
+                nextYear,
+                gameSeed,
+                step.idMap,
+              )
+              setHoldings(landStep.holdings)
+              setFarms(worked.farms)
+              if (worked.changedLand) setWorld({ ...world, feature: worked.feature, fertility: worked.fertility })
+              setLandIncome(landStep.toTreasury)
               setFertility((current) =>
                 current ? noteMonth(current, nextYear, nextMonth, step.people, step.deaths) : current,
               )

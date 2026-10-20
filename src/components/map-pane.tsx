@@ -1,8 +1,9 @@
 "use client"
 
-import { useEffect, useImperativeHandle, useRef, type Ref } from "react"
+import { useEffect, useImperativeHandle, useRef, useState, type PointerEvent as ReactPointerEvent, type Ref } from "react"
 import { Card, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
-import { legendFor, paintLayer } from "@/lib/colors"
+import { HOME_STYLE, isPlop, isWater, PLOP_STYLE, type BuildTool, type Structure } from "@/lib/buildings"
+import { paintLayer } from "@/lib/colors"
 import type { LayerId, World } from "@/lib/types"
 
 export type MapPaneHandle = {
@@ -10,28 +11,50 @@ export type MapPaneHandle = {
   fit: () => void
 }
 
+type Cell = { x: number; y: number }
+
 type MapPaneProps = {
   world: World | null
   layer: LayerId
-  cell: { x: number; y: number } | null
+  cell: Cell | null
   generation: number
-  onSelect: (cell: { x: number; y: number }) => void
+  structures: Structure[]
+  tool: BuildTool | null
+  onSelect: (cell: Cell) => void
+  onBuild: (cells: Cell[], mode: "tap" | "stroke" | "place", latch: Set<number>, allowNew: boolean) => void
   handle: Ref<MapPaneHandle>
 }
 
-export function MapPane({ world, layer, cell, generation, onSelect, handle }: MapPaneProps) {
+type View = { x: number; y: number; zoom: number }
+
+export function MapPane({ world, layer, cell, generation, structures, tool, onSelect, onBuild, handle }: MapPaneProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const bitmapRef = useRef<HTMLCanvasElement | null>(null)
-  const viewRef = useRef({ x: 0, y: 0, zoom: 1 })
+  const viewRef = useRef<View>({ x: 0, y: 0, zoom: 1 })
   const fitZoomRef = useRef(1)
-  const dragRef = useRef<{ x: number; y: number; moved: boolean } | null>(null)
+  const dragRef = useRef<{
+    x: number
+    y: number
+    originX: number
+    originY: number
+    moved: boolean
+    painting: boolean
+    last: Cell | null
+    startedStroke: boolean
+    latch: Set<number>
+  } | null>(null)
   const worldRef = useRef(world)
   const cellRef = useRef(cell)
+  const structuresRef = useRef(structures)
+  const toolRef = useRef(tool)
+  const hoverRef = useRef<Cell | null>(null)
+  const [hover, setHover] = useState<Cell | null>(null)
 
-  useEffect(() => {
-    worldRef.current = world
-    cellRef.current = cell
-  }, [world, cell])
+  worldRef.current = world
+  cellRef.current = cell
+  structuresRef.current = structures
+  toolRef.current = tool
+  hoverRef.current = hover
 
   const draw = () => {
     const canvas = canvasRef.current
@@ -56,6 +79,8 @@ export function MapPane({ world, layer, cell, generation, onSelect, handle }: Ma
     context.fillRect(0, 0, width, height)
     const view = viewRef.current
     context.drawImage(bitmap, view.x, view.y, current.size * view.zoom, current.size * view.zoom)
+    drawStructures(context, structuresRef.current, current.size, view)
+    drawGhost(context, hoverRef.current, toolRef.current, structuresRef.current, current, view)
     const selected = cellRef.current
     if (!selected) return
     const sx = view.x + selected.x * view.zoom
@@ -144,9 +169,18 @@ export function MapPane({ world, layer, cell, generation, onSelect, handle }: Ma
 
   useEffect(() => {
     draw()
-  }, [cell])
+  }, [cell, structures, tool, hover])
 
-  const legend = legendFor(layer)
+  const cellAt = (event: ReactPointerEvent<HTMLCanvasElement>): Cell | null => {
+    const current = worldRef.current
+    if (!current) return null
+    const rect = event.currentTarget.getBoundingClientRect()
+    const view = viewRef.current
+    const x = Math.floor((event.clientX - rect.left - view.x) / view.zoom)
+    const y = Math.floor((event.clientY - rect.top - view.y) / view.zoom)
+    if (x < 0 || y < 0 || x >= current.size || y >= current.size) return null
+    return { x, y }
+  }
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -155,17 +189,53 @@ export function MapPane({ world, layer, cell, generation, onSelect, handle }: Ma
           <canvas
             ref={canvasRef}
             aria-label="Planning map"
-            className="h-full w-full touch-none"
+            className={tool ? "h-full w-full touch-none cursor-crosshair" : "h-full w-full touch-none"}
+            onContextMenu={(event) => event.preventDefault()}
             onPointerDown={(event) => {
-              event.currentTarget.setPointerCapture(event.pointerId)
-              dragRef.current = { x: event.clientX, y: event.clientY, moved: false }
+              try {
+                event.currentTarget.setPointerCapture(event.pointerId)
+              } catch {
+                // A pointer the browser is no longer tracking cannot be captured.
+              }
+              const active = toolRef.current
+              const painting = event.button === 0 && (active === "farmstead" || active === "delete")
+              dragRef.current = {
+                x: event.clientX,
+                y: event.clientY,
+                originX: event.clientX,
+                originY: event.clientY,
+                moved: false,
+                painting,
+                last: cellAt(event),
+                startedStroke: false,
+                latch: new Set(),
+              }
             }}
             onPointerMove={(event) => {
+              const active = toolRef.current
               const drag = dragRef.current
+              if (!drag && isPlop(active)) {
+                const next = cellAt(event)
+                setHover((current) => (sameCell(current, next) ? current : next))
+              }
               if (!drag) return
+              if (Math.hypot(event.clientX - drag.originX, event.clientY - drag.originY) > 3) drag.moved = true
+              if (drag.painting) {
+                const next = cellAt(event)
+                if (drag.moved && next && drag.last) {
+                  const allowNew = !drag.startedStroke
+                  drag.startedStroke = true
+                  onBuild(orthogonalLine(drag.last, next), "stroke", drag.latch, allowNew)
+                  drag.last = next
+                } else if (next) {
+                  drag.last = next
+                }
+                drag.x = event.clientX
+                drag.y = event.clientY
+                return
+              }
               const dx = event.clientX - drag.x
               const dy = event.clientY - drag.y
-              if (Math.hypot(dx, dy) > 3) drag.moved = true
               viewRef.current = {
                 ...viewRef.current,
                 x: viewRef.current.x + dx,
@@ -178,14 +248,18 @@ export function MapPane({ world, layer, cell, generation, onSelect, handle }: Ma
             onPointerUp={(event) => {
               const drag = dragRef.current
               dragRef.current = null
-              if (!drag || drag.moved || !world) return
-              const rect = event.currentTarget.getBoundingClientRect()
-              const view = viewRef.current
-              const x = Math.floor((event.clientX - rect.left - view.x) / view.zoom)
-              const y = Math.floor((event.clientY - rect.top - view.y) / view.zoom)
-              if (x < 0 || y < 0 || x >= world.size || y >= world.size) return
-              onSelect({ x, y })
+              if (!drag || !world) return
+              if (drag.painting) {
+                if (!drag.moved && drag.last) onBuild([drag.last], "tap", drag.latch, true)
+                return
+              }
+              if (drag.moved) return
+              const picked = cellAt(event)
+              if (!picked) return
+              if (isPlop(toolRef.current)) onBuild([picked], "place", drag.latch, false)
+              else onSelect(picked)
             }}
+            onPointerLeave={() => setHover(null)}
           />
         ) : (
           <div className="flex h-full items-center justify-center p-6">
@@ -207,20 +281,170 @@ export function MapPane({ world, layer, cell, generation, onSelect, handle }: Ma
           </div>
         ) : null}
       </div>
-      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 border-t px-3 py-2 text-xs text-muted-foreground">
-        {legend.swatches.map((swatch) => (
-          <span key={swatch.label} className="inline-flex items-center gap-1.5">
-            <span className="size-3 rounded-sm ring-1 ring-foreground/15" style={{ background: swatch.hex }} />
-            {swatch.label}
-          </span>
-        ))}
-        <span className="basis-full leading-relaxed sm:basis-auto">
-          {cell
-            ? `Cell ${cell.x}, ${cell.y}. `
-            : ""}
-          {legend.note ?? "Drag to pan. Scroll to zoom. One pixel is one 10 m cell."}
-        </span>
-      </div>
     </div>
   )
+}
+
+function sameCell(a: Cell | null, b: Cell | null): boolean {
+  if (a === b) return true
+  if (!a || !b) return false
+  return a.x === b.x && a.y === b.y
+}
+
+/** Walk the columns first, then the rows, so a fast drag stays edge-connected. */
+function orthogonalLine(from: Cell, to: Cell): Cell[] {
+  const cells: Cell[] = []
+  let x = from.x
+  let y = from.y
+  const stepX = Math.sign(to.x - x)
+  const stepY = Math.sign(to.y - y)
+  while (x !== to.x) {
+    cells.push({ x, y })
+    x += stepX
+  }
+  while (y !== to.y) {
+    cells.push({ x, y })
+    y += stepY
+  }
+  cells.push({ x, y })
+  return cells
+}
+
+function drawStructures(context: CanvasRenderingContext2D, structures: readonly Structure[], size: number, view: View) {
+  for (const structure of structures) {
+    const alpha = structure.removing ? 0.38 : structure.pending ? 0.78 : 1
+    if (structure.kind === "farmstead") {
+      strokeFarm(context, structure, size, view, alpha)
+      if (structure.home) drawLabelBox(context, structure.home, size, view, HOME_STYLE.fill, HOME_STYLE.label, alpha)
+      continue
+    }
+    const style = PLOP_STYLE[structure.kind]
+    drawLabelBox(context, structure.tiles, size, view, style.fill, style.label, alpha)
+  }
+}
+
+function strokeFarm(
+  context: CanvasRenderingContext2D,
+  structure: Structure,
+  size: number,
+  view: View,
+  alpha: number,
+) {
+  const tiles = new Set(structure.tiles)
+  context.save()
+  context.globalAlpha = alpha
+  context.lineWidth = Math.max(1, Math.min(2.5, view.zoom * 0.22))
+  context.beginPath()
+  for (const index of structure.tiles) {
+    const x = index % size
+    const y = (index - x) / size
+    const sx = view.x + x * view.zoom
+    const sy = view.y + y * view.zoom
+    const z = view.zoom
+    if (x === 0 || !tiles.has(index - 1)) {
+      context.moveTo(sx, sy)
+      context.lineTo(sx, sy + z)
+    }
+    if (x + 1 === size || !tiles.has(index + 1)) {
+      context.moveTo(sx + z, sy)
+      context.lineTo(sx + z, sy + z)
+    }
+    if (y === 0 || !tiles.has(index - size)) {
+      context.moveTo(sx, sy)
+      context.lineTo(sx + z, sy)
+    }
+    if (y + 1 === size || !tiles.has(index + size)) {
+      context.moveTo(sx, sy + z)
+      context.lineTo(sx + z, sy + z)
+    }
+  }
+  context.strokeStyle = structure.removing ? "rgba(176, 64, 48, 0.95)" : "rgba(236, 255, 242, 0.95)"
+  context.stroke()
+  context.strokeStyle = structure.removing ? "rgba(176, 64, 48, 0.55)" : "rgba(86, 168, 104, 0.7)"
+  context.stroke()
+  context.restore()
+}
+
+function drawGhost(
+  context: CanvasRenderingContext2D,
+  hover: Cell | null,
+  tool: BuildTool | null,
+  structures: readonly Structure[],
+  world: World,
+  view: View,
+) {
+  if (!hover || !isPlop(tool)) return
+  const size = world.size
+  const tiles = [hover.y * size + hover.x, hover.y * size + hover.x + 1, (hover.y + 1) * size + hover.x, (hover.y + 1) * size + hover.x + 1]
+  const inside = hover.x + 1 < size && hover.y + 1 < size
+  const blocked =
+    !inside ||
+    tiles.some(
+      (index) =>
+        isWater(world.terrain, world.feature, index) ||
+        structures.some((structure) => structure.tiles.includes(index)),
+    )
+  const style = PLOP_STYLE[tool]
+  const sx = view.x + hover.x * view.zoom
+  const sy = view.y + hover.y * view.zoom
+  const width = view.zoom * 2
+  const height = view.zoom * 2
+  context.save()
+  context.globalAlpha = 0.45
+  context.fillStyle = blocked ? "rgba(168, 48, 36, 0.9)" : style.fill
+  context.fillRect(sx, sy, width, height)
+  context.restore()
+  if (blocked || width < 16 || height < 10) return
+  context.save()
+  context.globalAlpha = 0.9
+  context.fillStyle = "#fff8e7"
+  context.font = `600 ${Math.max(8, Math.floor(Math.min(width, height) * 0.42))}px sans-serif`
+  context.textAlign = "center"
+  context.textBaseline = "middle"
+  context.fillText(style.label, sx + width / 2, sy + height / 2 + 0.5)
+  context.restore()
+}
+
+function drawLabelBox(
+  context: CanvasRenderingContext2D,
+  tiles: readonly number[],
+  size: number,
+  view: View,
+  fill: string,
+  label: string,
+  alpha: number,
+) {
+  let minX = size
+  let minY = size
+  let maxX = 0
+  let maxY = 0
+  for (const index of tiles) {
+    const x = index % size
+    const y = (index - x) / size
+    if (x < minX) minX = x
+    if (y < minY) minY = y
+    if (x > maxX) maxX = x
+    if (y > maxY) maxY = y
+  }
+  const sx = view.x + minX * view.zoom
+  const sy = view.y + minY * view.zoom
+  const width = (maxX - minX + 1) * view.zoom
+  const height = (maxY - minY + 1) * view.zoom
+  context.save()
+  context.globalAlpha = alpha
+  context.fillStyle = fill
+  context.fillRect(sx, sy, width, height)
+  context.strokeStyle = "rgba(28, 22, 16, 0.4)"
+  context.lineWidth = 1
+  context.strokeRect(sx + 0.5, sy + 0.5, Math.max(0, width - 1), Math.max(0, height - 1))
+  context.restore()
+  if (width < 16 || height < 10) return
+  context.save()
+  context.globalAlpha = 1
+  context.fillStyle = "#fff8e7"
+  context.font = `600 ${Math.max(8, Math.floor(Math.min(width, height) * 0.42))}px sans-serif`
+  context.textAlign = "center"
+  context.textBaseline = "middle"
+  context.fillText(label, sx + width / 2, sy + height / 2 + 0.5)
+  context.restore()
 }

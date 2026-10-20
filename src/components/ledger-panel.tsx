@@ -1,13 +1,24 @@
 "use client"
 
+import { useState } from "react"
 import { Button } from "@/components/ui/button"
 import { Card, CardAction, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
-import type { CitizenCensus } from "@/lib/people"
+import { Input } from "@/components/ui/input"
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import { LAND_LABEL, LAND_TYPES, type LandRate, type LandSchedule, type LandType } from "@/lib/land"
+import type { CitizenCensus, EconomyCensus, EducationCensus } from "@/lib/people"
 import { cn } from "@/lib/utils"
 
-export type LedgerId = "population" | "treasury"
+export type LedgerId = "population" | "treasury" | "education" | "economy"
 
 const BLANK = "—"
+
+const TITLES: Record<LedgerId, string> = {
+  population: "Population",
+  education: "Education",
+  treasury: "Treasury",
+  economy: "Economy",
+}
 
 type Row = {
   label: string
@@ -24,6 +35,11 @@ export function LedgerPanel({
   lastBirths,
   lastDeaths,
   lastRate,
+  schooling,
+  economy,
+  landIncome,
+  land,
+  onLand,
   onClose,
 }: {
   kind: LedgerId
@@ -33,16 +49,31 @@ export function LedgerPanel({
   lastBirths: number | null
   lastDeaths: number | null
   lastRate: number | null
+  schooling: EducationCensus | null
+  economy: EconomyCensus | null
+  /** Land payments collected last month, or null before the first month. */
+  landIncome: number | null
+  land: LandSchedule
+  onLand: (type: LandType, patch: Partial<LandRate>) => void
   onClose: () => void
 }) {
   const rows =
     kind === "population"
       ? populationRows(population, citizens, lastBirths, lastDeaths, lastRate)
-      : treasuryRows(cash)
+      : kind === "education"
+        ? educationRows(schooling)
+        : kind === "economy"
+          ? economyRows(economy)
+          : treasuryRows(cash, landIncome)
+  if (kind === "treasury") {
+    return (
+      <TreasuryPanel rows={rows} land={land} onLand={onLand} onClose={onClose} />
+    )
+  }
   return (
     <Card className="w-full shadow-md">
       <CardHeader>
-        <CardTitle>{kind === "population" ? "Population" : "Treasury"}</CardTitle>
+        <CardTitle>{TITLES[kind]}</CardTitle>
         <CardAction>
           <Button type="button" variant="outline" size="sm" aria-label="Close" onClick={onClose}>
             X
@@ -51,9 +82,9 @@ export function LedgerPanel({
       </CardHeader>
       <CardContent>
         <dl className="grid gap-2.5 text-sm">
-          {rows.map((row) => (
+          {rows.map((row, index) => (
             <div
-              key={row.label}
+              key={`${row.label}-${index}`}
               className={cn(
                 "grid grid-cols-[minmax(0,1fr)_auto] items-baseline gap-3",
                 row.detail && "text-xs text-muted-foreground",
@@ -124,6 +155,62 @@ function populationRows(
   ]
 }
 
+function economyRows(economy: EconomyCensus | null): Row[] {
+  return [
+    { label: "Total Household Wealth", value: money(economy?.total ?? null, true) },
+    {
+      label: "Avg. Family Wealth",
+      note: "A living couple and their children under 18.",
+      value: money(economy?.familyAverage ?? null),
+    },
+    { label: "Median", value: money(economy?.familyMedian ?? null), detail: true },
+    {
+      label: "Avg. Single Wealth",
+      note: "People 18 and older with no living spouse.",
+      value: money(economy?.singleAverage ?? null),
+    },
+    { label: "Median", value: money(economy?.singleMedian ?? null), detail: true },
+  ]
+}
+
+function money(value: number | null, whole = false): string {
+  if (value === null) return BLANK
+  const digits = whole || Number.isInteger(value) ? 0 : 1
+  return (
+    "$" +
+    value.toLocaleString("en-US", {
+      minimumFractionDigits: digits,
+      maximumFractionDigits: digits,
+    })
+  )
+}
+
+function educationRows(schooling: EducationCensus | null): Row[] {
+  const primary = schooling?.primaryStudents ?? 0
+  const secondary = schooling?.secondaryStudents ?? 0
+  const enrolled = primary + secondary
+  return [
+    { label: "Students enrolled", value: enrolled.toLocaleString("en-US") },
+    { label: "Primary", value: primary.toLocaleString("en-US"), detail: true },
+    { label: "Secondary", value: secondary.toLocaleString("en-US"), detail: true },
+    {
+      label: "Adult literacy",
+      note: "Share of people 18 and older with at least basic schooling.",
+      value: literacy(schooling),
+    },
+    {
+      label: "Adults with at least secondary",
+      value: band(schooling?.secondaryAdults, schooling?.adults ?? 0),
+    },
+  ]
+}
+
+function literacy(schooling: EducationCensus | null): string {
+  if (schooling === null || schooling.adults <= 0) return BLANK
+  const share = (schooling.literateAdults / schooling.adults) * 100
+  return share.toLocaleString("en-US", { minimumFractionDigits: 1, maximumFractionDigits: 1 }) + "%"
+}
+
 function score(value: number | undefined): string {
   if (value === undefined) return BLANK
   return value.toLocaleString("en-US", { minimumFractionDigits: 1, maximumFractionDigits: 1 })
@@ -139,7 +226,7 @@ function band(count: number | undefined, total: number): string {
   return `${count.toLocaleString("en-US")} (${percent}%)`
 }
 
-function treasuryRows(cash: string): Row[] {
+function treasuryRows(cash: string, landIncome: number | null): Row[] {
   return [
     { label: "Cash", value: cash },
     {
@@ -156,9 +243,141 @@ function treasuryRows(cash: string): Row[] {
     {
       label: "Capital income",
       note: "Last month. Sales of land, resources, and the like.",
-      value: BLANK,
+      value: landIncome === null ? BLANK : `$${landIncome.toLocaleString("en-US")}`,
     },
     { label: "Debt", value: BLANK },
     { label: "Interest rate", value: BLANK },
   ]
+}
+
+function TreasuryPanel({
+  rows,
+  land,
+  onLand,
+  onClose,
+}: {
+  rows: Row[]
+  land: LandSchedule
+  onLand: (type: LandType, patch: Partial<LandRate>) => void
+  onClose: () => void
+}) {
+  const [tab, setTab] = useState("overview")
+  return (
+    <Card className="w-full shadow-md">
+      <CardHeader>
+        <CardTitle>Treasury</CardTitle>
+        <CardAction>
+          <Button type="button" variant="outline" size="sm" aria-label="Close" onClick={onClose}>
+            X
+          </Button>
+        </CardAction>
+      </CardHeader>
+      <CardContent>
+        <Tabs
+          value={tab}
+          onValueChange={(value) => {
+            if (typeof value === "string") setTab(value)
+          }}
+        >
+          <TabsList className="h-auto w-full flex-wrap justify-start">
+            <TabsTrigger value="overview" className="px-1.5 text-xs">Overview</TabsTrigger>
+            <TabsTrigger value="taxation" className="px-1.5 text-xs">Taxation</TabsTrigger>
+            <TabsTrigger value="land" className="px-1.5 text-xs">Land</TabsTrigger>
+            <TabsTrigger value="expenses" className="px-1.5 text-xs">Expenses</TabsTrigger>
+          </TabsList>
+          <TabsContent value="overview">
+            <RowList rows={rows} />
+          </TabsContent>
+          <TabsContent value="taxation">
+            <RowList rows={rows.filter((row) => row.label === "Tax income")} />
+          </TabsContent>
+          <TabsContent value="expenses">
+            <RowList rows={rows.filter((row) => row.label.endsWith("expenses"))} />
+          </TabsContent>
+          <TabsContent value="land">
+            <LandTable land={land} onLand={onLand} />
+          </TabsContent>
+        </Tabs>
+      </CardContent>
+    </Card>
+  )
+}
+
+function LandTable({
+  land,
+  onLand,
+}: {
+  land: LandSchedule
+  onLand: (type: LandType, patch: Partial<LandRate>) => void
+}) {
+  return (
+    <div className="grid gap-3">
+      {LAND_TYPES.map((type) => {
+        const rate = land[type]
+        return (
+          <div key={type} className="grid gap-1">
+            <div className="text-sm font-medium">{LAND_LABEL[type]}</div>
+            <div className="flex items-center gap-1">
+              <Button
+                type="button"
+                size="sm"
+                variant={rate.tenure === "sale" ? "secondary" : "outline"}
+                aria-pressed={rate.tenure === "sale"}
+                onClick={() => onLand(type, { tenure: "sale" })}
+              >
+                Sell
+              </Button>
+              <Button
+                type="button"
+                size="sm"
+                variant={rate.tenure === "lease" ? "secondary" : "outline"}
+                aria-pressed={rate.tenure === "lease"}
+                onClick={() => onLand(type, { tenure: "lease" })}
+              >
+                Lease
+              </Button>
+              <Input
+                type="number"
+                min={0}
+                step={1}
+                aria-label={`${LAND_LABEL[type]} dollars per tile`}
+                className="h-7 w-20 tabular-nums"
+                value={rate.price}
+                onChange={(event) => {
+                  const next = Math.floor(Number(event.target.value))
+                  onLand(type, { price: Number.isFinite(next) ? Math.max(0, next) : 0 })
+                }}
+              />
+            </div>
+          </div>
+        )
+      })}
+      <p className="text-xs leading-relaxed text-muted-foreground">
+        Dollars per tile. A farmstead follows the farmland switch. A tile set the other way converts at 20 to 1.
+        Businesses use urban land.
+      </p>
+    </div>
+  )
+}
+
+function RowList({ rows }: { rows: Row[] }) {
+  return (
+    <dl className="grid gap-2.5 text-sm">
+      {rows.map((row, index) => (
+        <div
+          key={`${row.label}-${index}`}
+          className={cn(
+            "grid grid-cols-[minmax(0,1fr)_auto] items-baseline gap-3",
+            row.detail && "text-xs text-muted-foreground",
+          )}
+        >
+          <dt className={row.detail ? "pl-3" : undefined}>
+            <div>{row.label}</div>
+            {row.note ? <div className="text-xs leading-snug text-muted-foreground">{row.note}</div> : null}
+          </dt>
+          <dd className={cn("tabular-nums", !row.detail && "font-medium")}>{row.value}</dd>
+        </div>
+      ))}
+    </dl>
+  )
 }
