@@ -80,6 +80,11 @@ export type People = {
   primaryYears: Uint8Array
   /** Secondary attendance, in tenths of a quality-weighted year. */
   secondaryYears: Uint8Array
+  /**
+   * Current work. Student while on a school roll, then the job of the oldest
+   * house the person or their spouse owns. Otherwise Idle under 18 and Unemployed at 18.
+   */
+  occupation: Uint8Array
   /** 1 while living. Dead rows stay until the January purge. */
   alive: Uint8Array
   /** Dollars earned this period. No wage rule yet, so this stays 0. */
@@ -89,6 +94,41 @@ export type People = {
   spouse: Int32Array
   mother: Int32Array
   father: Int32Array
+}
+
+/** Stored in People.occupation. A person holds one of these at a time. */
+export const OCCUPATION = {
+  idle: 0,
+  student: 1,
+  farmer: 2,
+  trader: 3,
+  craftsman: 4,
+  shopkeeper: 5,
+  unemployed: 6,
+} as const
+
+export const OCCUPATION_LABEL = [
+  "Idle",
+  "Student",
+  "Farmer",
+  "Trader",
+  "Craftsman",
+  "Shopkeeper",
+  "Unemployed",
+] as const
+
+/** A house someone lives in. The lowest id is the oldest, and that one sets the job. */
+export type HouseholdHome = {
+  id: number
+  owner: number
+  kind: "farmstead" | "market" | "trading-post" | "workshop"
+}
+
+const HOME_JOB: Record<HouseholdHome["kind"], number> = {
+  farmstead: OCCUPATION.farmer,
+  "trading-post": OCCUPATION.trader,
+  workshop: OCCUPATION.craftsman,
+  market: OCCUPATION.shopkeeper,
 }
 
 /** Years a woman spends in each birth band. Matches the fertility table. */
@@ -297,6 +337,10 @@ export type EconomyCensus = {
   familyMedian: number | null
   singleAverage: number | null
   singleMedian: number | null
+  /** Living people whose occupation is Unemployed. */
+  unemployed: number
+  /** Unemployed divided by people 18 and older who are not students. Null when that group is empty. */
+  unemploymentRate: number | null
 }
 
 /**
@@ -333,13 +377,122 @@ export function economyCensus(people: People): EconomyCensus {
     singles.push(people.wealth[i])
   }
 
+  let unemployed = 0
+  let labor = 0
+  for (let i = 0; i < people.age.length; i++) {
+    if (people.alive[i] === 0 || people.age[i] < MIN_ADULT_AGE) continue
+    const job = people.occupation?.[i] ?? OCCUPATION.unemployed
+    if (job === OCCUPATION.student) continue
+    labor += 1
+    if (job === OCCUPATION.unemployed) unemployed += 1
+  }
+
   return {
     total,
     familyAverage: average(families),
     familyMedian: median(families),
     singleAverage: average(singles),
     singleMedian: median(singles),
+    unemployed,
+    unemploymentRate: labor === 0 ? null : unemployed / labor,
   }
+}
+
+/** Houses already in place, with the person who owns each one. */
+export function householdHomes(
+  structures: readonly { id: number; kind: string; pending: boolean; removing: boolean }[],
+  holdings: readonly { structureId: number; owner: number }[],
+): HouseholdHome[] {
+  const ownerOf = new Map<number, number>()
+  for (const row of holdings) if (row.owner >= 0) ownerOf.set(row.structureId, row.owner)
+  const homes: HouseholdHome[] = []
+  for (const structure of structures) {
+    if (structure.pending || structure.removing) continue
+    if (
+      structure.kind !== "farmstead" &&
+      structure.kind !== "market" &&
+      structure.kind !== "trading-post" &&
+      structure.kind !== "workshop"
+    ) {
+      continue
+    }
+    const owner = ownerOf.get(structure.id)
+    if (owner === undefined) continue
+    homes.push({ id: structure.id, owner, kind: structure.kind })
+  }
+  return homes
+}
+
+/**
+ * Write one occupation for each person. A school seat wins. Otherwise the owner
+ * of a house and their living spouse take that house's job, and the oldest house
+ * wins when the household owns more than one. Everyone else is Idle under 18
+ * and Unemployed at 18.
+ */
+export function assignOccupations(
+  people: People,
+  homes: readonly HouseholdHome[],
+  schools: SchoolSession = NO_SCHOOLS,
+): People {
+  const byOwner = new Map<number, { id: number; job: number }[]>()
+  for (const home of homes) {
+    const list = byOwner.get(home.owner) ?? []
+    list.push({ id: home.id, job: HOME_JOB[home.kind] })
+    byOwner.set(home.owner, list)
+  }
+  const students = new Set<number>()
+  for (const seat of schools.primary) students.add(seat.student)
+  for (const seat of schools.secondary) students.add(seat.student)
+  const occupation = new Uint8Array(people.age.length)
+  for (let i = 0; i < people.age.length; i++) {
+    if (people.alive[i] === 0) continue
+    if (students.has(i)) {
+      occupation[i] = OCCUPATION.student
+      continue
+    }
+    const job = householdJob(people, byOwner, i)
+    if (job !== null) occupation[i] = job
+    else occupation[i] = people.age[i] < MIN_ADULT_AGE ? OCCUPATION.idle : OCCUPATION.unemployed
+  }
+  return { ...people, occupation }
+}
+
+/** Couples with no house, and unmarried adults who do not own one. Students are left out of the second count. */
+export function residenceCensus(
+  people: People,
+  homes: readonly HouseholdHome[],
+): { homelessFamilies: number; homelessSingles: number } {
+  const owners = new Set<number>()
+  for (const home of homes) if (home.owner >= 0) owners.add(home.owner)
+  let homelessFamilies = 0
+  let homelessSingles = 0
+  for (let i = 0; i < people.age.length; i++) {
+    if (people.alive[i] === 0) continue
+    const mate = people.spouse[i]
+    const mateAlive = mate >= 0 && mate < people.alive.length && people.alive[mate] !== 0
+    if (mateAlive) {
+      if (i < mate && !owners.has(i) && !owners.has(mate)) homelessFamilies += 1
+      continue
+    }
+    if (people.age[i] < MIN_ADULT_AGE) continue
+    if ((people.occupation?.[i] ?? OCCUPATION.unemployed) === OCCUPATION.student) continue
+    if (!owners.has(i)) homelessSingles += 1
+  }
+  return { homelessFamilies, homelessSingles }
+}
+
+function householdJob(
+  people: People,
+  byOwner: Map<number, { id: number; job: number }[]>,
+  id: number,
+): number | null {
+  const mate = people.spouse[id]
+  const mateAlive = mate >= 0 && mate < people.alive.length && people.alive[mate] !== 0
+  const homes = [...(byOwner.get(id) ?? []), ...(mateAlive ? (byOwner.get(mate) ?? []) : [])]
+  if (homes.length === 0) return null
+  let best = homes[0]
+  for (const home of homes) if (home.id < best.id) best = home
+  return best.job
 }
 
 function average(values: readonly number[]): number | null {
@@ -550,6 +703,7 @@ export function advancePeople(
   const education = new Uint8Array(people.education)
   const primaryYears = new Uint8Array(people.primaryYears)
   const secondaryYears = new Uint8Array(people.secondaryYears)
+  const occupation = occupationColumn(people, count)
   const alive = new Uint8Array(people.alive)
   const income = new Int32Array(people.income)
   const wealth = new Int32Array(people.wealth)
@@ -644,7 +798,7 @@ export function advancePeople(
 
   let next: People
   if (born.length === 0) {
-    next = { age, sex, birthMonth, cooldown, vigor, intellect, willpower, education, primaryYears, secondaryYears, alive, income, wealth, spouse, mother, father }
+    next = { age, sex, birthMonth, cooldown, vigor, intellect, willpower, education, primaryYears, secondaryYears, occupation, alive, income, wealth, spouse, mother, father }
   } else {
     const grownCount = count + born.length
     const grown = {
@@ -658,6 +812,7 @@ export function advancePeople(
       education: new Uint8Array(grownCount),
       primaryYears: new Uint8Array(grownCount),
       secondaryYears: new Uint8Array(grownCount),
+      occupation: new Uint8Array(grownCount),
       alive: new Uint8Array(grownCount),
       income: new Int32Array(grownCount),
       wealth: new Int32Array(grownCount),
@@ -675,6 +830,7 @@ export function advancePeople(
     grown.education.set(education)
     grown.primaryYears.set(primaryYears)
     grown.secondaryYears.set(secondaryYears)
+    grown.occupation.set(occupation)
     grown.alive.set(alive)
     grown.income.set(income)
     grown.wealth.set(wealth)
@@ -943,6 +1099,7 @@ export function purgeUnlinkedDead(people: People): { people: People; idMap: Int3
   const education = new Uint8Array(kept)
   const primaryYears = new Uint8Array(kept)
   const secondaryYears = new Uint8Array(kept)
+  const occupation = new Uint8Array(kept)
   const alive = new Uint8Array(kept)
   const income = new Int32Array(kept)
   const wealth = new Int32Array(kept)
@@ -962,6 +1119,7 @@ export function purgeUnlinkedDead(people: People): { people: People; idMap: Int3
     education[at] = people.education[i]
     primaryYears[at] = people.primaryYears[i]
     secondaryYears[at] = people.secondaryYears[i]
+    occupation[at] = people.occupation?.[i] ?? 0
     alive[at] = people.alive[i]
     income[at] = people.income[i]
     wealth[at] = people.wealth[i]
@@ -970,7 +1128,7 @@ export function purgeUnlinkedDead(people: People): { people: People; idMap: Int3
     father[at] = people.father[i] < 0 ? -1 : map[people.father[i]]
   }
   return {
-    people: { age, sex, birthMonth, cooldown, vigor, intellect, willpower, education, primaryYears, secondaryYears, alive, income, wealth, spouse, mother, father },
+    people: { age, sex, birthMonth, cooldown, vigor, intellect, willpower, education, primaryYears, secondaryYears, occupation, alive, income, wealth, spouse, mother, father },
     idMap: map,
   }
 }
@@ -1294,6 +1452,14 @@ function filledAlive(count: number): Uint8Array {
   return alive
 }
 
+/** Copy the occupation column, or zeros when an older table has none. */
+function occupationColumn(people: People, count: number): Uint8Array {
+  const next = new Uint8Array(count)
+  const current = people.occupation
+  if (current) next.set(current.subarray(0, Math.min(count, current.length)))
+  return next
+}
+
 function pack(
   age: number[],
   sex: number[],
@@ -1317,6 +1483,7 @@ function pack(
     education: new Uint8Array(age.length),
     primaryYears: new Uint8Array(age.length),
     secondaryYears: new Uint8Array(age.length),
+    occupation: new Uint8Array(age.length),
     alive: filledAlive(age.length),
     income: new Int32Array(age.length),
     wealth: new Int32Array(age.length),

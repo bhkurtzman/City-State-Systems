@@ -22,6 +22,7 @@ import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import {
   cloneMonths,
   deriveClimate,
+  monthAridity,
   presetById,
   sanitizeMonth,
   temperaturesForLatitude,
@@ -29,10 +30,13 @@ import {
 } from "@/lib/climate"
 import {
   advancePeople,
+  assignOccupations,
   beginFertility,
   citizenCensus,
   economyCensus,
   educationCensus,
+  householdHomes,
+  residenceCensus,
   DIFFICULTIES,
   emptyEpidemic,
   epidemicNotice,
@@ -47,6 +51,7 @@ import {
 import { applyBuild, commitSettlement, emptySettlement, structureAt, structureLabel, type BuildTool } from "@/lib/buildings"
 import { defaultLandSchedule, emptyHoldings, propertyLines, settleHoldings, type LandSchedule } from "@/lib/land"
 import { emptyFarms, productionLines, workFarms } from "@/lib/produce"
+import { costOfLiving, emptyTown, marketLines, townPriceRows, tradeLines, tradeMonth } from "@/lib/trade"
 import { runGeneration } from "@/lib/run-generation"
 import { monthWeather } from "@/lib/weather"
 import { LAYERS, type Coast, type LayerId, type MapSize, type MonthClimate, type World } from "@/lib/types"
@@ -218,6 +223,7 @@ export function PlannerApp() {
   const [landSchedule, setLandSchedule] = useState<LandSchedule>(defaultLandSchedule)
   const [holdings, setHoldings] = useState(emptyHoldings)
   const [farms, setFarms] = useState(emptyFarms)
+  const [town, setTown] = useState(emptyTown)
   const [landIncome, setLandIncome] = useState<number | null>(null)
   const [foundingYear, setFoundingYear] = useState(1)
   const [foundedYear, setFoundedYear] = useState(1)
@@ -225,10 +231,16 @@ export function PlannerApp() {
   const [calendarYear, setCalendarYear] = useState(1)
   const mapRef = useRef<MapPaneHandle>(null)
 
-  const population = people ? livingCount(people) : 0
-  const citizens = useMemo(() => (people ? citizenCensus(people) : null), [people])
-  const schooling = useMemo(() => (people ? educationCensus(people) : null), [people])
-  const economy = useMemo(() => (people ? economyCensus(people) : null), [people])
+  const homes = useMemo(
+    () => householdHomes(settlement.structures, holdings.rows),
+    [settlement.structures, holdings.rows],
+  )
+  const housed = useMemo(() => (people ? assignOccupations(people, homes) : null), [people, homes])
+  const population = housed ? livingCount(housed) : 0
+  const citizens = useMemo(() => (housed ? citizenCensus(housed) : null), [housed])
+  const schooling = useMemo(() => (housed ? educationCensus(housed) : null), [housed])
+  const economy = useMemo(() => (housed ? economyCensus(housed) : null), [housed])
+  const residence = useMemo(() => (housed ? residenceCensus(housed, homes) : null), [housed, homes])
   const indices = useMemo(() => deriveClimate(latitude, months), [latitude, months])
   const weather = useMemo(
     () => monthWeather(seed.trim() || "0", calendarYear, calendarMonth, months[calendarMonth]),
@@ -271,7 +283,7 @@ export function PlannerApp() {
         OPENING_MONTH,
         difficulty,
       )
-      setPeople(founded.people)
+      setPeople(assignOccupations(founded.people, []))
       setEpidemic(founded.epidemic)
       setEpidemicDismissed(null)
       setFertility(beginFertility(foundingYear, OPENING_MONTH, founded.people))
@@ -281,6 +293,7 @@ export function PlannerApp() {
       setLandSchedule(defaultLandSchedule())
       setHoldings(emptyHoldings())
       setFarms(emptyFarms())
+      setTown(emptyTown())
       setLandIncome(null)
       setFoundedYear(foundingYear)
       setCalendarMonth(OPENING_MONTH)
@@ -305,6 +318,8 @@ export function PlannerApp() {
         ? [
             ...propertyLines(selected, holdings, people, world.terrain, world.feature, world.size, landSchedule),
             ...productionLines(selected, farms, people),
+            ...tradeLines(selected, holdings, town),
+            ...marketLines(selected, farms),
           ]
         : []
     return (
@@ -466,6 +481,10 @@ export function PlannerApp() {
                   lastRate={fertility?.lastRate ?? null}
                   schooling={schooling}
                   economy={economy}
+                  prices={townPriceRows(town, farms, settlement.structures, holdings, people, world.months[calendarMonth].low, world.terrain, world.feature, world.months.map((item) => item.low))}
+                  living={costOfLiving(town.prices, world.months.map((item) => item.low))}
+                  homelessFamilies={residence?.homelessFamilies ?? null}
+                  homelessSingles={residence?.homelessSingles ?? null}
                   landIncome={landIncome}
                   land={landSchedule}
                   onLand={(type, patch) =>
@@ -558,7 +577,6 @@ export function PlannerApp() {
               )
               setCalendarMonth(nextMonth)
               setCalendarYear(nextYear)
-              setPeople(landStep.people)
               setEpidemic(step.epidemic)
               setTreasury((cash) => cash + step.toTreasury + landStep.toTreasury)
               setSettlement(committed)
@@ -574,9 +592,28 @@ export function PlannerApp() {
                 nextYear,
                 gameSeed,
                 step.idMap,
+                monthAridity(world.latitude, world.months, nextMonth),
               )
+              const traded = tradeMonth(
+                landStep.people,
+                worked.farms,
+                committed.structures,
+                landStep.holdings,
+                town,
+                nextMonth,
+                nextYear,
+                world.months[nextMonth].low,
+                gameSeed,
+                world.months.map((item) => item.low),
+                world.terrain,
+                world.feature,
+                world.months[nextMonth].high,
+                world.months[nextMonth].precip,
+              )
+              setPeople(assignOccupations(traded.people, householdHomes(committed.structures, landStep.holdings.rows)))
               setHoldings(landStep.holdings)
-              setFarms(worked.farms)
+              setFarms(traded.farms)
+              setTown(traded.town)
               if (worked.changedLand) setWorld({ ...world, feature: worked.feature, fertility: worked.fertility })
               setLandIncome(landStep.toTreasury)
               setFertility((current) =>

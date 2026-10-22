@@ -37,6 +37,10 @@ export function LedgerPanel({
   lastRate,
   schooling,
   economy,
+  prices,
+  living,
+  homelessFamilies,
+  homelessSingles,
   landIncome,
   land,
   onLand,
@@ -51,6 +55,11 @@ export function LedgerPanel({
   lastRate: number | null
   schooling: EducationCensus | null
   economy: EconomyCensus | null
+  prices: { label: string; value: string; note?: string }[]
+  /** One adult's yearly cost of living, in whole dollars. */
+  living: number | null
+  homelessFamilies: number | null
+  homelessSingles: number | null
   /** Land payments collected last month, or null before the first month. */
   landIncome: number | null
   land: LandSchedule
@@ -59,16 +68,19 @@ export function LedgerPanel({
 }) {
   const rows =
     kind === "population"
-      ? populationRows(population, citizens, lastBirths, lastDeaths, lastRate)
+      ? populationRows(population, citizens, lastBirths, lastDeaths, lastRate, homelessFamilies, homelessSingles)
       : kind === "education"
         ? educationRows(schooling)
         : kind === "economy"
-          ? economyRows(economy)
+          ? economyRows(economy, living)
           : treasuryRows(cash, landIncome)
   if (kind === "treasury") {
     return (
       <TreasuryPanel rows={rows} land={land} onLand={onLand} onClose={onClose} />
     )
+  }
+  if (kind === "economy") {
+    return <EconomyPanel rows={rows} prices={prices} onClose={onClose} />
   }
   return (
     <Card className="w-full shadow-md">
@@ -109,6 +121,8 @@ function populationRows(
   lastBirths: number | null,
   lastDeaths: number | null,
   lastRate: number | null,
+  homelessFamilies: number | null,
+  homelessSingles: number | null,
 ): Row[] {
   const age =
     citizens === null
@@ -132,6 +146,16 @@ function populationRows(
     { label: "Young adults (27–40)", value: band(citizens?.youngAdults, population), detail: true },
     { label: "Mature adults (41–64)", value: band(citizens?.matureAdults, population), detail: true },
     { label: "Elderly (65+)", value: band(citizens?.elderly, population) },
+    {
+      label: "Homeless families",
+      note: "Couples who do not own a house.",
+      value: countOf(homelessFamilies),
+    },
+    {
+      label: "Homeless single adults",
+      note: "Unmarried people 18 and older with no house of their own. Students are not counted.",
+      value: countOf(homelessSingles),
+    },
     { label: "Average vigor", value: score(citizens?.averageVigor) },
     { label: "Average intellect", value: score(citizens?.averageIntellect) },
     { label: "Average willpower", value: score(citizens?.averageWillpower) },
@@ -155,7 +179,7 @@ function populationRows(
   ]
 }
 
-function economyRows(economy: EconomyCensus | null): Row[] {
+function economyRows(economy: EconomyCensus | null, living: number | null): Row[] {
   return [
     { label: "Total Household Wealth", value: money(economy?.total ?? null, true) },
     {
@@ -170,7 +194,32 @@ function economyRows(economy: EconomyCensus | null): Row[] {
       value: money(economy?.singleAverage ?? null),
     },
     { label: "Median", value: money(economy?.singleMedian ?? null), detail: true },
+    { label: "Unemployed", value: economy ? economy.unemployed.toLocaleString("en-US") : BLANK },
+    {
+      label: "Unemployment rate",
+      note: "Share of people 18 and older who are not students.",
+      value: unemployment(economy),
+    },
+    {
+      label: "Cost of living",
+      note: "One adult's food, clothing, and leather for a year, plus half a household's fuel.",
+      value: money(living, true),
+    },
   ]
+}
+
+function countOf(value: number | null): string {
+  return value === null ? BLANK : value.toLocaleString("en-US")
+}
+
+function unemployment(economy: EconomyCensus | null): string {
+  if (economy === null || economy.unemploymentRate === null) return BLANK
+  return (
+    (economy.unemploymentRate * 100).toLocaleString("en-US", {
+      minimumFractionDigits: 1,
+      maximumFractionDigits: 1,
+    }) + "%"
+  )
 }
 
 function money(value: number | null, whole = false): string {
@@ -248,6 +297,50 @@ function treasuryRows(cash: string, landIncome: number | null): Row[] {
     { label: "Debt", value: BLANK },
     { label: "Interest rate", value: BLANK },
   ]
+}
+
+function EconomyPanel({
+  rows,
+  prices,
+  onClose,
+}: {
+  rows: Row[]
+  prices: { label: string; value: string; note?: string }[]
+  onClose: () => void
+}) {
+  const [tab, setTab] = useState("overview")
+  const resources: Row[] = prices.map((row) => ({ label: row.label, value: row.value, note: row.note }))
+  return (
+    <Card className="w-full shadow-md">
+      <CardHeader>
+        <CardTitle>Economy</CardTitle>
+        <CardAction>
+          <Button type="button" variant="outline" size="sm" aria-label="Close" onClick={onClose}>
+            X
+          </Button>
+        </CardAction>
+      </CardHeader>
+      <CardContent>
+        <Tabs
+          value={tab}
+          onValueChange={(value) => {
+            if (typeof value === "string") setTab(value)
+          }}
+        >
+          <TabsList className="h-auto w-full flex-wrap justify-start">
+            <TabsTrigger value="overview" className="px-1.5 text-xs">Overview</TabsTrigger>
+            <TabsTrigger value="resources" className="px-1.5 text-xs">Resources</TabsTrigger>
+          </TabsList>
+          <TabsContent value="overview">
+            <RowList rows={rows} />
+          </TabsContent>
+          <TabsContent value="resources">
+            <RowList rows={resources} />
+          </TabsContent>
+        </Tabs>
+      </CardContent>
+    </Card>
+  )
 }
 
 function TreasuryPanel({

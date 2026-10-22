@@ -171,6 +171,25 @@ export function temperaturesForLatitude(
   })
 }
 
+/**
+ * This month's rainfall divided by its Thornthwaite PET.
+ * The annual index in deriveClimate is unchanged; salt uses the month.
+ */
+export function monthAridity(latitude: number, monthsIn: MonthClimate[], index: number): number {
+  if (index < 0 || index > 11 || monthsIn.length < 12) return 99
+  const clean = monthsIn.map(sanitizeMonth)
+  const means = clean.map((month) => (month.high + month.low) / 2)
+  let heat = 0
+  for (const mean of means) if (mean > 0) heat += (mean / 5) ** 1.514
+  if (heat <= 0 || means[index] <= 0) return clean[index].precip > 0 ? 99 : 0
+  const a = 6.75e-7 * heat ** 3 - 7.71e-5 * heat ** 2 + 1.792e-2 * heat + 0.49239
+  const unadjusted = 16 * (10 * means[index] / heat) ** a
+  const hours = daylightHours(latitude, MID_DAY[index])
+  const pet = unadjusted * (DAYS[index] / 30) * (hours / 12)
+  if (pet < 1) return clean[index].precip > 0 ? 99 : 0
+  return clean[index].precip / pet
+}
+
 export function sanitizeMonth(month: MonthClimate): MonthClimate {
   return {
     high: clamp(month.high, -45, 55),

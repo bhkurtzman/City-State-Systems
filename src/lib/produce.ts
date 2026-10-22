@@ -14,8 +14,33 @@ const TENTH = 10
 export const CROPS = ["grain", "fiber", "fruit", "vegetables", "dairy", "meat"] as const
 export type Crop = (typeof CROPS)[number]
 
-export const GOODS = ["grain", "fiber", "fruit", "vegetables", "dairy", "meat", "hide", "wood", "fish"] as const
+export const GOODS = [
+  "grain",
+  "fiber",
+  "fruit",
+  "dried-fruit",
+  "vegetables",
+  "dairy",
+  "meat",
+  "hide",
+  "wood",
+  "lumber",
+  "fish",
+  "cured-fish",
+  "cured-meat",
+  "leather",
+  "textiles",
+  "clothing",
+  "coal",
+  "salt",
+  "steel",
+  "steel-parts",
+  "steel-tools",
+] as const
 export type Good = (typeof GOODS)[number]
+
+/** One craft, rolled when a workshop is first owned and then kept. */
+export type ShopSpecialty = "sawmill" | "blacksmith" | "smokehouse"
 
 const CROP_LABEL: Record<Crop, string> = {
   grain: "Grain",
@@ -26,16 +51,34 @@ const CROP_LABEL: Record<Crop, string> = {
   meat: "Meat",
 }
 
-const GOOD_LABEL: Record<Good, string> = {
+export const GOOD_LABEL: Record<Good, string> = {
   grain: "Grain",
   fiber: "Fiber",
   fruit: "Fruit",
+  "dried-fruit": "Dried fruit",
   vegetables: "Vegetables",
   dairy: "Dairy",
   meat: "Meat",
   hide: "Hides",
   wood: "Wood",
+  lumber: "Lumber",
   fish: "Fish",
+  "cured-fish": "Cured fish",
+  "cured-meat": "Cured meat",
+  leather: "Leather",
+  textiles: "Textiles",
+  clothing: "Clothing",
+  coal: "Coal",
+  salt: "Salt",
+  steel: "Steel",
+  "steel-parts": "Steel parts",
+  "steel-tools": "Steel tools",
+}
+
+const SHOP_LABEL: Record<ShopSpecialty, string> = {
+  sawmill: "Sawmill",
+  blacksmith: "Blacksmith",
+  smokehouse: "Smokehouse",
 }
 
 /** How many equal shares the prairie is split into, including the fallow share. */
@@ -51,6 +94,10 @@ export type FarmRecord = {
   fruitAge: number
   /** Hundredths of a ton sitting in the barn. */
   store: Record<Good, number>
+  /** Dollars per ton the market paid for goods it is holding to resell. */
+  cost?: Partial<Record<Good, number>>
+  /** Set once, the first month a workshop has an owner. */
+  specialty?: ShopSpecialty
 }
 
 export type Farms = { rows: FarmRecord[] }
@@ -72,8 +119,38 @@ export function emptyFarms(): Farms {
   return { rows: [] }
 }
 
+/** Hundredths. A house opens with half a ton of each staple and 20 tons of wood. */
+const HOUSEHOLD_START: Partial<Record<Good, number>> = {
+  grain: 50,
+  vegetables: 50,
+  fruit: 50,
+  dairy: 50,
+  wood: 2000,
+}
+
+/**
+ * Hundredths. One year of a business's supplies: 1 t grain, 0.05 t leather,
+ * 0.05 t textiles, and 0.025 t steel tools rounded to the nearest hundredth.
+ */
+const BUSINESS_YEAR: Partial<Record<Good, number>> = {
+  grain: 100,
+  leather: 5,
+  textiles: 5,
+  "steel-tools": 3,
+}
+
+function isHousehold(kind: Structure["kind"]): boolean {
+  return kind === "farmstead" || kind === "market" || kind === "trading-post" || kind === "workshop"
+}
+
+function isBusiness(kind: Structure["kind"]): boolean {
+  return kind === "market" || kind === "workshop" || kind === "trading-post"
+}
+
 function emptyStore(): Record<Good, number> {
-  return { grain: 0, fiber: 0, fruit: 0, vegetables: 0, dairy: 0, meat: 0, hide: 0, wood: 0, fish: 0 }
+  const store = {} as Record<Good, number>
+  for (const good of GOODS) store[good] = 0
+  return store
 }
 
 /** Climate specialty weighs twice as much as each other legal crop. It does not change the soil. */
@@ -158,8 +235,9 @@ export function workFarms(
   year: number,
   seed: string,
   idMap: Int32Array | null = null,
+  aridity = 99,
 ): { farms: Farms; feature: Uint8Array; fertility: Uint8Array; changedLand: boolean } {
-  const standing = structures.filter((structure) => structure.kind === "farmstead" && !structure.pending && !structure.removing)
+  const standing = structures.filter((structure) => !structure.pending && !structure.removing && (structure.kind === "farmstead" || isBusiness(structure.kind)))
   const ownerOf = new Map(owners.map((row) => [row.structureId, row.owner]))
   const land: Land = { feature: featureIn, fertility: fertilityIn, changed: false }
   const writeLand = () => {
@@ -173,15 +251,24 @@ export function workFarms(
   for (const structure of standing) {
     const owner = ownerOf.get(structure.id) ?? -1
     const previous = farms.rows.find((row) => row.structureId === structure.id)
-    let record = previous ? { ...previous, uses: [...previous.uses], store: { ...previous.store } } : null
+    let record = previous ? { ...previous, uses: [...previous.uses], store: { ...emptyStore(), ...previous.store } } : null
+    if (record) {
+      for (const good of GOODS) if (!Number.isFinite(record.store[good])) record.store[good] = 0
+    }
     if (record && idMap && record.owner >= 0) record.owner = record.owner < idMap.length ? idMap[record.owner] : -1
     if (owner < 0) {
       if (record) rows.push(record)
       continue
     }
     const planted = record !== null
-    if (!record) record = rollRecord(structure, land, preset, owner, seed, year, month)
-    const harvest = monthWork(structure, record, terrain, land, preset, month, year, seed, writeLand)
+    if (!record) record = structure.kind === "farmstead" ? rollRecord(structure, land, preset, owner, seed, year, month) : stockRecord(structure, owner, seed)
+    if (structure.kind === "workshop" && !record.specialty) record.specialty = rollSpecialty(structure.id, seed)
+    if (structure.kind !== "farmstead") {
+      record.owner = owner
+      rows.push(record)
+      continue
+    }
+    const harvest = monthWork(structure, record, terrain, land, preset, month, year, seed, writeLand, aridity)
     record = harvest.record
     const ownerChanged = planted && record.owner !== owner
     if (ownerChanged || harvest.replant) {
@@ -213,8 +300,45 @@ function rollRecord(
     layout: chosen.layout,
     uses: chosen.uses,
     fruitAge: chosen.uses.includes("fruit") ? 0 : -1,
-    store: emptyStore(),
+    store: openingStore(structure.kind),
   }
+}
+
+function stockRecord(structure: Structure, owner: number, seed: string): FarmRecord {
+  return {
+    structureId: structure.id,
+    owner,
+    layout: "none",
+    uses: [],
+    fruitAge: -1,
+    store: openingStore(structure.kind),
+    specialty: structure.kind === "workshop" ? rollSpecialty(structure.id, seed) : undefined,
+  }
+}
+
+function rollSpecialty(id: number, seed: string): ShopSpecialty {
+  const kinds: ShopSpecialty[] = ["sawmill", "blacksmith", "smokehouse"]
+  const roll = mulberry32(hashSeed(`${seed}:shop:${id}`))()
+  return kinds[Math.min(kinds.length - 1, Math.floor(roll * kinds.length))]
+}
+
+/** Hundredths of a ton. Nested: under 0.5, under 1.0, then under 1.2. */
+function saltFromAridity(aridity: number): number {
+  if (aridity < 0.5) return 10
+  if (aridity < 1) return 5
+  if (aridity < 1.2) return 2
+  return 0
+}
+
+function openingStore(kind: Structure["kind"]): Record<Good, number> {
+  const store = emptyStore()
+  if (isHousehold(kind)) {
+    for (const good of GOODS) store[good] += HOUSEHOLD_START[good] ?? 0
+  }
+  if (isBusiness(kind)) {
+    for (const good of GOODS) store[good] += BUSINESS_YEAR[good] ?? 0
+  }
+  return store
 }
 
 function monthWork(
@@ -227,6 +351,7 @@ function monthWork(
   year: number,
   seed: string,
   writeLand: () => void,
+  aridity = 99,
 ): { record: FarmRecord; replant: boolean } {
   const next = record
   const feature = () => land.feature
@@ -320,6 +445,7 @@ function monthWork(
 
   const rng = mulberry32(hashSeed(`${seed}:harvest:${structure.id}:${year}:${month}`))
   for (const good of GOODS) next.store[good] += keep(bucket[good], rng)
+  if (structure.tiles.some((tile) => terrain[tile] === Terrain.Sea)) next.store.salt += saltFromAridity(aridity)
   return { record: next, replant }
 }
 
@@ -362,12 +488,14 @@ export function productionLines(
   farms: Farms,
   people: People | null,
 ): PropertyLine[] {
-  if (structure.kind !== "farmstead" || structure.pending) return []
+  if (structure.pending) return []
   const record = farms.rows.find((row) => row.structureId === structure.id)
   if (!record || record.owner < 0) return []
-  const lines: PropertyLine[] = [{ label: "Crops", value: record.uses.length > 0 ? [...record.uses.map((crop) => CROP_LABEL[crop]), "Fallow"].join(", ") : "No prairie crops" }]
-  if (record.fruitAge >= 0) {
-    lines.push({ label: "Orchard", value: record.fruitAge === 34 ? "Year 34, wood in February" : `Year ${record.fruitAge}` })
+  const lines: PropertyLine[] = []
+  if (record.specialty) lines.push({ label: "Specialty", value: SHOP_LABEL[record.specialty] })
+  if (structure.kind === "farmstead") {
+    lines.push({ label: "Crops", value: record.uses.length > 0 ? [...record.uses.map((crop) => CROP_LABEL[crop]), "Fallow"].join(", ") : "No prairie crops" })
+    if (record.fruitAge >= 0) lines.push({ label: "Orchard", value: record.fruitAge === 34 ? "Year 34, wood in February" : `Year ${record.fruitAge}` })
   }
   for (const good of GOODS) {
     if (record.store[good] <= 0) continue
@@ -377,19 +505,36 @@ export function productionLines(
   return lines
 }
 
-function yearlyNeed(people: People, owner: number): string {
-  if (owner < 0 || owner >= people.age.length) return "—"
+/** The owner's living household: self, a living spouse, and their unmarried children. */
+export function familyPortions(people: People, owner: number): { scale: number; adults: number; children: number } {
+  const empty = { scale: 0, adults: 0, children: 0 }
+  if (owner < 0 || owner >= people.age.length || people.alive[owner] === 0) return empty
   const mate = people.spouse[owner]
   const spouse = mate >= 0 && mate < people.alive.length && people.alive[mate] !== 0 ? mate : -1
-  let scale = portion(people.age[owner] ?? 0)
-  if (spouse >= 0) scale += portion(people.age[spouse])
+  const members = [owner]
+  if (spouse >= 0) members.push(spouse)
   for (let i = 0; i < people.age.length; i++) {
     if (people.alive[i] === 0 || i === owner || i === spouse || people.spouse[i] >= 0) continue
     const mother = people.mother[i]
     const father = people.father[i]
-    if (mother === owner || father === owner || (spouse >= 0 && (mother === spouse || father === spouse))) scale += portion(people.age[i])
+    if (mother === owner || father === owner || (spouse >= 0 && (mother === spouse || father === spouse))) members.push(i)
   }
-  return `${formatNeed(scale * 0.1)} fish, meat, or dairy · ${formatNeed(scale * 0.3)} fruit or vegetables · ${formatNeed(scale * 0.1)} grain`
+  let scale = 0
+  let adults = 0
+  let children = 0
+  for (const id of members) {
+    const age = people.age[id] ?? 0
+    scale += portion(age)
+    if (age >= 13) adults += 1
+    else children += 1
+  }
+  return { scale, adults, children }
+}
+
+function yearlyNeed(people: People, owner: number): string {
+  const family = familyPortions(people, owner)
+  if (family.scale <= 0) return "—"
+  return `${formatNeed(family.scale * 0.1)} fish, meat, or dairy · ${formatNeed(family.scale * 0.3)} fruit or vegetables · ${formatNeed(family.scale * 0.1)} grain`
 }
 
 function portion(age: number): number {

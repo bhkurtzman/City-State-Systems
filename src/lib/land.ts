@@ -35,6 +35,8 @@ export type Holding = {
   lease: number
   /** Calendar month the lease was signed. */
   leaseMonth: number
+  /** Dollars paid the last time this plot was bought. 0 while it is leased or unsold. */
+  paid: number
 }
 
 export type Holdings = {
@@ -99,7 +101,7 @@ export function settleHoldings(
   for (const structure of structures) {
     if (structure.pending || structure.removing) continue
     if (rows.some((row) => row.structureId === structure.id)) continue
-    rows.push({ structureId: structure.id, owner: -1, lease: 0, leaseMonth: month })
+    rows.push({ structureId: structure.id, owner: -1, lease: 0, leaseMonth: month, paid: 0 })
   }
 
   const wealth = new Int32Array(people.wealth)
@@ -110,7 +112,10 @@ export function settleHoldings(
     const mate = people.spouse[row.owner]
     const heir = mate >= 0 && mate < people.alive.length && people.alive[mate] !== 0
     row.owner = heir ? mate : -1
-    if (!heir) row.lease = 0
+    if (!heir) {
+      row.lease = 0
+      row.paid = 0
+    }
   }
 
   for (const row of rows) {
@@ -161,7 +166,15 @@ export function propertyLines(
     { label: "Purse", value: dollars(people.wealth[row.owner] ?? 0) },
   ]
   if (row.lease > 0) lines.push({ label: "Lease", value: `${dollars(row.lease)} a year` })
+  if (row.paid > 0) lines.push({ label: "Paid", value: dollars(row.paid) })
+  if (row.lease > 0 || row.paid > 0) lines.push({ label: "Upkeep", value: `${fineMoney(monthlyCapital(row))} a month` })
   return lines
+}
+
+/** Lease divided by 12, or the sale price divided by 20 and then by 12. */
+export function monthlyCapital(row: Holding): number {
+  if (row.lease > 0) return row.lease / 12
+  return row.paid / 240
 }
 
 function offerToPoorest(
@@ -214,6 +227,7 @@ function assign(row: Holding, quote: Quote, head: number, wealth: Int32Array, mo
   wealth[head] -= quote.due
   row.owner = head
   row.lease = quote.tenure === "lease" ? quote.lease : 0
+  row.paid = quote.tenure === "sale" ? quote.due : 0
   row.leaseMonth = month
   return quote.due
 }
@@ -301,4 +315,8 @@ function bordersLand(index: number, terrain: Uint8Array, size: number): boolean 
 
 function dollars(value: number): string {
   return `$${value.toLocaleString("en-US")}`
+}
+
+function fineMoney(value: number): string {
+  return `$${value.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
 }
