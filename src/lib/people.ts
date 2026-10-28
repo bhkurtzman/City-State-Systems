@@ -1,3 +1,4 @@
+import type { Holding, Holdings } from "@/lib/land"
 import { hashSeed, mulberry32 } from "@/lib/noise"
 
 export const Sex = {
@@ -9,6 +10,14 @@ export type SexId = (typeof Sex)[keyof typeof Sex]
 
 /** Adults are this old, inclusive. Offspring may be younger and still live at home. */
 const MIN_ADULT_AGE = 18
+/** A father hands the household to an adult eldest son from this birthday. */
+const RETIRE_AGE = 65
+/** Children younger than this can be adopted when both parents are dead. */
+const ADOPT_AGE = 16
+/** Working households set aside at most this share of the father's purse each January. */
+const SEED_SHARE = 0.2
+/** A daughter's wedding draws at most this share, once, under the same reserve. */
+const DOWRY_SHARE = 0.1
 const MAX_ADULT_AGE = 40
 const MAX_AGE_GAP = 10
 const MAX_CHILDREN = 8
@@ -18,9 +27,9 @@ const MAX_CHILDREN = 8
  * A married woman aged 18–45 tries on 1/12 of months, so a year averages one try.
  */
 export const MOTHER_FERTILITY: readonly { maxAge: number; chance: number }[] = [
-  { maxAge: 25, chance: 0.25 },
-  { maxAge: 35, chance: 0.2 },
-  { maxAge: 45, chance: 0.15 },
+  { maxAge: 25, chance: 0.4 },
+  { maxAge: 35, chance: 0.3 },
+  { maxAge: 45, chance: 0.2 },
 ]
 
 const TRY_CHANCE = 1 / 12
@@ -87,13 +96,35 @@ export type People = {
   occupation: Uint8Array
   /** 1 while living. Dead rows stay until the January purge. */
   alive: Uint8Array
-  /** Dollars earned this period. No wage rule yet, so this stays 0. */
+  /**
+   * Trailing year of operating income. Sales and fees in, goods bought and
+   * leases out. The first year is the year so far. Land purchases, inheritances,
+   * and marriage transfers stay out of it.
+   */
   income: Int32Array
+  /** Twelve monthly operating results. Slot `id * 12 + month` is that calendar month. */
+  incomeLog: Int32Array
   /** Whole dollars held by this person. A wife’s household money sits on her husband. */
   wealth: Int32Array
   spouse: Int32Array
   mother: Int32Array
   father: Int32Array
+  /**
+   * Retired parent or adopted child lives in this person's household.
+   * −1 for everyone else. Biological parents stay on mother and father.
+   */
+  livesWith: Int32Array
+  /** 1 after a parent has handed the household to a child. */
+  retired: Uint8Array
+}
+
+/** Plots, prices, and the adult cost of living for one month of kinship. Founding passes null. */
+export type KinBooks = {
+  holdings: Holdings
+  /** One adult's yearly cost of living, in whole dollars. */
+  adultCost: number
+  /** Dollars the treasury pays to take a plot back. */
+  salePrice: (structureId: number) => number
 }
 
 /** Stored in People.occupation. A person holds one of these at a time. */
@@ -105,6 +136,7 @@ export const OCCUPATION = {
   craftsman: 4,
   shopkeeper: 5,
   unemployed: 6,
+  retired: 7,
 } as const
 
 export const OCCUPATION_LABEL = [
@@ -115,6 +147,7 @@ export const OCCUPATION_LABEL = [
   "Craftsman",
   "Shopkeeper",
   "Unemployed",
+  "Retired",
 ] as const
 
 /** A house someone lives in. The lowest id is the oldest, and that one sets the job. */
@@ -344,10 +377,11 @@ export type EconomyCensus = {
 }
 
 /**
- * Private wealth. A family is a living couple plus their children under 18.
- * Singles are people 18 and older with no living spouse. Widows count as single.
+ * Private wealth. A family is a household with a living couple.
+ * While a father is alive and under 65, his eldest son, that son's wife, and their
+ * children are part of his household. Singles are household heads with no living spouse.
  */
-export function economyCensus(people: People): EconomyCensus {
+export function economyCensus(people: People, homes: readonly HouseholdHome[] = []): EconomyCensus {
   let total = 0
   for (let i = 0; i < people.age.length; i++) {
     if (people.alive[i] === 0) continue
@@ -355,26 +389,10 @@ export function economyCensus(people: People): EconomyCensus {
   }
 
   const families: number[] = []
-  for (let i = 0; i < people.age.length; i++) {
-    if (people.alive[i] === 0) continue
-    const mate = people.spouse[i]
-    if (mate < i || mate >= people.age.length || people.alive[mate] === 0) continue
-    let wealth = people.wealth[i] + people.wealth[mate]
-    for (let child = 0; child < people.age.length; child++) {
-      if (people.alive[child] === 0 || people.age[child] >= MIN_ADULT_AGE) continue
-      const mother = people.mother[child]
-      const father = people.father[child]
-      if (mother === i || mother === mate || father === i || father === mate) wealth += people.wealth[child]
-    }
-    families.push(wealth)
-  }
-
   const singles: number[] = []
-  for (let i = 0; i < people.age.length; i++) {
-    if (people.alive[i] === 0 || people.age[i] < MIN_ADULT_AGE) continue
-    const mate = people.spouse[i]
-    if (mate >= 0 && mate < people.age.length && people.alive[mate] !== 0) continue
-    singles.push(people.wealth[i])
+  for (const unit of households(people, homes)) {
+    if (unit.couple) families.push(unit.wealth)
+    else if (people.age[unit.head] >= MIN_ADULT_AGE) singles.push(unit.wealth)
   }
 
   let unemployed = 0
@@ -424,10 +442,11 @@ export function householdHomes(
 }
 
 /**
- * Write one occupation for each person. A school seat wins. Otherwise the owner
- * of a house and their living spouse take that house's job, and the oldest house
- * wins when the household owns more than one. Everyone else is Idle under 18
- * and Unemployed at 18.
+ * Write one occupation for each person. Retired wins, then a school seat.
+ * Otherwise the owner of a house and their living spouse take that house's job,
+ * and so do the eldest son still in his father's house and that son's wife.
+ * The oldest house wins when the household owns more than one. Everyone else
+ * is Idle under 18 and Unemployed at 18.
  */
 export function assignOccupations(
   people: People,
@@ -440,45 +459,196 @@ export function assignOccupations(
     list.push({ id: home.id, job: HOME_JOB[home.kind] })
     byOwner.set(home.owner, list)
   }
+  const owned = ownersOf(homes)
+  const headOf = residenceMap(people, owned)
+  const eldest = eldestByFather(people)
   const students = new Set<number>()
   for (const seat of schools.primary) students.add(seat.student)
   for (const seat of schools.secondary) students.add(seat.student)
   const occupation = new Uint8Array(people.age.length)
   for (let i = 0; i < people.age.length; i++) {
     if (people.alive[i] === 0) continue
+    if ((people.retired?.[i] ?? 0) !== 0) {
+      occupation[i] = OCCUPATION.retired
+      continue
+    }
     if (students.has(i)) {
       occupation[i] = OCCUPATION.student
       continue
     }
-    const job = householdJob(people, byOwner, i)
+    const job = householdJob(people, byOwner, i) ?? heirJob(people, byOwner, headOf, eldest, i)
     if (job !== null) occupation[i] = job
     else occupation[i] = people.age[i] < MIN_ADULT_AGE ? OCCUPATION.idle : OCCUPATION.unemployed
   }
   return { ...people, occupation }
 }
 
-/** Couples with no house, and unmarried adults who do not own one. Students are left out of the second count. */
+/**
+ * Couples who form their own household and have no house, and household heads
+ * with no living spouse who do not own one. A son still living in his father's
+ * house is not a second homeless family. Students are left out of the second count.
+ */
 export function residenceCensus(
   people: People,
   homes: readonly HouseholdHome[],
 ): { homelessFamilies: number; homelessSingles: number } {
-  const owners = new Set<number>()
-  for (const home of homes) if (home.owner >= 0) owners.add(home.owner)
+  const owners = ownersOf(homes)
+  const headOf = residenceMap(people, owners)
   let homelessFamilies = 0
   let homelessSingles = 0
   for (let i = 0; i < people.age.length; i++) {
     if (people.alive[i] === 0) continue
     const mate = people.spouse[i]
-    const mateAlive = mate >= 0 && mate < people.alive.length && people.alive[mate] !== 0
+    const mateAlive = isAlive(people, mate)
     if (mateAlive) {
-      if (i < mate && !owners.has(i) && !owners.has(mate)) homelessFamilies += 1
+      if (i > mate || headOf[i] !== i) continue
+      if (!owners.has(i) && !owners.has(mate)) homelessFamilies += 1
       continue
     }
-    if (people.age[i] < MIN_ADULT_AGE) continue
+    if (people.age[i] < MIN_ADULT_AGE || headOf[i] !== i) continue
     if ((people.occupation?.[i] ?? OCCUPATION.unemployed) === OCCUPATION.student) continue
+    if ((people.retired?.[i] ?? 0) !== 0) continue
     if (!owners.has(i)) homelessSingles += 1
   }
   return { homelessFamilies, homelessSingles }
+}
+
+export type ClassCensus = {
+  /** Families and single adults. A child living with a parent is part of that household. */
+  units: number
+  incomeAverage: number | null
+  incomeMedian: number | null
+  poor: number
+  working: number
+  middle: number
+  upper: number
+  wealthy: number
+}
+
+/**
+ * One adult's cost of living, scaled per household. A couple needs twice that.
+ * The eldest son still in his father's house, and that son's wife, each add a full adult.
+ * Their children add a full adult from 18 and half before that. Other unmarried
+ * children at home, adopted children, and retired parents add half.
+ * A single adult needs one, plus those same additions. Wealthy through working
+ * are tested from the top. Poor is whatever is left.
+ */
+export function classCensus(people: People, adultCost: number, homes: readonly HouseholdHome[] = []): ClassCensus {
+  const incomes: number[] = []
+  const counts = { poor: 0, working: 0, middle: 0, upper: 0, wealthy: 0 }
+  for (const unit of households(people, homes)) {
+    incomes.push(unit.income)
+    counts[classify(unit.income, unit.wealth, householdCost(adultCost, unit.adults, unit.dependents))] += 1
+  }
+  return {
+    units: incomes.length,
+    incomeAverage: average(incomes),
+    incomeMedian: median(incomes),
+    ...counts,
+  }
+}
+
+function householdCost(adultCost: number, adults: number, dependents: number): number {
+  return Math.round(adultCost * (adults + dependents * 0.5))
+}
+
+/** Class of each household head, and the head every living person follows. */
+export function householdRanks(
+  people: People,
+  adultCost: number,
+  homes: readonly HouseholdHome[],
+): { rank: Map<number, SocialClass>; headOf: Int32Array } {
+  const headOf = residenceMap(people, ownersOf(homes))
+  const rank = new Map<number, SocialClass>()
+  for (const unit of households(people, homes)) {
+    rank.set(unit.head, classify(unit.income, unit.wealth, householdCost(adultCost, unit.adults, unit.dependents)))
+  }
+  return { rank, headOf }
+}
+
+export type SocialClass = "poor" | "working" | "middle" | "upper" | "wealthy"
+
+function classify(income: number, wealth: number, cost: number): SocialClass {
+  const line = Math.max(0, cost)
+  if (income > 20 * line || wealth > 100 * line) return "wealthy"
+  if (income > 3 * line || wealth >= 15 * line) return "upper"
+  if (income >= 1.5 * line || wealth >= 5 * line) return "middle"
+  if (income >= line || wealth >= line) return "working"
+  return "poor"
+}
+
+type HouseholdRoll = {
+  head: number
+  couple: boolean
+  income: number
+  wealth: number
+  adults: number
+  dependents: number
+}
+
+function households(people: People, homes: readonly HouseholdHome[]): HouseholdRoll[] {
+  const owned = ownersOf(homes)
+  const headOf = residenceMap(people, owned)
+  const eldest = eldestByFather(people)
+  const members = new Map<number, number[]>()
+  for (let id = 0; id < people.age.length; id++) {
+    if (people.alive[id] === 0) continue
+    const head = headOf[id]
+    if (head < 0) continue
+    const list = members.get(head) ?? []
+    list.push(id)
+    members.set(head, list)
+  }
+  const units: HouseholdRoll[] = []
+  for (const [head, list] of members) {
+    if (people.alive[head] === 0) continue
+    const mate = people.spouse[head]
+    const couple = isAlive(people, mate) && headOf[mate] === head
+    let income = 0
+    let wealth = 0
+    for (const id of list) {
+      income += people.income?.[id] ?? 0
+      wealth += people.wealth[id] ?? 0
+    }
+    const weight = weighHousehold(people, head, list, eldest)
+    units.push({ head, couple, income, wealth, adults: weight.adults, dependents: weight.dependents })
+  }
+  return units
+}
+
+/** Heads count in full. A folded heir's own adults do too. Everyone else at home is half. */
+function weighHousehold(
+  people: People,
+  head: number,
+  members: readonly number[],
+  eldest: Int32Array,
+): { adults: number; dependents: number } {
+  const mate = people.spouse[head]
+  const couple = isAlive(people, mate)
+  let adults = couple ? 2 : 1
+  let dependents = 0
+  const heir = people.sex[head] === Sex.Male ? eldest[head] : -1
+  const heirHome = heir >= 0 && heir !== head && members.includes(heir)
+  const heirWife = heirHome ? people.spouse[heir] : -1
+  for (const id of members) {
+    if (id === head || (couple && id === mate)) continue
+    if (heirHome && id === heir) {
+      if (people.age[id] >= MIN_ADULT_AGE) adults += 1
+      else dependents += 1
+      continue
+    }
+    if (heirHome && heirWife >= 0 && id === heirWife && isAlive(people, heirWife)) {
+      adults += 1
+      continue
+    }
+    if (heirHome && (people.father[id] === heir || people.mother[id] === heir)) {
+      if (people.age[id] >= MIN_ADULT_AGE) adults += 1
+      else dependents += 1
+      continue
+    }
+    dependents += 1
+  }
+  return { adults, dependents }
 }
 
 function householdJob(
@@ -487,12 +657,149 @@ function householdJob(
   id: number,
 ): number | null {
   const mate = people.spouse[id]
-  const mateAlive = mate >= 0 && mate < people.alive.length && people.alive[mate] !== 0
+  const mateAlive = isAlive(people, mate)
   const homes = [...(byOwner.get(id) ?? []), ...(mateAlive ? (byOwner.get(mate) ?? []) : [])]
   if (homes.length === 0) return null
   let best = homes[0]
   for (const home of homes) if (home.id < best.id) best = home
   return best.job
+}
+
+/** The house job of the father an heir still lives with. */
+function heirJob(
+  people: People,
+  byOwner: Map<number, { id: number; job: number }[]>,
+  headOf: Int32Array,
+  eldest: Int32Array,
+  id: number,
+): number | null {
+  const head = headOf[id]
+  if (head < 0 || head === id) return null
+  const heir = eldest[head]
+  if (heir < 0 || headOf[heir] !== head) return null
+  const wife = people.spouse[heir]
+  if (id !== heir && id !== wife) return null
+  return householdJob(people, byOwner, head)
+}
+
+function ownersOf(homes: readonly HouseholdHome[]): Set<number> {
+  const owners = new Set<number>()
+  for (const home of homes) if (home.owner >= 0) owners.add(home.owner)
+  return owners
+}
+
+function ownersFromRows(rows: readonly Holding[]): Set<number> {
+  const owners = new Set<number>()
+  for (const row of rows) if (row.owner >= 0) owners.add(row.owner)
+  return owners
+}
+
+/**
+ * Men who may take a vacant plot. A married head who keeps his own house,
+ * a widow who is her own head, and a landless man of 18 who is not a student
+ * and not the eldest son still in his father's house.
+ */
+export function propertySeekers(people: People, owned: ReadonlySet<number>): number[] {
+  const headOf = residenceMap(people, owned)
+  const eldest = eldestByFather(people)
+  const seekers: number[] = []
+  for (let id = 0; id < people.age.length; id++) {
+    if (people.alive[id] === 0 || (people.retired?.[id] ?? 0) !== 0) continue
+    if (owned.has(id)) continue
+    const mate = people.spouse[id]
+    const mateAlive = isAlive(people, mate)
+    if (mateAlive && owned.has(mate)) continue
+    if (mateAlive) {
+      if (people.sex[id] === Sex.Male && headOf[id] === id) seekers.push(id)
+      continue
+    }
+    if (people.age[id] < MIN_ADULT_AGE) continue
+    if (people.sex[id] === Sex.Female) {
+      if (headOf[id] === id) seekers.push(id)
+      continue
+    }
+    if ((people.occupation?.[id] ?? OCCUPATION.unemployed) === OCCUPATION.student) continue
+    if (foldedHeir(people, eldest, id)) continue
+    seekers.push(id)
+  }
+  return seekers
+}
+
+function isAlive(people: People, id: number): boolean {
+  return id >= 0 && id < people.alive.length && people.alive[id] !== 0
+}
+
+/** Eldest living son of each father, or −1. Oldest age wins, then the lower id. */
+function eldestByFather(people: People): Int32Array {
+  const best = new Int32Array(people.age.length)
+  best.fill(-1)
+  for (let id = 0; id < people.age.length; id++) {
+    if (people.alive[id] === 0 || people.sex[id] !== Sex.Male) continue
+    const dad = people.father[id]
+    if (!isAlive(people, dad)) continue
+    const current = best[dad]
+    if (current < 0 || people.age[id] > people.age[current] || (people.age[id] === people.age[current] && id < current)) {
+      best[dad] = id
+    }
+  }
+  return best
+}
+
+/** The eldest son follows his father while that father is alive, under 65, and not retired. */
+function foldedHeir(people: People, eldest: Int32Array, id: number): boolean {
+  if (people.sex[id] !== Sex.Male || (people.retired?.[id] ?? 0) !== 0) return false
+  const dad = people.father[id]
+  if (!isAlive(people, dad) || (people.retired?.[dad] ?? 0) !== 0 || people.age[dad] >= RETIRE_AGE) return false
+  return eldest[dad] === id
+}
+
+/**
+ * Household head of each living person. A wife follows her husband. The eldest
+ * son follows his father while the father is alive and under 65, unless that son
+ * already owns a plot. Retired parents and adopted children follow livesWith.
+ * An unmarried landless child follows a living parent.
+ */
+function residenceMap(people: People, owned: ReadonlySet<number>): Int32Array {
+  const count = people.age.length
+  const eldest = eldestByFather(people)
+  const head = new Int32Array(count)
+  head.fill(-2)
+  const state = new Uint8Array(count)
+  const resolve = (id: number): number => {
+    if (!isAlive(people, id)) return -1
+    if (state[id] === 2) return head[id]
+    if (state[id] === 1) return id
+    state[id] = 1
+    head[id] = chooseHead(people, owned, eldest, id, resolve)
+    state[id] = 2
+    return head[id]
+  }
+  for (let id = 0; id < count; id++) if (people.alive[id] !== 0) resolve(id)
+  return head
+}
+
+function chooseHead(
+  people: People,
+  owned: ReadonlySet<number>,
+  eldest: Int32Array,
+  id: number,
+  resolve: (id: number) => number,
+): number {
+  const withId = people.livesWith?.[id] ?? -1
+  if ((people.retired?.[id] ?? 0) !== 0 && isAlive(people, withId)) return resolve(withId)
+  const mate = people.spouse[id]
+  if (people.sex[id] === Sex.Female && isAlive(people, mate)) return resolve(mate)
+  if (foldedHeir(people, eldest, id) && !owned.has(id)) return resolve(people.father[id])
+  if ((people.retired?.[id] ?? 0) === 0 && withId >= 0 && isAlive(people, withId) && !owned.has(id)) {
+    return resolve(withId)
+  }
+  if (!isAlive(people, mate) && !owned.has(id)) {
+    const dad = people.father[id]
+    if (isAlive(people, dad)) return resolve(dad)
+    const mom = people.mother[id]
+    if (isAlive(people, mom)) return resolve(mom)
+  }
+  return id
 }
 
 function average(values: readonly number[]): number | null {
@@ -625,10 +932,12 @@ export type MonthStep = {
   /** Deaths resolved this month, before the January purge. */
   deaths: number
   epidemic: Epidemic
-  /** Dollars left with no living spouse, child, or sibling. */
+  /** Dollars left with no heir, minus what the treasury pays to buy a plot back. */
   toTreasury: number
   /** Old person id to new id after the January purge. Null when nobody was removed. */
   idMap: Int32Array | null
+  /** Plot book after succession and sales. Null when this month had no land to settle. */
+  holdings: Holdings | null
 }
 
 /** A student finishing the school year, and that school's quality from 0 to 100. */
@@ -675,13 +984,17 @@ export function schoolYearTenths(quality: number): number {
  * Resolve the start of one calendar month. Living people age on their birthday.
  * An epidemic declared last month raises illness, and the kill chance of that illness,
  * for its rolled length. Each person then rolls illness and injury. A hit rolls again
- * for death. A living spouse inherits the purse. Otherwise the living children split
- * it, and anything left with no heir joins the treasury. The dead stay in the table, so spouse and parent ids keep working.
+ * for death. An adult eldest son then takes a father's house, at the father's death
+ * or from the birthday the father is 65. A widow holds it until that son is 18.
+ * Plots move with the purse when a land book was passed in. The dead stay in the
+ * table, so spouse and parent ids keep working.
  * In June, enrolled students bank one quality-weighted school credit, then ages 12, 17,
- * and 18 sit their exams. Unmarried living men aged 18–50 may marry, then living wives
- * aged 18–45 may try for a child. A birth skips her for the next 12 months. In January,
- * a dead person whom no living spouse or child still points at is removed and the
- * remaining ids are rewritten. A new epidemic may be declared for the following month.
+ * and 18 sit their exams. In January, working fathers seed landless younger sons.
+ * An eldest son still at home, or a man who owns a plot, may marry. A bride's father
+ * may pay a dowry. Living wives aged 18–45 may try for a child. A birth skips her for
+ * the next 12 months. In January, a dead person whom no living spouse, child, or
+ * household still points at is removed and the remaining ids are rewritten.
+ * A new epidemic may be declared for the following month.
  * The same people, seed, year, and month always rebuild the same result.
  */
 export function advancePeople(
@@ -691,6 +1004,7 @@ export function advancePeople(
   seed: string,
   epidemic: Epidemic,
   schools: SchoolSession = NO_SCHOOLS,
+  kin: KinBooks | null = null,
 ): MonthStep {
   const count = people.age.length
   const age = new Uint8Array(people.age)
@@ -705,11 +1019,15 @@ export function advancePeople(
   const secondaryYears = new Uint8Array(people.secondaryYears)
   const occupation = occupationColumn(people, count)
   const alive = new Uint8Array(people.alive)
-  const income = new Int32Array(people.income)
+  const income = new Int32Array(people.income ?? count)
+  const incomeLog = copyIncomeLog(people, count)
   const wealth = new Int32Array(people.wealth)
   const spouse = new Int32Array(people.spouse)
   const mother = new Int32Array(people.mother)
   const father = new Int32Array(people.father)
+  const livesWith = livesWithColumn(people, count)
+  const retired = retiredColumn(people, count)
+  const rows = kin ? kin.holdings.rows.map((row) => ({ ...row })) : null
   const wave = resolveEpidemic(epidemic, year, month, seed)
 
   for (let i = 0; i < count; i++) {
@@ -737,7 +1055,25 @@ export function advancePeople(
     died.push(i)
   }
 
-  const toTreasury = settleEstates(died, wealth, alive, sex, age, spouse, mother, father)
+  const books = settleKin(
+    {
+      wealth,
+      alive,
+      sex,
+      age,
+      spouse,
+      mother,
+      father,
+      livesWith,
+      retired,
+      income,
+      rows,
+      adultCost: kin?.adultCost ?? 0,
+      salePrice: kin?.salePrice ?? (() => 0),
+      toTreasury: 0,
+    },
+    died,
+  )
 
   if (month === JUNE) {
     resolveJuneSchooling(
@@ -756,12 +1092,15 @@ export function advancePeople(
     )
   }
 
+  if (kin && month === 0) seedSons(books)
+
   const marriages = mulberry32(hashSeed(`${seed}|${year}|${month}|marriages`))
   for (let i = 0; i < count; i++) {
     if (alive[i] === 0 || sex[i] !== Sex.Male || spouse[i] >= 0) continue
+    if (!maySeekWife(books, i)) continue
     const look = marriageLookChance(age[i])
     if (look === 0 || marriages() >= look) continue
-    const wife = pickWife(i, age, sex, alive, spouse, mother, father, marriages)
+    const wife = pickWife(i, age, sex, alive, spouse, retired, mother, father, marriages)
     if (wife < 0) continue
     const accept = marriageAcceptChance(vigor[i], vigor[wife], education[i], education[wife])
     if (marriages() >= accept) continue
@@ -769,6 +1108,10 @@ export function advancePeople(
     spouse[wife] = i
     wealth[i] += wealth[wife]
     wealth[wife] = 0
+    mergeIncome(income, incomeLog, i, wife)
+    movePlots(books, [wife], i, "spill")
+    if (kin) payDowry(books, wife, i)
+    retireChildlessFather(books, wife)
   }
 
   const rng = mulberry32(hashSeed(`${seed}|${year}|${month}|births`))
@@ -798,7 +1141,28 @@ export function advancePeople(
 
   let next: People
   if (born.length === 0) {
-    next = { age, sex, birthMonth, cooldown, vigor, intellect, willpower, education, primaryYears, secondaryYears, occupation, alive, income, wealth, spouse, mother, father }
+    next = {
+      age,
+      sex,
+      birthMonth,
+      cooldown,
+      vigor,
+      intellect,
+      willpower,
+      education,
+      primaryYears,
+      secondaryYears,
+      occupation,
+      alive,
+      income,
+      incomeLog,
+      wealth,
+      spouse,
+      mother,
+      father,
+      livesWith,
+      retired,
+    }
   } else {
     const grownCount = count + born.length
     const grown = {
@@ -815,10 +1179,13 @@ export function advancePeople(
       occupation: new Uint8Array(grownCount),
       alive: new Uint8Array(grownCount),
       income: new Int32Array(grownCount),
+      incomeLog: new Int32Array(grownCount * 12),
       wealth: new Int32Array(grownCount),
       spouse: new Int32Array(grownCount),
       mother: new Int32Array(grownCount),
       father: new Int32Array(grownCount),
+      livesWith: new Int32Array(grownCount),
+      retired: new Uint8Array(grownCount),
     }
     grown.age.set(age)
     grown.sex.set(sex)
@@ -833,10 +1200,14 @@ export function advancePeople(
     grown.occupation.set(occupation)
     grown.alive.set(alive)
     grown.income.set(income)
+    grown.incomeLog.set(incomeLog)
     grown.wealth.set(wealth)
     grown.spouse.set(spouse)
     grown.mother.set(mother)
     grown.father.set(father)
+    grown.livesWith.set(livesWith)
+    grown.livesWith.fill(-1, count)
+    grown.retired.set(retired)
     for (let i = 0; i < born.length; i++) {
       const at = count + i
       const child = born[i]
@@ -855,6 +1226,8 @@ export function advancePeople(
       grown.spouse[at] = -1
       grown.mother[at] = child.motherId
       grown.father[at] = child.fatherId
+      grown.livesWith[at] = -1
+      grown.retired[at] = 0
     }
     next = grown
   }
@@ -865,7 +1238,8 @@ export function advancePeople(
     next = purged.people
     idMap = purged.idMap
   }
-  return { people: next, deaths, epidemic: wave, toTreasury, idMap }
+  const holdings = rows && kin ? { opened: kin.holdings.opened, rows } : null
+  return { people: next, deaths, epidemic: wave, toTreasury: books.toTreasury, idMap, holdings }
 }
 
 /** A declared wave starts this month. A new roll, if it hits, waits until next month. */
@@ -903,47 +1277,416 @@ export function livingCount(people: People): number {
   return count
 }
 
+type KinState = {
+  wealth: Int32Array
+  alive: Uint8Array
+  sex: Uint8Array
+  age: Uint8Array
+  spouse: Int32Array
+  mother: Int32Array
+  father: Int32Array
+  livesWith: Int32Array
+  retired: Uint8Array
+  income: Int32Array
+  rows: Holding[] | null
+  adultCost: number
+  salePrice: (structureId: number) => number
+  toTreasury: number
+}
+
 /**
- * A death this month. A living spouse takes the purse. Otherwise the living
- * children split it in whole dollars, and the oldest takes the leftover dollar.
- * A single person or widow with no living children splits it the same way among
- * living siblings (same mother or same father). A married daughter's share is
- * paid to her husband. A sibling under 16 with a living parent pays that parent,
- * father first. No heir sends it to the treasury.
+ * Living fathers hand the house to an adult eldest son from age 65. A widow
+ * does the same when that son turns 18. Deaths then move the purse and the
+ * plots: an adult son, else a living spouse, else an adopting sibling, else
+ * the children, else siblings, else the treasury.
  */
-function settleEstates(
-  died: readonly number[],
-  wealth: Int32Array,
-  alive: Uint8Array,
-  sex: Uint8Array,
-  age: Uint8Array,
-  spouse: Int32Array,
-  mother: Int32Array,
-  father: Int32Array,
-): number {
-  let toTreasury = 0
-  for (const dead of died) {
-    const estate = wealth[dead]
-    if (estate <= 0) continue
-    wealth[dead] = 0
-    const mate = spouse[dead]
-    if (mate >= 0 && alive[mate] !== 0) {
-      wealth[mate] += estate
-      continue
-    }
-    const children = livingChildren(dead, alive, mother, father)
-    if (children.length > 0) {
-      divideEstate(estate, children, false, sex, age, spouse, alive, wealth, mother, father)
-      continue
-    }
-    const siblings = livingSiblings(dead, alive, mother, father)
-    if (siblings.length > 0) {
-      divideEstate(estate, siblings, true, sex, age, spouse, alive, wealth, mother, father)
-      continue
-    }
-    toTreasury += estate
+function settleKin(state: KinState, died: readonly number[]): KinState {
+  handLivingHouseholds(state)
+  const ordered = [...died].sort((a, b) => state.sex[b] - state.sex[a] || a - b)
+  const seen = new Set<number>()
+  for (const dead of ordered) {
+    if (seen.has(dead)) continue
+    settleDead(state, dead, seen)
   }
-  return toTreasury
+  return state
+}
+
+function handLivingHouseholds(state: KinState) {
+  for (let id = 0; id < state.alive.length; id++) {
+    if (state.alive[id] === 0 || state.retired[id] !== 0 || state.sex[id] !== Sex.Male) continue
+    if (state.age[id] < RETIRE_AGE) continue
+    const son = eldestAdultSon(childrenOf(state, id), state)
+    if (son >= 0) handToSon(state, id, son, true)
+  }
+  for (let id = 0; id < state.alive.length; id++) {
+    if (state.alive[id] === 0 || state.retired[id] !== 0 || state.sex[id] !== Sex.Female) continue
+    const mate = state.spouse[id]
+    if (mate < 0 || state.alive[mate] !== 0) continue
+    const son = eldestAdultSon(childrenOf(state, id), state)
+    if (son >= 0) handToSon(state, id, son, false)
+  }
+}
+
+/** Split a father's purse, or pass a widow's whole purse, then retire the parents onto the son. */
+function handToSon(state: KinState, holder: number, son: number, split: boolean) {
+  const wife = split ? livingMate(state, holder) : -1
+  let estate = takePurse(state, holder)
+  const from = [holder]
+  if (wife >= 0) {
+    estate += takePurse(state, wife)
+    from.push(wife)
+  }
+  movePlots(state, from, son, "keep")
+  if (split) splitFatherPurse(state, holder, son, estate)
+  else if (estate > 0) state.wealth[son] += estate
+  retireWith(state, holder, son)
+  if (wife >= 0) retireWith(state, wife, son)
+}
+
+function settleDead(state: KinState, dead: number, seen: Set<number>) {
+  seen.add(dead)
+  if (state.retired[dead] !== 0) {
+    const heir = livingId(state, state.livesWith[dead]) ? state.livesWith[dead] : -1
+    givePurse(state, dead, heir)
+    movePlots(state, [dead], heir, "keep")
+    return
+  }
+  const mate = state.spouse[dead]
+  const mateAlive = livingId(state, mate)
+  const kids = childrenOf(state, dead)
+  const adultSon = eldestAdultSon(kids, state)
+  if (mateAlive && !(state.sex[dead] === Sex.Male && adultSon >= 0)) {
+    givePurse(state, dead, mate)
+    movePlots(state, [dead], mate, "keep")
+    return
+  }
+  if (adultSon >= 0) {
+    let estate = takePurse(state, dead)
+    const from = [dead]
+    if (mate >= 0) {
+      estate += takePurse(state, mate)
+      from.push(mate)
+      if (mateAlive) retireWith(state, mate, adultSon)
+      else seen.add(mate)
+    }
+    movePlots(state, from, adultSon, "keep")
+    if (state.sex[dead] === Sex.Male) splitFatherPurse(state, dead, adultSon, estate)
+    else state.wealth[adultSon] += estate
+    return
+  }
+  const minors = kids.filter((id) => state.age[id] < ADOPT_AGE)
+  const sons = kids.filter((id) => state.sex[id] === Sex.Male)
+  if (kids.length > 0 && kids.every((id) => state.age[id] < ADOPT_AGE)) {
+    if (adoptMinors(state, dead, minors, seen)) return
+  }
+  const waitingSon = eldestSon(sons, state)
+  if (waitingSon >= 0) {
+    givePurse(state, dead, waitingSon)
+    movePlots(state, [dead], waitingSon, "keep")
+    for (const child of minors) if (child !== waitingSon) state.livesWith[child] = waitingSon
+    return
+  }
+  const daughters = kids.filter((id) => state.sex[id] === Sex.Female)
+  if (daughters.length > 0) {
+    liquidatePlots(state, [dead])
+    splitDaughterPurse(state, daughters, takePurse(state, dead))
+    const eldest = oldestHeir(daughters, state.age)
+    for (const child of minors) state.livesWith[child] = eldest
+    return
+  }
+  const siblings = livingSiblings(dead, state.alive, state.mother, state.father)
+  if (siblings.length === 0) {
+    state.toTreasury += takePurse(state, dead)
+    movePlots(state, [dead], -1, "keep")
+    return
+  }
+  const oldest = oldestHeir(siblings, state.age)
+  movePlots(state, [dead], siblingPlotHeir(state, oldest), "keep")
+  const estate = takePurse(state, dead)
+  divideEstate(estate, siblings, true, state.sex, state.age, state.spouse, state.alive, state.wealth, state.mother, state.father)
+}
+
+function adoptMinors(state: KinState, dead: number, minors: readonly number[], seen: Set<number>): boolean {
+  const fatherId = state.sex[dead] === Sex.Male ? dead : state.spouse[dead]
+  const motherId = state.sex[dead] === Sex.Female ? dead : state.spouse[dead]
+  const adopter = adoptingSibling(state, fatherId, motherId)
+  if (adopter < 0) return false
+  let estate = takePurse(state, dead)
+  const from = [dead]
+  const other = state.sex[dead] === Sex.Male ? motherId : fatherId
+  if (other >= 0 && other < state.alive.length && state.alive[other] === 0) {
+    estate += takePurse(state, other)
+    from.push(other)
+    seen.add(other)
+  }
+  for (const child of minors) state.livesWith[child] = adopter
+  movePlots(state, from, adopter, "spill")
+  state.wealth[adopter] += estate
+  return true
+}
+
+function adoptingSibling(state: KinState, fatherId: number, motherId: number): number {
+  const fromFather = adultSiblings(state, fatherId)
+  if (fromFather.length > 0) return oldestHeir(fromFather, state.age)
+  const fromMother = adultSiblings(state, motherId)
+  if (fromMother.length > 0) return oldestHeir(fromMother, state.age)
+  return -1
+}
+
+function adultSiblings(state: KinState, person: number): number[] {
+  if (!Number.isInteger(person) || person < 0 || person >= state.alive.length) return []
+  return livingSiblings(person, state.alive, state.mother, state.father).filter((id) => state.age[id] >= MIN_ADULT_AGE)
+}
+
+/** Half to the eldest son. The other half to younger sons, else daughters, else back to him. */
+function splitFatherPurse(state: KinState, fatherId: number, son: number, estate: number) {
+  if (estate <= 0) return
+  const half = Math.floor(estate / 2)
+  const rest = estate - half
+  state.wealth[son] += half
+  const younger = childrenOf(state, fatherId).filter((id) => id !== son && state.sex[id] === Sex.Male)
+  if (younger.length > 0) {
+    divideAmong(state, rest, younger)
+    return
+  }
+  const daughters = childrenOf(state, fatherId).filter((id) => state.sex[id] === Sex.Female)
+  if (daughters.length > 0) divideAmong(state, rest, daughters)
+  else state.wealth[son] += rest
+}
+
+function splitDaughterPurse(state: KinState, daughters: readonly number[], estate: number) {
+  if (estate <= 0 || daughters.length === 0) return
+  const eldest = oldestHeir(daughters, state.age)
+  const half = Math.floor(estate / 2)
+  payHeir(eldest, half, state.sex, state.spouse, state.alive, state.wealth)
+  const others = daughters.filter((id) => id !== eldest)
+  if (others.length === 0) payHeir(eldest, estate - half, state.sex, state.spouse, state.alive, state.wealth)
+  else divideAmong(state, estate - half, others)
+}
+
+function divideAmong(state: KinState, amount: number, heirs: readonly number[]) {
+  if (amount <= 0 || heirs.length === 0) return
+  const share = Math.floor(amount / heirs.length)
+  let leftover = amount - share * heirs.length
+  const oldest = oldestHeir(heirs, state.age)
+  for (const heir of heirs) {
+    const extra = heir === oldest ? leftover : 0
+    if (heir === oldest) leftover = 0
+    payHeir(heir, share + extra, state.sex, state.spouse, state.alive, state.wealth)
+  }
+}
+
+function childrenOf(state: KinState, parent: number): number[] {
+  return livingChildren(parent, state.alive, state.mother, state.father)
+}
+
+function eldestAdultSon(children: readonly number[], state: KinState): number {
+  const sons = children.filter((id) => state.sex[id] === Sex.Male && state.age[id] >= MIN_ADULT_AGE)
+  return sons.length === 0 ? -1 : eldestSon(sons, state)
+}
+
+function eldestSon(sons: readonly number[], state: KinState): number {
+  return sons.length === 0 ? -1 : oldestHeir(sons, state.age)
+}
+
+function livingMate(state: KinState, id: number): number {
+  const mate = state.spouse[id]
+  return livingId(state, mate) ? mate : -1
+}
+
+function livingId(state: KinState, id: number): boolean {
+  return id >= 0 && id < state.alive.length && state.alive[id] !== 0
+}
+
+function takePurse(state: KinState, id: number): number {
+  if (id < 0 || id >= state.wealth.length) return 0
+  const amount = state.wealth[id]
+  state.wealth[id] = 0
+  return amount > 0 ? amount : 0
+}
+
+function givePurse(state: KinState, from: number, to: number) {
+  const amount = takePurse(state, from)
+  if (amount <= 0) return
+  if (to >= 0) state.wealth[to] += amount
+  else state.toTreasury += amount
+}
+
+function retireWith(state: KinState, person: number, head: number) {
+  state.retired[person] = 1
+  state.livesWith[person] = head
+}
+
+function siblingPlotHeir(state: KinState, sibling: number): number {
+  if (state.age[sibling] < ADOPT_AGE) {
+    const dad = state.father[sibling]
+    if (livingId(state, dad)) return dad
+    const mom = state.mother[sibling]
+    if (livingId(state, mom)) return mom
+  }
+  const mate = state.spouse[sibling]
+  if (state.sex[sibling] === Sex.Female && livingId(state, mate)) return mate
+  return sibling
+}
+
+function movePlots(state: KinState, from: readonly number[], to: number, policy: "keep" | "spill") {
+  if (!state.rows) return
+  const sources = new Set(from)
+  for (const row of state.rows) {
+    if (!sources.has(row.owner)) continue
+    if (to < 0) {
+      clearPlot(row)
+      continue
+    }
+    if (policy === "spill" && ownsOtherPlot(state, to, row)) {
+      const next = spillSon(state, to)
+      if (next >= 0) row.owner = next
+      else sellPlot(state, row, to)
+      continue
+    }
+    row.owner = to
+  }
+}
+
+function liquidatePlots(state: KinState, from: readonly number[]) {
+  if (!state.rows) return
+  const sources = new Set(from)
+  for (const row of state.rows) {
+    if (!sources.has(row.owner)) continue
+    sellPlot(state, row, row.owner)
+  }
+}
+
+function ownsOtherPlot(state: KinState, person: number, except: Holding): boolean {
+  return state.rows?.some((row) => row !== except && row.owner === person) ?? false
+}
+
+/** An adult son other than the eldest, so the heir of the adopter's own house stays home. */
+function spillSon(state: KinState, adopter: number): number {
+  const sons = childrenOf(state, adopter).filter((id) => state.sex[id] === Sex.Male && state.age[id] >= MIN_ADULT_AGE)
+  if (sons.length === 0) return -1
+  const eldest = eldestSon(sons, state)
+  const others = sons.filter((id) => id !== eldest && !ownsPlot(state, id))
+  return others.length === 0 ? -1 : eldestSon(others, state)
+}
+
+function ownsPlot(state: KinState, person: number): boolean {
+  return state.rows?.some((row) => row.owner === person) ?? false
+}
+
+function sellPlot(state: KinState, row: Holding, payTo: number) {
+  const price = Math.max(0, Math.floor(state.salePrice(row.structureId)))
+  if (payTo >= 0 && payTo < state.wealth.length) state.wealth[payTo] += price
+  state.toTreasury -= price
+  clearPlot(row)
+}
+
+function clearPlot(row: Holding) {
+  row.owner = -1
+  row.lease = 0
+  row.paid = 0
+}
+
+function seedSons(state: KinState) {
+  const homes = homesFromRows(state.rows ?? [])
+  const owned = ownersFromRows(state.rows ?? [])
+  for (const unit of households(kinView(state), homes)) {
+    const head = unit.head
+    if (state.alive[head] === 0 || state.sex[head] !== Sex.Male || state.retired[head] !== 0) continue
+    const males = childrenOf(state, head).filter((id) => state.sex[id] === Sex.Male)
+    if (males.length === 0) continue
+    const heir = eldestSon(males, state)
+    const younger = males.filter((id) => id !== heir && state.age[id] >= ADOPT_AGE && !owned.has(id))
+    if (younger.length === 0) continue
+    const gift = purseGift(state, head, unit, SEED_SHARE)
+    if (gift <= 0) continue
+    state.wealth[head] -= gift
+    divideAmong(state, gift, younger)
+  }
+}
+
+function payDowry(state: KinState, bride: number, husband: number) {
+  const dad = state.father[bride]
+  if (!livingId(state, dad) || state.retired[dad] !== 0) return
+  const unit = householdContaining(state, dad)
+  if (!unit) return
+  const gift = purseGift(state, dad, unit, DOWRY_SHARE)
+  if (gift <= 0) return
+  state.wealth[dad] -= gift
+  state.wealth[husband] += gift
+}
+
+/** A father with no living son retires onto his eldest married daughter once the last daughter marries. */
+function retireChildlessFather(state: KinState, bride: number) {
+  const dad = state.father[bride]
+  if (!livingId(state, dad) || state.retired[dad] !== 0 || state.sex[dad] !== Sex.Male) return
+  if (childrenOf(state, dad).some((id) => state.sex[id] === Sex.Male)) return
+  const daughters = childrenOf(state, dad).filter((id) => state.sex[id] === Sex.Female)
+  if (daughters.length === 0 || daughters.some((id) => !livingId(state, state.spouse[id]))) return
+  const eldest = oldestHeir(daughters, state.age)
+  const wife = livingMate(state, dad)
+  const from = wife >= 0 ? [dad, wife] : [dad]
+  liquidatePlots(state, from)
+  let estate = takePurse(state, dad)
+  if (wife >= 0) estate += takePurse(state, wife)
+  splitDaughterPurse(state, daughters, estate)
+  retireWith(state, dad, eldest)
+  if (wife >= 0) retireWith(state, wife, eldest)
+}
+
+function purseGift(state: KinState, payer: number, unit: HouseholdRoll, share: number): number {
+  const cost = householdCost(state.adultCost, unit.adults, unit.dependents)
+  if (classify(unit.income, unit.wealth, cost) === "poor") return 0
+  const purse = state.wealth[payer]
+  const cap = Math.floor(purse * share)
+  const room = purse - cost
+  return Math.max(0, Math.min(cap, room))
+}
+
+function householdContaining(state: KinState, person: number): HouseholdRoll | null {
+  const view = kinView(state)
+  const head = residenceMap(view, ownersFromRows(state.rows ?? []))[person]
+  if (head < 0) return null
+  return households(view, homesFromRows(state.rows ?? [])).find((unit) => unit.head === head) ?? null
+}
+
+function kinView(state: KinState): People {
+  const count = state.age.length
+  return {
+    age: state.age,
+    sex: state.sex,
+    birthMonth: new Uint8Array(count),
+    cooldown: new Uint8Array(count),
+    vigor: new Uint8Array(count),
+    intellect: new Uint8Array(count),
+    willpower: new Uint8Array(count),
+    education: new Uint8Array(count),
+    primaryYears: new Uint8Array(count),
+    secondaryYears: new Uint8Array(count),
+    occupation: new Uint8Array(count),
+    alive: state.alive,
+    income: state.income,
+    incomeLog: new Int32Array(count * 12),
+    wealth: state.wealth,
+    spouse: state.spouse,
+    mother: state.mother,
+    father: state.father,
+    livesWith: state.livesWith,
+    retired: state.retired,
+  }
+}
+
+function homesFromRows(rows: readonly Holding[]): HouseholdHome[] {
+  return rows.filter((row) => row.owner >= 0).map((row) => ({ id: row.structureId, owner: row.owner, kind: "farmstead" }))
+}
+
+/** A man looks when he owns a plot, or he is the eldest son still in his father's house. */
+function maySeekWife(state: KinState, id: number): boolean {
+  if (ownsPlot(state, id)) return true
+  const dad = state.father[id]
+  if (!livingId(state, dad) || state.retired[dad] !== 0 || state.age[dad] >= RETIRE_AGE) return false
+  const sons = childrenOf(state, dad).filter((son) => state.sex[son] === Sex.Male)
+  return eldestSon(sons, state) === id
 }
 
 function livingChildren(dead: number, alive: Uint8Array, mother: Int32Array, father: Int32Array): number[] {
@@ -1063,7 +1806,7 @@ function grantFoundingWealth(people: People, founderId: string) {
 }
 
 /**
- * Remove a dead person only when no living spouse, mother, or father field
+ * Remove a dead person only when no living spouse, parent, or household field
  * still names them. Surviving ids are packed from the front. A pointer at
  * someone who was removed becomes −1.
  */
@@ -1079,6 +1822,8 @@ export function purgeUnlinkedDead(people: People): { people: People; idMap: Int3
     if (motherId >= 0) keep[motherId] = 1
     const fatherId = people.father[i]
     if (fatherId >= 0) keep[fatherId] = 1
+    const homeId = people.livesWith?.[i] ?? -1
+    if (homeId >= 0) keep[homeId] = 1
   }
   let kept = 0
   for (let i = 0; i < count; i++) if (keep[i] !== 0) kept += 1
@@ -1102,10 +1847,14 @@ export function purgeUnlinkedDead(people: People): { people: People; idMap: Int3
   const occupation = new Uint8Array(kept)
   const alive = new Uint8Array(kept)
   const income = new Int32Array(kept)
+  const incomeLog = new Int32Array(kept * 12)
   const wealth = new Int32Array(kept)
   const spouse = new Int32Array(kept)
   const mother = new Int32Array(kept)
   const father = new Int32Array(kept)
+  const livesWith = new Int32Array(kept)
+  livesWith.fill(-1)
+  const retired = new Uint8Array(kept)
   for (let i = 0; i < count; i++) {
     const at = map[i]
     if (at < 0) continue
@@ -1121,14 +1870,39 @@ export function purgeUnlinkedDead(people: People): { people: People; idMap: Int3
     secondaryYears[at] = people.secondaryYears[i]
     occupation[at] = people.occupation?.[i] ?? 0
     alive[at] = people.alive[i]
-    income[at] = people.income[i]
+    income[at] = people.income?.[i] ?? 0
+    writeIncomeLog(incomeLog, at, people.incomeLog, i)
     wealth[at] = people.wealth[i]
     spouse[at] = people.spouse[i] < 0 ? -1 : map[people.spouse[i]]
     mother[at] = people.mother[i] < 0 ? -1 : map[people.mother[i]]
     father[at] = people.father[i] < 0 ? -1 : map[people.father[i]]
+    const homeId = people.livesWith?.[i] ?? -1
+    livesWith[at] = homeId < 0 ? -1 : map[homeId]
+    retired[at] = people.retired?.[i] ?? 0
   }
   return {
-    people: { age, sex, birthMonth, cooldown, vigor, intellect, willpower, education, primaryYears, secondaryYears, occupation, alive, income, wealth, spouse, mother, father },
+    people: {
+      age,
+      sex,
+      birthMonth,
+      cooldown,
+      vigor,
+      intellect,
+      willpower,
+      education,
+      primaryYears,
+      secondaryYears,
+      occupation,
+      alive,
+      income,
+      incomeLog,
+      wealth,
+      spouse,
+      mother,
+      father,
+      livesWith,
+      retired,
+    },
     idMap: map,
   }
 }
@@ -1169,17 +1943,18 @@ function pickWife(
   sex: Uint8Array,
   alive: Uint8Array,
   spouse: Int32Array,
+  retired: Uint8Array,
   mother: Int32Array,
   father: Int32Array,
   rng: () => number,
 ): number {
-  const preferred = wivesInRange(man, PREFERRED_YOUNGER, PREFERRED_OLDER, age, sex, alive, spouse, mother, father)
+  const preferred = wivesInRange(man, PREFERRED_YOUNGER, PREFERRED_OLDER, age, sex, alive, spouse, retired, mother, father)
   const pool =
     preferred.length > 0
       ? preferred
       : age[man] <= 22
-        ? wivesInRange(man, PREFERRED_YOUNGER, YOUNG_FALLBACK_OLDER, age, sex, alive, spouse, mother, father)
-        : wivesInRange(man, WIDE_GAP, WIDE_GAP, age, sex, alive, spouse, mother, father)
+        ? wivesInRange(man, PREFERRED_YOUNGER, YOUNG_FALLBACK_OLDER, age, sex, alive, spouse, retired, mother, father)
+        : wivesInRange(man, WIDE_GAP, WIDE_GAP, age, sex, alive, spouse, retired, mother, father)
   if (pool.length === 0) return -1
   return pool[Math.floor(rng() * pool.length)]
 }
@@ -1192,15 +1967,19 @@ function wivesInRange(
   sex: Uint8Array,
   alive: Uint8Array,
   spouse: Int32Array,
+  retired: Uint8Array,
   mother: Int32Array,
   father: Int32Array,
 ): number[] {
   const manAge = age[man]
   const youngest = Math.max(MIN_ADULT_AGE, manAge - younger)
-  const oldest = manAge + older
+  const oldest = Math.min(45, manAge + older)
   const found: number[] = []
   for (let j = 0; j < age.length; j++) {
-    if (alive[j] === 0 || sex[j] !== Sex.Female || spouse[j] >= 0) continue
+    if (alive[j] === 0 || sex[j] !== Sex.Female) continue
+    const mate = spouse[j]
+    if (mate >= 0 && alive[mate] !== 0) continue
+    if (mate >= 0 && retired[j] !== 0) continue
     const hers = age[j]
     if (hers < youngest || hers > oldest) continue
     if (sharesParent(mother, father, man, j)) continue
@@ -1452,12 +2231,79 @@ function filledAlive(count: number): Uint8Array {
   return alive
 }
 
+/** Copy household pointers, or −1 when an older table has none. */
+function livesWithColumn(people: People, count: number): Int32Array {
+  const next = new Int32Array(count)
+  next.fill(-1)
+  const current = people.livesWith
+  if (current) {
+    for (let i = 0; i < Math.min(count, current.length); i++) next[i] = current[i]
+  }
+  return next
+}
+
+/** Copy retirement flags, or zeros when an older table has none. */
+function retiredColumn(people: People, count: number): Uint8Array {
+  const next = new Uint8Array(count)
+  const current = people.retired
+  if (current) next.set(current.subarray(0, Math.min(count, current.length)))
+  return next
+}
+
 /** Copy the occupation column, or zeros when an older table has none. */
 function occupationColumn(people: People, count: number): Uint8Array {
   const next = new Uint8Array(count)
   const current = people.occupation
   if (current) next.set(current.subarray(0, Math.min(count, current.length)))
   return next
+}
+
+/** Copy twelve months of operating income for each person, or zeros when an older table has none. */
+export function copyIncomeLog(people: People, count: number): Int32Array {
+  const next = new Int32Array(count * 12)
+  const current = people.incomeLog
+  if (current) next.set(current.subarray(0, Math.min(current.length, next.length)))
+  return next
+}
+
+function writeIncomeLog(dest: Int32Array, destId: number, src: Int32Array | undefined, srcId: number) {
+  if (!src) return
+  const from = srcId * 12
+  const to = destId * 12
+  for (let month = 0; month < 12; month++) dest[to + month] = src[from + month] ?? 0
+}
+
+function mergeIncome(income: Int32Array, log: Int32Array, head: number, other: number) {
+  if (other < 0 || other >= income.length || head < 0 || head >= income.length) return
+  income[head] += income[other]
+  income[other] = 0
+  for (let month = 0; month < 12; month++) {
+    log[head * 12 + month] += log[other * 12 + month] ?? 0
+    log[other * 12 + month] = 0
+  }
+}
+
+/** Drop this calendar month's result from a year ago, then record the new month in that slot. */
+export function openIncomeMonth(people: People, month: number): People {
+  const count = people.age.length
+  const income = new Int32Array(people.income ?? count)
+  const incomeLog = copyIncomeLog(people, count)
+  const slot = ((month % 12) + 12) % 12
+  for (let id = 0; id < count; id++) {
+    const at = id * 12 + slot
+    income[id] -= incomeLog[at] ?? 0
+    incomeLog[at] = 0
+  }
+  return { ...people, income, incomeLog }
+}
+
+/** Add a sale, fee, goods purchase, or lease payment to the open month. */
+export function noteOperatingIncome(income: Int32Array, log: Int32Array, id: number, dollars: number, month: number) {
+  if (!Number.isFinite(dollars) || dollars === 0) return
+  if (id < 0 || id >= income.length) return
+  const slot = ((month % 12) + 12) % 12
+  income[id] += dollars
+  log[id * 12 + slot] += dollars
 }
 
 function pack(
@@ -1486,10 +2332,13 @@ function pack(
     occupation: new Uint8Array(age.length),
     alive: filledAlive(age.length),
     income: new Int32Array(age.length),
+    incomeLog: new Int32Array(age.length * 12),
     wealth: new Int32Array(age.length),
     spouse: Int32Array.from(spouse),
     mother: Int32Array.from(mother),
     father: Int32Array.from(father),
+    livesWith: new Int32Array(age.length).fill(-1),
+    retired: new Uint8Array(age.length),
   }
 }
 

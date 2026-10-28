@@ -1,14 +1,19 @@
 import { monthlyCapital, type Holding, type Holdings } from "@/lib/land"
 import { hashSeed, mulberry32 } from "@/lib/noise"
-import { Sex, type People } from "@/lib/people"
+import { copyIncomeLog, householdHomes, householdRanks, noteOperatingIncome, Sex, type People, type SocialClass } from "@/lib/people"
 import { familyPortions, GOOD_LABEL, GOODS, type Farms, type Good, type ShopSpecialty } from "@/lib/produce"
 import type { PropertyLine } from "@/lib/land"
 import { isWater, type Structure } from "@/lib/buildings"
-import { Feature } from "@/lib/types"
+import { Feature, Terrain } from "@/lib/types"
 
 /** Hundredths of a ton. */
 const TON = 100
 const TARGET_MONTHS = 3
+/** Cover below this is a shortage: use has outrun production. */
+const COVER_SHORT = 3
+/** Cover above this is a surplus. A year of harvest plus three months of slack sits in between. */
+const COVER_LONG = 15
+const PRICE_CEILING = 100_000
 /** Years of expected use a household or business holds back, and tries to buy up to. */
 const STOCK_YEARS = 2
 /** A market sells at this markup over what it paid. */
@@ -32,8 +37,25 @@ type UseContext = {
   stockAsk: Partial<Record<Good, number>>
   targets: Map<number, Record<Good, number>>
   wealth: Int32Array
+  /** Year's protein order per household head. The first good is the one they keep. */
+  proteinOrders?: Map<number, Good[]>
+  headOf?: Int32Array
+  /** Where each good's price is heading. Workshops score a batch against these. */
+  marks?: Record<Good, number>
 }
 const PRICE_FLOOR = 1
+
+type IncomeBooks = { income: Int32Array; log: Int32Array; month: number }
+
+/** Set for the month being settled. Cash from sales, fees, goods, and nothing else goes through credit. */
+let books: IncomeBooks | null = null
+
+function credit(wealth: Int32Array, id: number, dollars: number) {
+  if (!Number.isFinite(dollars) || dollars === 0) return
+  if (id < 0 || id >= wealth.length) return
+  wealth[id] += dollars
+  if (books) noteOperatingIncome(books.income, books.log, id, dollars, books.month)
+}
 
 type Quote = { price: number; export: boolean; import?: boolean }
 
@@ -98,6 +120,10 @@ export type TownTrade = {
   /** Dollars per ton a buyer pays for imported stock. The foreign price plus the importing post's fee. */
   stockAsk: Partial<Record<Good, number>>
   shipments: Shipment[]
+  /** Calendar year the protein orders were chosen. */
+  proteinYear?: number
+  /** Household head to this year's protein order. The first good is the one they keep. */
+  proteinPick?: Partial<Record<number, Good[]>>
 }
 
 export function emptyTown(): TownTrade {
@@ -164,23 +190,37 @@ export function townPriceRows(
   terrain: Uint8Array = new Uint8Array(),
   feature: Uint8Array = new Uint8Array(),
   lows: readonly number[] = [],
-): { label: string; value: string; note?: string }[] {
+  seed = "",
+  year = 0,
+): { label: string; value: string; note?: string; sub?: string }[] {
   const stock = totalStock(farms, town)
   const ownedIds = new Set(holdings.rows.filter((row) => row.owner >= 0).map((row) => row.structureId))
   const owned = new Map(holdings.rows.filter((row) => row.owner >= 0).map((row) => [row.structureId, row]))
   const yearLows = lows.length > 0 ? lows : Array.from({ length: 12 }, () => low)
   const fee = cheapFee(holdings, structures) ?? 0
-  const targets = people ? stockTargets(people, structures, owned, yearLows, terrain, feature, farms, town.prices) : new Map()
-  const use = monthlyUse(structures, people, low, ownedIds, terrain, feature, {
-    farms,
-    prices: town.prices,
-    fee,
-    stock: town.stock,
-    stockOwner: town.stockOwner,
-    stockAsk: town.stockAsk ?? {},
-    targets,
-    wealth: people?.wealth ?? new Int32Array(),
-  })
+  const plan = people
+    ? planProtein(people, structures, owned, farms, town.prices, yearLows, terrain, feature, seed, year, town.proteinYear === year ? 1 : 0, town)
+    : null
+  const targets = people ? stockTargets(people, structures, owned, yearLows, terrain, feature, farms, town.prices, plan ?? undefined) : new Map()
+  const marketIds = structures.filter((structure) => structure.kind === "market" && !structure.pending && !structure.removing && owned.has(structure.id)).map((structure) => structure.id)
+  const postCount = structures.filter((structure) => structure.kind === "trading-post" && !structure.pending && !structure.removing && owned.has(structure.id)).length
+  const measure = (marks?: Record<Good, number>) =>
+    monthlyUse(structures, people, low, ownedIds, terrain, feature, {
+      farms,
+      prices: town.prices,
+      fee,
+      stock: town.stock,
+      stockOwner: town.stockOwner,
+      stockAsk: town.stockAsk ?? {},
+      targets,
+      wealth: people?.wealth ?? new Int32Array(),
+      proteinOrders: plan?.orders,
+      headOf: plan?.headOf,
+      marks,
+    })
+  const quote = quotedPrices(stock, town.prices, fee, postCount, measure)
+  const selling = marketSale(farms, marketIds)
+  const use = measure(quote)
   return GOODS.map((good) => {
     const foreign = WEST_EUROPE[good]
     const onHand = stock[good] / TON
@@ -191,13 +231,15 @@ export function townPriceRows(
     ]
       .filter(Boolean)
       .join(" · ")
-    return { label: GOOD_LABEL[good], value: dollars(town.prices[good]), note }
+    const market = selling[good]
+    return { label: GOOD_LABEL[good], value: market == null ? "—" : dollars(market), sub: dollars(quote[good]), note }
   })
 }
 
 /**
  * One adult's year at town prices. Grain, the average of fruit and vegetables,
- * and the average of fish, meat, and dairy. Adult clothing and leather. Half of
+ * and the average of a year of meat, a year of fish, and a year of dairy.
+ * Dairy is twice the weight. Adult clothing and leather. Half of
  * one household's yearly fuel: wood, or coal when wood costs more than a quarter of coal.
  */
 export function costOfLiving(prices: Record<Good, number>, lows: readonly number[]): number {
@@ -205,7 +247,7 @@ export function costOfLiving(prices: Record<Good, number>, lows: readonly number
   const food =
     price("grain") * 0.1 +
     ((price("fruit") + price("vegetables")) / 2) * 0.3 +
-    ((price("fish") + price("meat") + price("dairy")) / 3) * 0.1
+    (price("meat") * 0.1 + price("fish") * 0.1 + price("dairy") * 0.2) / 3
   const supplies = price("clothing") * 0.01 + price("leather") * 0.005
   const woodYear = lows.reduce((sum, value) => sum + (value < 4 ? 4 : 2), 0)
   const wood = price("wood")
@@ -236,6 +278,9 @@ export function tradeMonth(
   precip = 0,
 ): { people: People; farms: Farms; town: TownTrade } {
   const wealth = new Int32Array(people.wealth)
+  const income = new Int32Array(people.income ?? people.age.length)
+  const incomeLog = copyIncomeLog(people, people.age.length)
+  books = { income, log: incomeLog, month }
   const rows = farms.rows.map((row) => ({ ...row, store: { ...emptyGoods(), ...row.store } }))
   for (const row of rows) for (const good of GOODS) if (!Number.isFinite(row.store[good])) row.store[good] = 0
   const nextFarms: Farms = { rows }
@@ -244,6 +289,9 @@ export function tradeMonth(
   const stockAsk = { ...(town.stockAsk ?? {}) }
   for (const good of GOODS) if (stock[good] == null) stock[good] = 0
   const owned = new Map(holdings.rows.filter((row) => row.owner >= 0).map((row) => [row.structureId, row]))
+  const yearLows = lows.length > 0 ? lows : [low]
+  const protein = planProtein(people, structures, owned, nextFarms, town.prices, yearLows, terrain, feature, seed, year, month, town)
+  bindProteinSales(protein.sources, protein.farmsteads)
   const posts = structures
     .filter((structure) => structure.kind === "trading-post" && !structure.pending && !structure.removing && owned.has(structure.id))
     .map((structure) => owned.get(structure.id) as Holding)
@@ -252,8 +300,7 @@ export function tradeMonth(
   const shipments: Shipment[] = []
   const exported = new Set<Good>()
   const ownedIds = new Set(owned.keys())
-  const yearLows = lows.length > 0 ? lows : [low]
-  const targets = stockTargets(people, structures, owned, yearLows, terrain, feature, nextFarms, town.prices)
+  const targets = stockTargets(people, structures, owned, yearLows, terrain, feature, nextFarms, town.prices, protein)
   dryFruit(nextFarms, structures, owned, targets, high, precip)
   makeCoal(nextFarms, structures, owned, targets, feature, month)
   const marketIds = marketStructures(structures, owned)
@@ -267,6 +314,8 @@ export function tradeMonth(
     stockAsk,
     targets,
     wealth,
+    proteinOrders: protein.orders,
+    headOf: protein.headOf,
   })
   for (const post of posts) {
     const fee = postFee(post)
@@ -285,7 +334,7 @@ export function tradeMonth(
     const fromWorkshop = drawn.shares.length > 0 && drawn.shares.every((share) => share.direct)
     if (direct || fromWorkshop) {
       payShares(wealth, drawn.shares, bid)
-      if (wealth.length > post.owner) wealth[post.owner] += fee
+      credit(wealth, post.owner, fee)
     } else settleExport(wealth, drawn.shares, bid, fee, post.owner, owned.get(marketIds[0])?.owner ?? -1)
     exported.add(good)
     shipments.push({ postId: post.structureId, good, way: "export", dollars: bid })
@@ -298,7 +347,7 @@ export function tradeMonth(
     if (!good) break
     const regional = (WEST_EUROPE[good] as Quote).price
     if (wealth.length <= post.owner || wealth[post.owner] < regional) continue
-    wealth[post.owner] -= regional
+    credit(wealth, post.owner, -regional)
     stock[good] += TON
     stockOwner[good] = post.owner
     stockAsk[good] = regional + fee
@@ -314,8 +363,14 @@ export function tradeMonth(
     feedShops(structures, owned, nextFarms, stock, stockOwner, stockAsk, wealth, town.prices, targets, marketIds, posts, year, seed)
     wear(people, nextFarms, stock, stockOwner, stockAsk, wealth, town.prices, targets, marketIds, posts, year, seed)
   }
-  runShops(structures, owned, nextFarms, stock, stockOwner, stockAsk, wealth, town.prices, targets, marketIds, posts, month)
-  restock(nextFarms, stock, stockOwner, stockAsk, wealth, town.prices, targets, marketIds, posts)
+  const prices = { ...town.prices }
+  for (const good of GOODS) if (prices[good] == null) prices[good] = WEST_EUROPE[good]?.price ?? PRICE_FLOOR
+  const feeNow = posts.length > 0 ? postFee(posts[0]) : 0
+  const measure = (marks?: Record<Good, number>) =>
+    monthlyUse(structures, people, low, ownedIds, terrain, feature, { ...tradeContext(), marks })
+  const shopMarks = quotedPrices(totalStock(nextFarms, { ...town, stock }), prices, feeNow, posts.length, measure)
+  runShops(structures, owned, nextFarms, stock, stockOwner, stockAsk, wealth, prices, targets, marketIds, posts, month, shopMarks)
+  restock(nextFarms, stock, stockOwner, stockAsk, wealth, town.prices, targets, marketIds, posts, protein.orders, protein.headOf)
   for (const good of GOODS) {
     if ((stock[good] ?? 0) > 0) continue
     stock[good] = 0
@@ -323,38 +378,139 @@ export function tradeMonth(
     delete stockAsk[good]
   }
 
-  const prices = { ...town.prices }
-  for (const good of GOODS) if (prices[good] == null) prices[good] = WEST_EUROPE[good]?.price ?? PRICE_FLOOR
   const after = totalStock(nextFarms, { ...town, stock })
-  const use = monthlyUse(structures, people, low, ownedIds, terrain, feature, tradeContext())
-  const fee = posts.length > 0 ? postFee(posts[0]) : 0
-  for (const good of GOODS) prices[good] = stepPrice(prices[good], after[good], use[good], band(good, fee))
+  const desired = quotedPrices(after, prices, feeNow, posts.length, measure)
+  for (const good of GOODS) prices[good] = glidePrice(prices[good], desired[good])
 
+  books = null
+  sellProtein = () => true
   return {
-    people: { ...people, wealth },
+    people: { ...people, wealth, income, incomeLog },
     farms: nextFarms,
-    town: { prices, stock, stockOwner, stockAsk, shipments },
+    town: { prices, stock, stockOwner, stockAsk, shipments, proteinYear: year, proteinPick: storeProteinPick(protein.orders, people, protein.headOf) },
   }
 }
 
-function band(good: Good, fee: number): { floor: number; ceiling: number } {
-  const foreign = WEST_EUROPE[good]
-  if (!foreign) return { floor: PRICE_FLOOR, ceiling: 0 }
-  // No trading post: nothing ships, so the quote stays put.
-  if (fee <= 0) return { floor: foreign.price, ceiling: foreign.price }
-  const bid = foreign.export ? Math.max(0, foreign.price - fee) : 0
-  const ask = foreign.price + fee
-  return { floor: bid > 0 ? bid : PRICE_FLOOR, ceiling: ask }
+function glidePrice(price: number, desired: number): number {
+  const next = Math.round(price + 0.25 * (desired - price))
+  return Math.min(PRICE_CEILING, Math.max(PRICE_FLOOR, next))
 }
 
-function stepPrice(price: number, stock: number, use: number, limits: { floor: number; ceiling: number }): number {
-  if (use <= 0 && stock <= 0) return price
-  const cover = use <= 0 ? 99 : Math.max(stock / TON / use, 0.05)
-  const anchor = limits.floor
-  const desired = anchor * Math.sqrt(TARGET_MONTHS / cover)
-  let next = Math.round(price + 0.25 * (desired - price))
-  if (limits.ceiling > 0) next = Math.min(next, limits.ceiling)
-  return Math.max(next, limits.floor)
+/** Months of stock. Null when the good is neither used nor stored. */
+function coverMonths(stock: number, use: number): number | null {
+  if (use <= 0 && stock <= 0) return null
+  if (use <= 0) return Number.POSITIVE_INFINITY
+  return (stock / TON) / use
+}
+
+/** The last ton is the smallest import. Price cover ignores it. Import cover still counts it. */
+function priceStock(stock: number): number {
+  return Math.max(0, stock - TON)
+}
+
+function tradeEnds(good: Good, fee: number): { list: number | null; bid: number | null; ask: number | null } {
+  const foreign = WEST_EUROPE[good]
+  if (!foreign) return { list: null, bid: null, ask: null }
+  const charge = fee > 0 ? fee : 0
+  const bid = foreign.export ? Math.max(PRICE_FLOOR, foreign.price - charge) : null
+  const ask = foreign.import === false ? null : foreign.price + charge
+  return { list: foreign.price, bid, ask }
+}
+
+function saturations(stock: Record<Good, number>, use: Record<Good, number>, fee: number, posts: number): { imports: number; exports: number } {
+  const slots = posts * 12
+  let exportPile = 0
+  let importPile = 0
+  for (const good of GOODS) {
+    const cover = coverMonths(stock[good] ?? 0, use[good] ?? 0)
+    if (cover === null) continue
+    const ends = tradeEnds(good, fee)
+    const tons = (stock[good] ?? 0) / TON
+    if (cover > COVER_LONG && ends.bid !== null) exportPile += Math.max(0, tons - COVER_LONG * (use[good] ?? 0))
+    if (cover < COVER_SHORT && ends.ask !== null) importPile += Math.max(0, COVER_SHORT * (use[good] ?? 0) - tons)
+  }
+  const ratio = (pile: number) => (pile <= 0 ? 0 : slots <= 0 ? 1 : pile / (pile + slots))
+  return { imports: ratio(importPile), exports: ratio(exportPile) }
+}
+
+/**
+ * The price a good is heading toward. From 3 to 15 months of cover it sits on the
+ * foreign list. A shortage can rise above the import ask once the year's import
+ * slots are full. A surplus can fall below the export bid once the export slots are full.
+ */
+function desiredPrice(
+  good: Good,
+  posted: number,
+  stock: number,
+  use: number,
+  fee: number,
+  pressure: { imports: number; exports: number },
+): number {
+  const ends = tradeEnds(good, fee)
+  const sticker = Math.min(PRICE_CEILING, Math.max(PRICE_FLOOR, posted))
+  const cover = coverMonths(priceStock(stock), use)
+  if (cover === null) return clampPrice(ends.list ?? sticker)
+  if (cover < COVER_SHORT) {
+    const safe = Math.max(cover, 0.05)
+    if (ends.ask === null) return clampPrice(sticker * Math.sqrt(COVER_SHORT / safe))
+    const lifted = ends.ask * Math.sqrt(COVER_SHORT / safe)
+    return clampPrice(ends.ask + (lifted - ends.ask) * pressure.imports)
+  }
+  if (cover > COVER_LONG) {
+    const finite = Math.min(cover, 1e6)
+    if (ends.bid === null) return clampPrice(sticker * Math.sqrt(COVER_LONG / finite))
+    const domestic = ends.bid * Math.sqrt(COVER_LONG / finite)
+    return clampPrice(ends.bid + (domestic - ends.bid) * pressure.exports)
+  }
+  return clampPrice(ends.list ?? sticker)
+}
+
+function clampPrice(value: number): number {
+  return Math.min(PRICE_CEILING, Math.max(PRICE_FLOOR, value))
+}
+
+/** Cheapest price a market with the good in its barn is asking. */
+function marketSale(farms: Farms, marketIds: readonly number[]): Partial<Record<Good, number>> {
+  const ask: Partial<Record<Good, number>> = {}
+  for (const row of farms.rows) {
+    if (!marketIds.includes(row.structureId)) continue
+    for (const good of GOODS) {
+      const cost = row.cost?.[good]
+      if (!cost || (row.store[good] ?? 0) <= 0) continue
+      const sale = sellPrice(cost)
+      const prior = ask[good]
+      if (prior === undefined || sale < prior) ask[good] = sale
+    }
+  }
+  return ask
+}
+
+function priceMarks(
+  stock: Record<Good, number>,
+  use: Record<Good, number>,
+  posted: Record<Good, number>,
+  fee: number,
+  posts: number,
+): Record<Good, number> {
+  const priced = {} as Record<Good, number>
+  for (const good of GOODS) priced[good] = priceStock(stock[good] ?? 0)
+  const pressure = saturations(priced, use, fee, posts)
+  const marks = {} as Record<Good, number>
+  for (const good of GOODS) {
+    marks[good] = desiredPrice(good, posted[good] ?? PRICE_FLOOR, stock[good] ?? 0, use[good] ?? 0, fee, pressure)
+  }
+  return marks
+}
+
+function quotedPrices(
+  stock: Record<Good, number>,
+  posted: Record<Good, number>,
+  fee: number,
+  posts: number,
+  measure: (marks?: Record<Good, number>) => Record<Good, number>,
+): Record<Good, number> {
+  const draft = priceMarks(stock, measure(undefined), posted, fee, posts)
+  return priceMarks(stock, measure(draft), posted, fee, posts)
 }
 
 function bestExport(
@@ -601,6 +757,7 @@ function drawSpare(
   const order = [...farms.rows].sort((a, b) => (b.store[good] ?? 0) - (a.store[good] ?? 0) || a.structureId - b.structureId)
   for (const row of order) {
     if (left <= 0) break
+    if (!sellProtein(row.structureId, good)) continue
     const room = spare.get(row.owner) ?? 0
     const taken = Math.min(row.store[good] ?? 0, left, room)
     if (taken <= 0) continue
@@ -647,6 +804,174 @@ function barnHeld(farms: Farms, owner: number, good: Good): number {
   return held
 }
 
+/** A year of protein is 0.1 t of meat, 0.1 t of fish, or 0.2 t of dairy. */
+const PROTEINS: readonly Good[] = ["meat", "dairy", "fish"]
+
+function proteinTons(good: Good): number {
+  return good === "dairy" ? 0.2 : 0.1
+}
+
+function proteinBasket(good: Good, prices: Record<Good, number>): number {
+  return (prices[good] ?? PRICE_FLOOR) * proteinTons(good)
+}
+
+/** Farmsteads may sell a protein only when that farm produces it. Other barns sell as before. */
+let sellProtein: (structureId: number, good: Good) => boolean = () => true
+
+function producedOn(
+  structures: readonly Structure[],
+  farms: Farms,
+  terrain: Uint8Array,
+  feature: Uint8Array,
+): { sources: Map<number, Set<Good>>; farmsteads: Set<number> } {
+  const sources = new Map<number, Set<Good>>()
+  const farmsteads = new Set<number>()
+  for (const structure of structures) {
+    if (structure.kind !== "farmstead" || structure.pending || structure.removing) continue
+    farmsteads.add(structure.id)
+    const row = farms.rows.find((item) => item.structureId === structure.id)
+    if (!row) continue
+    const made = new Set<Good>()
+    if (row.uses.includes("dairy")) made.add("dairy")
+    if (row.uses.includes("meat")) made.add("meat")
+    for (const tile of structure.tiles) {
+      const ground = terrain[tile]
+      if (ground === Terrain.Sea || ground === Terrain.Fresh) made.add("fish")
+      const cover = feature[tile]
+      if (cover === Feature.Woodland || cover === Feature.Forest || cover === Feature.Wetland) made.add("meat")
+    }
+    sources.set(structure.id, made)
+  }
+  return { sources, farmsteads }
+}
+
+function bindProteinSales(sources: Map<number, Set<Good>>, farmsteads: Set<number>) {
+  sellProtein = (structureId, good) => {
+    if (good !== "meat" && good !== "fish" && good !== "dairy") return true
+    if (!farmsteads.has(structureId)) return true
+    return sources.get(structureId)?.has(good) ?? false
+  }
+}
+
+function homeHead(headOf: Int32Array, id: number): number {
+  if (id < 0 || id >= headOf.length) return id
+  const head = headOf[id]
+  return head >= 0 ? head : id
+}
+
+function byBasket(prices: Record<Good, number>) {
+  return (a: Good, b: Good) => proteinBasket(a, prices) - proteinBasket(b, prices) || PROTEINS.indexOf(a) - PROTEINS.indexOf(b)
+}
+
+/** Market order. Producers later move the proteins they raise to the front. */
+function marketProteinOrder(rank: SocialClass, prices: Record<Good, number>, rng: () => number): Good[] {
+  const ranked = (["meat", "fish", "dairy"] as Good[]).sort(byBasket(prices))
+  if (rank === "poor" || rank === "working") return ranked
+  if (rank === "wealthy") {
+    const roll = rng()
+    const start = roll < 0.5 ? 0 : roll < 0.75 ? 1 : 2
+    return [0, 1, 2].map((step) => PROTEINS[(start + step) % 3])
+  }
+  const cheapest = ranked[0]
+  const second = ranked[1]
+  const dearest = ranked[2]
+  const roll = rng()
+  let first = cheapest
+  if (roll >= 0.9 && proteinBasket(dearest, prices) <= proteinBasket(cheapest, prices) * 10) first = dearest
+  else if (roll >= 0.5 && proteinBasket(second, prices) <= proteinBasket(cheapest, prices) * 5) first = second
+  return [first, ...ranked.filter((good) => good !== first)]
+}
+
+function proteinOrder(rank: SocialClass, produced: Set<Good> | undefined, prices: Record<Good, number>, rng: () => number): Good[] {
+  const market = marketProteinOrder(rank, prices, rng)
+  if (!produced || produced.size === 0) return market
+  const made = [...produced].sort(byBasket(prices))
+  if (rank === "wealthy") made.reverse()
+  return [...made, ...market.filter((good) => !produced.has(good))]
+}
+
+function readProteinPick(town: TownTrade, year: number, month: number): Map<number, Good[]> {
+  const orders = new Map<number, Good[]>()
+  if (month === 0 || town.proteinYear !== year || !town.proteinPick) return orders
+  for (const [key, order] of Object.entries(town.proteinPick)) {
+    if (!order || order.length === 0) continue
+    const goods = order.filter((good): good is Good => good === "meat" || good === "fish" || good === "dairy")
+    if (goods.length > 0) orders.set(Number(key), goods)
+  }
+  return orders
+}
+
+/**
+ * One protein order per household for the calendar year. January starts fresh.
+ * A head who appears later in the year is chosen once and kept until January.
+ */
+function planProtein(
+  people: People,
+  structures: readonly Structure[],
+  owned: Map<number, Holding>,
+  farms: Farms,
+  prices: Record<Good, number>,
+  lows: readonly number[],
+  terrain: Uint8Array,
+  feature: Uint8Array,
+  seed: string,
+  year: number,
+  month: number,
+  town: TownTrade,
+): { orders: Map<number, Good[]>; headOf: Int32Array; sources: Map<number, Set<Good>>; farmsteads: Set<number> } {
+  const homes = householdHomes(structures, [...owned.values()])
+  const { rank, headOf } = householdRanks(people, costOfLiving(prices, lows), homes)
+  const { sources, farmsteads } = producedOn(structures, farms, terrain, feature)
+  const produced = new Map<number, Set<Good>>()
+  for (const structure of structures) {
+    if (!farmsteads.has(structure.id)) continue
+    const holding = owned.get(structure.id)
+    if (!holding) continue
+    const head = homeHead(headOf, holding.owner)
+    const bag = produced.get(head) ?? new Set<Good>()
+    for (const good of sources.get(structure.id) ?? []) bag.add(good)
+    produced.set(head, bag)
+  }
+  const orders = readProteinPick(town, year, month)
+  for (let id = 0; id < people.age.length; id++) {
+    if (people.alive[id] === 0) continue
+    const head = homeHead(headOf, id)
+    if (orders.has(head)) continue
+    const rng = mulberry32(hashSeed(`${seed}:protein:${head}:${year}`))
+    orders.set(head, proteinOrder(rank.get(head) ?? "poor", produced.get(head), prices, rng))
+  }
+  return { orders, headOf, sources, farmsteads }
+}
+
+function storeProteinPick(orders: Map<number, Good[]>, people: People, headOf: Int32Array): Partial<Record<number, Good[]>> {
+  const pick: Partial<Record<number, Good[]>> = {}
+  for (let id = 0; id < people.alive.length; id++) {
+    if (people.alive[id] === 0) continue
+    const head = homeHead(headOf, id)
+    const order = orders.get(head)
+    if (order) pick[head] = order
+  }
+  return pick
+}
+
+function proteinForSale(
+  farms: Farms,
+  stock: Record<Good, number>,
+  stockOwner: Partial<Record<Good, number>>,
+  targets: Map<number, Record<Good, number>>,
+  good: Good,
+  buyer: number,
+): boolean {
+  const spare = new Map<number, number>()
+  for (const row of farms.rows) {
+    if (row.owner < 0 || row.owner === buyer || !sellProtein(row.structureId, good)) continue
+    if (!spare.has(row.owner)) spare.set(row.owner, Math.max(0, barnHeld(farms, row.owner, good) - (targets.get(row.owner)?.[good] ?? 0)))
+    if ((spare.get(row.owner) ?? 0) > 0 && (row.store[good] ?? 0) > 0) return true
+  }
+  const seller = stockOwner[good]
+  return (stock[good] ?? 0) > 0 && seller !== undefined && seller !== buyer
+}
+
 /** Two years of food, fuel, clothing, business supplies, and farm tools, in hundredths of a ton. */
 function stockTargets(
   people: People,
@@ -657,6 +982,7 @@ function stockTargets(
   feature: Uint8Array,
   farms: Farms,
   prices: Record<Good, number>,
+  protein?: { orders: Map<number, Good[]>; headOf: Int32Array },
 ): Map<number, Record<Good, number>> {
   const woodYear = lows.reduce((sum, value) => sum + (value < 4 ? 4 : 2), 0)
   const houses = new Map<number, number>()
@@ -701,9 +1027,9 @@ function stockTargets(
       tons.grain += family.scale * 0.1
       tons.fruit += family.scale * 0.15
       tons.vegetables += family.scale * 0.15
-      tons.fish += (family.scale * 0.1) / 3
-      tons.meat += (family.scale * 0.1) / 3
-      tons.dairy += (family.scale * 0.1) / 3
+      const head = protein ? homeHead(protein.headOf, owner) : owner
+      const pick = protein?.orders.get(head)?.[0]
+      if (pick) tons[pick] += family.scale * proteinTons(pick)
       tons.clothing += family.adults * 0.01 + family.children * 0.005
       tons.leather += family.adults * 0.005
     }
@@ -748,14 +1074,9 @@ function sellPrice(unit: number): number {
   return Math.max(marked, least)
 }
 
-/** Export goods are bought at the bid. Wood and local goods are bought at the town price. */
-function offerPrice(good: Good, prices: Record<Good, number>, fee: number): number {
-  const foreign = WEST_EUROPE[good]
-  if (foreign?.export && fee > 0) {
-    const bid = foreign.price - fee
-    if (bid >= 1) return bid
-  }
-  return prices[good] ?? PRICE_FLOOR
+/** What a local buyer pays. The post's bid and ask are separate, and the town price can sit outside them. */
+function offerPrice(good: Good, prices: Record<Good, number>, _fee: number): number {
+  return clampPrice(prices[good] ?? PRICE_FLOOR)
 }
 
 function rememberCost(row: { cost?: Partial<Record<Good, number>>; store: Record<Good, number> }, good: Good, added: number, unit: number) {
@@ -788,12 +1109,12 @@ function settleExport(
   shopsSold.forEach((share, index) => {
     const dollars = index === shopsSold.length - 1 ? shopDollars - credited : Math.round(((bid + markup) * share.hundredths) / TON)
     credited += dollars
-    if (wealth.length > share.owner) wealth[share.owner] += dollars
+    if (wealth.length > share.owner) credit(wealth, share.owner, dollars)
   })
   const pass = Math.round((markup * farmHundredths) / TON)
-  if (pass !== 0 && marketOwner >= 0 && wealth.length > marketOwner) wealth[marketOwner] += pass
+  if (pass !== 0 && marketOwner >= 0) credit(wealth, marketOwner, pass)
   const marketed = farmHundredths + shopHundredths
-  if (wealth.length > postOwner) wealth[postOwner] += fee - Math.round((markup * marketed) / TON)
+  credit(wealth, postOwner, fee - Math.round((markup * marketed) / TON))
 }
 
 function drawThroughMarket(
@@ -819,6 +1140,7 @@ function drawThroughMarket(
   const others = rows.filter((row) => !marketIds.includes(row.structureId)).sort((a, b) => (b.store[good] ?? 0) - (a.store[good] ?? 0) || a.structureId - b.structureId)
   for (const row of [...shops, ...others]) {
     if (left <= 0) break
+    if (!sellProtein(row.structureId, good)) continue
     const room = spare.get(row.owner) ?? 0
     const taken = Math.min(row.store[good] ?? 0, left, room)
     if (taken <= 0) continue
@@ -855,8 +1177,8 @@ function marketsBuyPool(
       const bought = affordable(wealth[shop.owner], ask, stock[good])
       if (bought <= 0) continue
       const cost = ask <= 0 ? 0 : Math.round((ask * bought) / TON)
-      wealth[shop.owner] -= cost
-      if (wealth.length > seller) wealth[seller] += cost
+      credit(wealth, shop.owner, -cost)
+      credit(wealth, seller, cost)
       rememberCost(shop, good, bought, ask)
       shop.store[good] = (shop.store[good] ?? 0) + bought
       stock[good] -= bought
@@ -891,9 +1213,9 @@ function buyGoods(
     const bought = affordable(wealth[buyer], price, offer)
     if (bought <= 0) continue
     const cost = price <= 0 ? 0 : Math.round((price * bought) / TON)
-    wealth[buyer] -= cost
+    credit(wealth, buyer, -cost)
     spent += cost
-    if (wealth.length > shop.owner) wealth[shop.owner] += cost
+    credit(wealth, shop.owner, cost)
     shop.store[good] = (shop.store[good] ?? 0) - bought
     left -= bought
   }
@@ -907,12 +1229,12 @@ function buyGoods(
     if (taken > 0) {
       const paying = Math.round((price * taken) / TON)
       const farmPay = Math.round((unit * taken) / TON)
-      wealth[buyer] -= paying
+      credit(wealth, buyer, -paying)
       spent += paying
       payShares(wealth, drawn.shares, farmPay)
       if (!ownsShop) {
         const shop = farms.rows.find((row) => row.structureId === marketIds[0])
-        if (shop && wealth.length > shop.owner) wealth[shop.owner] += paying - farmPay
+        if (shop) credit(wealth, shop.owner, paying - farmPay)
       }
       left -= taken
     }
@@ -929,9 +1251,9 @@ function buyGoods(
         const bought = affordable(wealth[buyer], sticker, available)
         if (bought > 0) {
           const cost = sticker <= 0 ? 0 : Math.round((sticker * bought) / TON)
-          wealth[buyer] -= cost
+          credit(wealth, buyer, -cost)
           spent += cost
-          if (wealth.length > seller) wealth[seller] += cost
+          credit(wealth, seller, cost)
           stock[good] -= bought
           left -= bought
         }
@@ -951,22 +1273,52 @@ function restock(
   targets: Map<number, Record<Good, number>>,
   marketIds: number[],
   posts: Holding[],
+  proteinOrders: Map<number, Good[]> = new Map(),
+  headOf?: Int32Array,
 ) {
   const fee = posts.length > 0 ? postFee(posts[0]) : 0
+  const deliver = (owner: number, good: Good, hundredths: number): number => {
+    const barn = farms.rows.filter((row) => row.owner === owner && !marketIds.includes(row.structureId)).sort((a, b) => a.structureId - b.structureId)[0]
+      ?? farms.rows.filter((row) => row.owner === owner).sort((a, b) => a.structureId - b.structureId)[0]
+    if (!barn || wealth.length <= owner || hundredths <= 0) return 0
+    const bought = buyGoods(farms, stock, stockOwner, stockAsk, wealth, owner, good, hundredths, prices, targets, marketIds, fee)
+    if (bought.taken <= 0) return 0
+    if (marketIds.includes(barn.structureId)) rememberCost(barn, good, bought.taken, (bought.spent * TON) / bought.taken)
+    barn.store[good] = (barn.store[good] ?? 0) + bought.taken
+    return bought.taken
+  }
   for (const good of GOODS) {
     const seekers = [...targets.entries()]
       .map(([owner, need]) => ({ owner, reserve: need[good] ?? 0, held: barnHeld(farms, owner, good) }))
       .filter((seeker) => seeker.reserve > 0 && seeker.held < seeker.reserve)
       .sort((a, b) => a.held / a.reserve - b.held / b.reserve || a.owner - b.owner)
-    for (const seeker of seekers) {
-      const barn = farms.rows.filter((row) => row.owner === seeker.owner && !marketIds.includes(row.structureId)).sort((a, b) => a.structureId - b.structureId)[0]
-        ?? farms.rows.filter((row) => row.owner === seeker.owner).sort((a, b) => a.structureId - b.structureId)[0]
-      if (!barn || wealth.length <= seeker.owner) continue
-      const gap = seeker.reserve - barnHeld(farms, seeker.owner, good)
-      const bought = buyGoods(farms, stock, stockOwner, stockAsk, wealth, seeker.owner, good, gap, prices, targets, marketIds, fee)
-      if (bought.taken <= 0) continue
-      if (marketIds.includes(barn.structureId)) rememberCost(barn, good, bought.taken, (bought.spent * TON) / bought.taken)
-      barn.store[good] = (barn.store[good] ?? 0) + bought.taken
+    for (const seeker of seekers) deliver(seeker.owner, good, seeker.reserve - seeker.held)
+  }
+  if (!headOf) return
+  const fallbacks = [...proteinOrders.entries()]
+    .map(([head, order]) => {
+      const first = order[0]
+      const homes = [...targets.keys()].filter((owner) => homeHead(headOf, owner) === head && (targets.get(owner)?.[first] ?? 0) > 0)
+      return { head, order, homes }
+    })
+    .filter((item) => item.homes.length > 0 && item.order.length > 1)
+  for (const item of fallbacks) {
+    for (const owner of item.homes) {
+      const first = item.order[0]
+      const reserve = targets.get(owner)?.[first] ?? 0
+      const held = barnHeld(farms, owner, first)
+      if (reserve <= 0 || held >= reserve) continue
+      if (proteinForSale(farms, stock, stockOwner, targets, first, owner)) continue
+      const short = reserve - held
+      for (const good of item.order.slice(1)) {
+        if (!proteinForSale(farms, stock, stockOwner, targets, good, owner)) continue
+        const cap = Math.ceil((reserve * proteinTons(good)) / proteinTons(first) - 1e-6)
+        const want = Math.ceil((short * proteinTons(good)) / proteinTons(first) - 1e-6)
+        const gap = Math.min(want, Math.max(0, cap - barnHeld(farms, owner, good)))
+        if (gap <= 0) continue
+        deliver(owner, good, gap)
+        break
+      }
     }
   }
 }
@@ -995,7 +1347,7 @@ function payShares(wealth: Int32Array, shares: { owner: number; hundredths: numb
     if (share.owner < 0 || wealth.length <= share.owner) return
     const dollars = index === shares.length - 1 ? bid - paid : Math.round((bid * share.hundredths) / taken)
     paid += dollars
-    wealth[share.owner] += dollars
+    credit(wealth, share.owner, dollars)
   })
 }
 
@@ -1035,18 +1387,26 @@ function monthlyUse(
   let scale = 0
   let adults = 0
   let children = 0
+  const orders = context?.proteinOrders
+  const headOf = context?.headOf
   for (let id = 0; id < people.age.length; id++) {
     if (people.alive[id] === 0) continue
-    scale += people.age[id] <= 5 ? 0.5 : people.age[id] <= 12 ? 0.75 : 1
+    const portion = people.age[id] <= 5 ? 0.5 : people.age[id] <= 12 ? 0.75 : 1
+    scale += portion
     if (people.age[id] >= 13) adults += 1
     else children += 1
+    if (!orders || !headOf) continue
+    const pick = orders.get(homeHead(headOf, id))?.[0]
+    if (pick) use[pick] += (portion * proteinTons(pick)) / 12
   }
   use.grain += (scale * 0.1) / 12
   use.fruit += (scale * 0.15) / 12
   use.vegetables += (scale * 0.15) / 12
-  use.fish += (scale * 0.1) / 36
-  use.meat += (scale * 0.1) / 36
-  use.dairy += (scale * 0.1) / 36
+  if (!orders || !headOf) {
+    use.fish += (scale * 0.1) / 36
+    use.meat += (scale * 0.1) / 36
+    use.dairy += (scale * 0.1) / 36
+  }
   use.clothing += (adults * 0.1 * 0.1 + children * 0.05 * 0.1) / 12
   use.leather += (adults * 0.05 * 0.1) / 12
   return use
@@ -1158,6 +1518,87 @@ function addInputs(extra: Record<Good, number>, batch: Batch) {
   for (const input of batch.inputs) extra[input.good] += input.hundredths
 }
 
+const SHOP_BATCHES: Record<ShopSpecialty, Batch[]> = {
+  sawmill: [SAWMILL_BATCH],
+  blacksmith: [PARTS_BATCH, TOOLS_BATCH],
+  smokehouse: [FISH_BATCH, MEAT_BATCH],
+}
+
+/** Dollars of expected margin for one batch. Null when an input cannot be had. */
+function batchQuote(batch: Batch, marks: Record<Good, number>, stock: Record<Good, number>, fee: number): number | null {
+  for (const input of batch.inputs) {
+    if ((stock[input.good] ?? 0) >= input.hundredths) continue
+    if (fee <= 0 || tradeEnds(input.good, fee).ask === null) return null
+  }
+  let cost = 0
+  for (const input of batch.inputs) cost += Math.round(((marks[input.good] ?? PRICE_FLOOR) * input.hundredths) / TON)
+  const revenue = Math.round(((marks[batch.output] ?? PRICE_FLOOR) * batch.out) / TON)
+  return revenue - cost
+}
+
+/** Best batch of each specialty that still earns money, highest monthly margin first. A blacksmith runs three months a year. */
+function rankedSpecialties(marks: Record<Good, number>, stock: Record<Good, number>, fee: number): ShopSpecialty[] {
+  const order = ["sawmill", "blacksmith", "smokehouse"] as const
+  const scored: { specialty: ShopSpecialty; margin: number }[] = []
+  for (const specialty of order) {
+    let top: number | null = null
+    for (const batch of SHOP_BATCHES[specialty]) {
+      const margin = batchQuote(batch, marks, stock, fee)
+      if (margin === null || margin <= 0) continue
+      if (top === null || margin > top) top = margin
+    }
+    if (top === null) continue
+    const months = specialty === "blacksmith" ? 3 / 12 : 1
+    scored.push({ specialty, margin: top * months })
+  }
+  scored.sort((a, b) => b.margin - a.margin || order.indexOf(a.specialty) - order.indexOf(b.specialty))
+  return scored.map((item) => item.specialty)
+}
+
+/**
+ * Profitable specialties this month, best monthly margin first. Empty when every
+ * batch loses money. An occupied workshop keeps the specialty it already has.
+ */
+export function workshopOpening(
+  town: TownTrade,
+  farms: Farms,
+  structures: readonly Structure[],
+  holdings: Holdings,
+  people: People | null,
+  low: number,
+  terrain: Uint8Array,
+  feature: Uint8Array,
+  lows: readonly number[],
+  seed: string,
+  year: number,
+): ShopSpecialty[] {
+  if (!people) return []
+  const owned = new Map(holdings.rows.filter((row) => row.owner >= 0).map((row) => [row.structureId, row]))
+  const ownedIds = new Set(owned.keys())
+  const yearLows = lows.length > 0 ? lows : [low]
+  const plan = planProtein(people, structures, owned, farms, town.prices, yearLows, terrain, feature, seed, year, town.proteinYear === year ? 1 : 0, town)
+  const fee = cheapFee(holdings, structures) ?? 0
+  const posts = structures.filter((structure) => structure.kind === "trading-post" && !structure.pending && !structure.removing && owned.has(structure.id)).length
+  const targets = stockTargets(people, structures, owned, yearLows, terrain, feature, farms, town.prices, plan)
+  const pool = totalStock(farms, town)
+  const measure = (marks?: Record<Good, number>) =>
+    monthlyUse(structures, people, low, ownedIds, terrain, feature, {
+      farms,
+      prices: town.prices,
+      fee,
+      stock: town.stock,
+      stockOwner: town.stockOwner,
+      stockAsk: town.stockAsk ?? {},
+      targets,
+      wealth: people.wealth,
+      proteinOrders: plan.orders,
+      headOf: plan.headOf,
+      marks,
+    })
+  const marks = quotedPrices(pool, town.prices, fee, posts, measure)
+  return rankedSpecialties(marks, pool, fee)
+}
+
 function optionsFor(specialty: ShopSpecialty, month: number, producing: boolean): Batch[] {
   if (specialty === "sawmill") return [SAWMILL_BATCH]
   if (specialty === "blacksmith") {
@@ -1242,13 +1683,14 @@ function runShops(
   marketIds: number[],
   posts: Holding[],
   month: number,
+  marks?: Record<Good, number>,
 ) {
   const fee = posts.length > 0 ? postFee(posts[0]) : 0
   const shops = structures.filter((structure) => structure.kind === "workshop" && !structure.pending && !structure.removing).sort((a, b) => a.id - b.id)
   for (const structure of shops) {
     const row = farms.rows.find((item) => item.structureId === structure.id)
     if (!row?.specialty || !owned.has(structure.id)) continue
-    const batch = chooseBatch(optionsFor(row.specialty, month, true), row, farms, stock, stockOwner, stockAsk, wealth, prices, targets, marketIds, fee)
+    const batch = chooseBatch(optionsFor(row.specialty, month, true), row, farms, stock, stockOwner, stockAsk, wealth, prices, targets, marketIds, fee, false, marks)
     if (batch && applyInputs(batch.inputs, row.owner, farms, stock, stockOwner, stockAsk, wealth, prices, targets, marketIds, fee)) {
       row.store[batch.output] = (row.store[batch.output] ?? 0) + batch.out
     }
@@ -1269,15 +1711,20 @@ function chooseBatch(
   marketIds: number[],
   fee: number,
   allowImport = false,
+  marks?: Record<Good, number>,
 ): Batch | null {
   let best: { batch: Batch; margin: number } | null = null
+  const unit = (good: Good) => marks?.[good] ?? offerPrice(good, prices, fee)
   for (const batch of options) {
     if ((row.store[batch.output] ?? 0) + batch.out > batch.cap) continue
     const priced = priceInputs(batch.inputs, row.owner, farms, stock, stockOwner, stockAsk, wealth, prices, targets, marketIds, fee, allowImport)
     if (!priced) continue
-    const revenue = Math.round((offerPrice(batch.output, prices, fee) * batch.out) / TON)
-    if (priced.economic > revenue) continue
-    const margin = revenue - priced.economic
+    const revenue = Math.round((unit(batch.output) * batch.out) / TON)
+    const cost = marks
+      ? batch.inputs.reduce((sum, input) => sum + Math.round((unit(input.good) * input.hundredths) / TON), 0)
+      : priced.economic
+    if (cost > revenue) continue
+    const margin = revenue - cost
     if (!best || margin > best.margin) best = { batch, margin }
   }
   return best?.batch ?? null
@@ -1304,6 +1751,7 @@ function addShopUse(use: Record<Good, number>, structures: readonly Structure[],
       marketIds,
       context.fee,
       true,
+      context.marks,
     )
     if (!batch) continue
     const scale = row.specialty === "blacksmith" ? 0.25 : 1
@@ -1344,7 +1792,7 @@ function purchaseLots(
   for (const row of farms.rows) {
     if (row.owner < 0 || row.owner === buyer) continue
     const sitting = row.store[good] ?? 0
-    if (sitting <= 0) continue
+    if (sitting <= 0 || !sellProtein(row.structureId, good)) continue
     const isMarket = marketIds.includes(row.structureId)
     ranked.push({
       price: isMarket ? sellPrice(row.cost?.[good] ?? unit) : farmPrice,
@@ -1444,6 +1892,8 @@ function applyInputs(
     stores: farms.rows.map((row) => GOODS.map((good) => row.store[good] ?? 0)),
     stock: GOODS.map((good) => stock[good] ?? 0),
     wealth: new Int32Array(wealth),
+    income: books ? new Int32Array(books.income) : null,
+    log: books ? new Int32Array(books.log) : null,
   }
   const undo = () => {
     farms.rows.forEach((row, index) => {
@@ -1455,6 +1905,10 @@ function applyInputs(
       stock[good] = saved.stock[g]
     })
     wealth.set(saved.wealth)
+    if (books && saved.income && saved.log) {
+      books.income.set(saved.income)
+      books.log.set(saved.log)
+    }
   }
   for (const input of inputs) {
     let left = input.hundredths - takeOwned(farms, stock, stockOwner, buyer, input.good, input.hundredths)
@@ -1463,8 +1917,8 @@ function applyInputs(
       const take = Math.min(lot.hundredths, left, affordable(wealth[buyer], lot.price, lot.hundredths))
       if (take <= 0) continue
       const dollars = Math.round((lot.price * take) / TON)
-      wealth[buyer] -= dollars
-      if (lot.owner >= 0 && wealth.length > lot.owner) wealth[lot.owner] += dollars
+      credit(wealth, buyer, -dollars)
+      credit(wealth, lot.owner, dollars)
       if (lot.structureId === null) stock[input.good] -= take
       else {
         const source = farms.rows.find((item) => item.structureId === lot.structureId)
@@ -1503,8 +1957,8 @@ function sellLocal(
     const bought = affordable(wealth[shop.owner], price, left)
     if (bought <= 0) continue
     const cost = price <= 0 ? 0 : Math.round((price * bought) / TON)
-    wealth[shop.owner] -= cost
-    if (wealth.length > row.owner) wealth[row.owner] += cost
+    credit(wealth, shop.owner, -cost)
+    credit(wealth, row.owner, cost)
     row.store[good] -= bought
     rememberCost(shop, good, bought, price)
     shop.store[good] = (shop.store[good] ?? 0) + bought

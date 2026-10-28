@@ -33,6 +33,7 @@ import {
   assignOccupations,
   beginFertility,
   citizenCensus,
+  classCensus,
   economyCensus,
   educationCensus,
   householdHomes,
@@ -49,9 +50,9 @@ import {
   type People,
 } from "@/lib/people"
 import { applyBuild, commitSettlement, emptySettlement, structureAt, structureLabel, type BuildTool } from "@/lib/buildings"
-import { defaultLandSchedule, emptyHoldings, propertyLines, settleHoldings, type LandSchedule } from "@/lib/land"
+import { defaultLandSchedule, emptyHoldings, plotSalePrice, propertyLines, settleHoldings, type LandSchedule } from "@/lib/land"
 import { emptyFarms, productionLines, workFarms } from "@/lib/produce"
-import { costOfLiving, emptyTown, marketLines, townPriceRows, tradeLines, tradeMonth } from "@/lib/trade"
+import { costOfLiving, emptyTown, marketLines, townPriceRows, tradeLines, tradeMonth, workshopOpening } from "@/lib/trade"
 import { runGeneration } from "@/lib/run-generation"
 import { monthWeather } from "@/lib/weather"
 import { LAYERS, type Coast, type LayerId, type MapSize, type MonthClimate, type World } from "@/lib/types"
@@ -239,8 +240,13 @@ export function PlannerApp() {
   const population = housed ? livingCount(housed) : 0
   const citizens = useMemo(() => (housed ? citizenCensus(housed) : null), [housed])
   const schooling = useMemo(() => (housed ? educationCensus(housed) : null), [housed])
-  const economy = useMemo(() => (housed ? economyCensus(housed) : null), [housed])
+  const economy = useMemo(() => (housed ? economyCensus(housed, homes) : null), [housed, homes])
   const residence = useMemo(() => (housed ? residenceCensus(housed, homes) : null), [housed, homes])
+  const adultCost = useMemo(
+    () => (world ? costOfLiving(town.prices, world.months.map((item) => item.low)) : 0),
+    [town, world],
+  )
+  const classes = useMemo(() => (housed ? classCensus(housed, adultCost, homes) : null), [housed, adultCost, homes])
   const indices = useMemo(() => deriveClimate(latitude, months), [latitude, months])
   const weather = useMemo(
     () => monthWeather(seed.trim() || "0", calendarYear, calendarMonth, months[calendarMonth]),
@@ -481,8 +487,9 @@ export function PlannerApp() {
                   lastRate={fertility?.lastRate ?? null}
                   schooling={schooling}
                   economy={economy}
-                  prices={townPriceRows(town, farms, settlement.structures, holdings, people, world.months[calendarMonth].low, world.terrain, world.feature, world.months.map((item) => item.low))}
+                  prices={townPriceRows(town, farms, settlement.structures, holdings, people, world.months[calendarMonth].low, world.terrain, world.feature, world.months.map((item) => item.low), seed.trim() || "0", calendarYear)}
                   living={costOfLiving(town.prices, world.months.map((item) => item.low))}
+                  classes={classes}
                   homelessFamilies={residence?.homelessFamilies ?? null}
                   homelessSingles={residence?.homelessSingles ?? null}
                   landIncome={landIncome}
@@ -560,10 +567,31 @@ export function PlannerApp() {
               const nextMonth = calendarMonth === 11 ? 0 : calendarMonth + 1
               const nextYear = calendarMonth === 11 ? calendarYear + 1 : calendarYear
               const gameSeed = seed.trim() || "0"
-              const step = advancePeople(people, nextYear, nextMonth, gameSeed, epidemic)
-              const committed = commitSettlement(settlement, world.terrain, world.feature, world.size)
-              const landStep = settleHoldings(
+              const step = advancePeople(people, nextYear, nextMonth, gameSeed, epidemic, undefined, {
                 holdings,
+                adultCost,
+                salePrice: (structureId) => {
+                  const structure = settlement.structures.find((item) => item.id === structureId)
+                  if (!structure) return 0
+                  return plotSalePrice(structure, world.terrain, world.feature, world.size, landSchedule)
+                },
+              })
+              const committed = commitSettlement(settlement, world.terrain, world.feature, world.size)
+              const opening = workshopOpening(
+                town,
+                farms,
+                committed.structures,
+                step.holdings ?? holdings,
+                step.people,
+                world.months[nextMonth].low,
+                world.terrain,
+                world.feature,
+                world.months.map((item) => item.low),
+                gameSeed,
+                nextYear,
+              )
+              const landStep = settleHoldings(
+                step.holdings ?? holdings,
                 committed.structures,
                 step.people,
                 world.terrain,
@@ -573,7 +601,9 @@ export function PlannerApp() {
                 nextMonth,
                 nextYear,
                 gameSeed,
+                adultCost,
                 step.idMap,
+                opening.length > 0,
               )
               setCalendarMonth(nextMonth)
               setCalendarYear(nextYear)
@@ -593,6 +623,7 @@ export function PlannerApp() {
                 gameSeed,
                 step.idMap,
                 monthAridity(world.latitude, world.months, nextMonth),
+                opening,
               )
               const traded = tradeMonth(
                 landStep.people,

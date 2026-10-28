@@ -1,0 +1,86 @@
+Reference this Guide for context regarding the long-term goals of CityStateSystems
+
+Goals:
+CityStateSystems is a working title for a strategy game prototype. My main goals are creating systems that work together and can be ported to a future desktop application.
+ The game puts the user in charge of a newly founded micro-nation with a unique people. The goal is to create an accurate demographic, economic, cultural, logistical, and urbanist simulator.
+ The player will be given a suite of statistics and policy nobs to create whatever kind of legal system, culture, and economy he wants.
+ That said, the goal is for the simulator to work as a kind of ant farm, where the game can just run without much user input due to the dynamic and balanced systems.
+ Realism is the goal: all citizen behavior, production and consumption, and economic activity should be based on reality.
+ My medium term goal is for this grid/turn based game to run on a map-size of about 1000km2 with up to 100k population. Long term goal for eventual desktop app is 20,000km2 and up to 10m population.
+ The game will also have a tech progress element. Your nation will research technologies at a variable pace which will unlock new buildings, efficiencies, resources, and policies.
+ The game follows a simple philosophy that base extraction and especially agriculture are the foundation of civilization-- as a nation advances, agriculture becomes more efficient so more people may specialize.
+ A key mechanic that is rather unique: demographics will play a big role-- Vigor, Intellect, and Willpower are heritable and marriage and fertility are dependant on the economy, culture, and laws of your nation. 
+ Contrary to most city builders, increasing population through migration will be more difficult and have trade-offs concerning immigrant culture and attributes.
+ A users country will be measured relative to other regions, which will follow a static progress and development schedule based on history. Depending on player decisions, your nation can be advanced or fall behind. Developed or undeveloped.
+ 
+ Current State:
+ This is a turn based game. Each turn represents one month. The map is 2d with 10mx10m tiles.
+ The map and buildings on the map are also tracked-- the map has terrain features that influence buildings.
+ Climate and map generation are set by the user. Climate affects map generation and agriculture.
+ Each citizen is a unique agent with attributes, relationships, and information kept in a ledger that updates once per month.
+ A citizen has parents listed. Siblings are citizens who share at least one parent.
+ Siblings may not marry. A dead citizen is removed from the ledger once he has no living relatives (children, siblings, spouse). The ledger is rewritten when dead citizens are removed to maintain citizen paths.
+ Citizens have 3 attributes that are partially heritable (genetically). Vigor, Intellect, Willpower. Each citizen has either level 1, 2, or 3 for each of these skills. Higher levels are typically better and bonuses are given to various probabilities depending on level.
+ The basic unit is the family. Families form when a man and woman get married. A husband is the head of the family and keeps the family wealth in his purse. While a father is alive and under 65, his eldest son, that son's wife, and their children stay in his household. Children under 18 live with their family unless the parents have died. A younger son leaves when he takes a plot of his own.
+ The game has three starting conditions, Warrior, Merchant, Explorer. Each have a unique attribute bonus, starting number of families, and treasury.
+ A family (or single adult) will occupy a building and run it as an owner/occupier.
+ Farmsteads can be 2-2000 tiles and feature a single house. Farmstead map tile composition affects farmstead production decisions. Each tile owned by a farmstead has a monthly production.
+ Markets buy and sell domestically, taking a 10% (minimum $1) profit on all sales.
+ Each good has a set foriegn regional price. This price is currently only set for western europe. The set foreign price is how much $ is exchanged for a given good. It is the same price for imports and exports. Any trading fees are separate.
+ Trading posts import and export goods, 1 ton of goods each way per month. They currently export based on whatever good is in highest supply at an 80% chance. 10% for second highest supply good, and 10% for any remaining good in excess supply. 
+ Trading posts collect a fee for imports and exports by subtracting a dollar amount from purchases for export and adding the same fee to imported goods that they sell. Trading post fee is calculated based on the cost to purchase supplies needed to run the post and support their family.
+ Producers will not export their goods if the trading post fee exceeds the foreign value of the good, therefore some goods are not exported.
+ Workshops are primitive industrial buildings that specialize in producing one or a few similar types of goods. They require input resources, often fuel, and supplies. They produce a certain amount of product based on a known recipe.
+ Each person living in a building requires supplies to survive. Various foods, fuel, and some durable goods are needed. The cost of living is an estimate of this basket of goods.
+ Cost of living for a family is calculated by 2x + (0.5y)x. x being cost of living and y being number of dependants (usually children).
+ All goods/resources are measured in metric tons. Buildings will not buy or sell less than 0.1T at a time.
+ Buildings and households attempt to hold at least 2 years of goods needed for survival.
+ Buildings can buy resources the same turn (month) they are needed.
+ Citizens have a chance of illness or injury and chance of death from said illness or injury that rolls each month. Those chances change with citizen age and are affected by their traits.
+ Education is currently 0,1,2. Illiterate, Primary, Secondary. Schools are not implemented yet but a set of rules for homeschool (passive) chance and graduation is already laid out.
+ Buildings/property are placed by the user. The user can set a yearly lease or sale price per tile of a specific type. Once a building is leased, that lease price is maintained. A lease is generally multiplied by 20 to get an equivalent sale price. This is useful because a farmstead that contains multiple types of tiles can only be leased or sold as a whole.
+ Vacant plots go to the wealthiest eligible buyer, one plot each. Buyers are household heads without a plot, and landless men of 18 who are not students and are not the eldest son still in his father's house. A small farmstead uses the old affordability rule, so a purse of $0 can take a plot priced at $0. A farmstead over 1,000 tiles, a market, a trading post, or a workshop also requires a purse of at least five times one adult's yearly cost of living.
+ The UI has a top bar with map overlays on the left and Population, Education, Economy, and Treasury menus on the right. These have statistics as well as allow the user to set land prices.
+ 
+ File Guide:
+ The simulation lives in `src/lib`. The screen that calls it is `src/components/planner-app.tsx`. One Advance Month runs the steps in this order: `advancePeople`, `commitSettlement`, `settleHoldings`, `workFarms`, `tradeMonth`.
+
+People are columns of typed arrays. Money is whole dollars. Barn stock is hundredths of a ton. The same seed always rebuilds the same result through `hashSeed` and `mulberry32` in `src/lib/noise.ts`.
+
+**Where to edit a mechanic**
+
+- **Founding families, purses, and opening ages.** `foundPeople` in `src/lib/people.ts`.
+- **Birth, death, aging, marriage, inheritance, epidemics, and the June school credits.** `advancePeople` in `src/lib/people.ts`. An eldest son still at home, or a man who owns a plot, may marry. Never-married women 18–45 may marry from any house. A widow under 45 may remarry only while she is still the head; widowers do not. A wife’s purse moves onto her husband. From a father's 65th birthday, or at his death, an adult eldest son takes the property. Half the purse goes to that son and half to the other sons, or to the daughters if there is no younger son. A father with no son retires onto his eldest married daughter when his last daughter marries, and the plot is sold back to the treasury. In January, a working father splits up to 20% of his purse among landless younger sons of 16, keeping one year of household cost. A daughter's wedding draws one dowry of up to 10% on the same terms.
+- **Occupation.** `assignOccupations` in `src/lib/people.ts`. Student, then the job of the oldest house the owner or spouse holds, otherwise Idle under 18 and Unemployed at 18.
+- **Homeless families and homeless single adults.** `residenceCensus` in `src/lib/people.ts`. A house is a farmstead, market, trading post, or workshop that is already in place.
+- **Classes, household cost, and who counts as one income.** `classCensus` in `src/lib/people.ts`. A couple costs twice an adult’s cost of living. The eldest son still at home and his wife each add a full adult, and their children add a full adult from 18 or half before that. Other children at home, adopted children, and retired parents add half. A single adult costs one, plus those same additions.
+- **The income number itself.** `openIncomeMonth` and `noteOperatingIncome` in `src/lib/people.ts`. Sales, fees, goods bought, and leases are recorded. Land purchases, inheritances, and marriage transfers are not. The cash is tagged in `credit` inside `src/lib/trade.ts`, and lease payments are tagged in `settleHoldings` inside `src/lib/land.ts`.
+- **Cost of living for one adult.** `costOfLiving` in `src/lib/trade.ts`. Grain, the fruit and vegetable average, and the average of a year of meat, a year of fish, and a year of dairy. Dairy is 0.2 t. Clothing, leather, and half a household’s yearly fuel follow.
+- **Land prices, sale or lease, who is offered a plot, and the yearly lease bill.** `settleHoldings` in `src/lib/land.ts`. One plot per buyer. Large farms, markets, posts, and workshops need five years of one adult's cost of living. `plotSalePrice` is what the treasury pays to take a plot back. `monthlyCapital` is the trading-post fee’s land part, not a second rent.
+- **Placing, deleting, and finishing buildings.** `applyBuild` and `commitSettlement` in `src/lib/buildings.ts`. Logging camps and mining camps are listed and disabled. A farmstead stops at 2,000 tiles.
+- **Crops, farm yields, salt, farm coal, dried fruit, and opening barn stocks.** `workFarms` in `src/lib/produce.ts`. The good list and labels are `GOODS` and `GOOD_LABEL` at the top of that file. Household diet size is `familyPortions`.
+- **Workshops.** The batch constants and `runShops` in `src/lib/trade.ts`. Sawmill, blacksmith, and smokehouse. A specialty is rolled once per workshop in `produce.ts`.
+- **Exports, imports, the trading-post fee, markets, the two-year reserve, and town prices.** `tradeMonth` in `src/lib/trade.ts`. Regional prices are `WEST_EUROPE`. The fee is `postFee`. The export roll is `bestExport`. Reserves are `stockTargets`. Each household keeps one protein for the year. A farmstead sells a protein only when that farm produces it. From 3 to 15 months of cover a price stays on the foreign list. The last ton of stock is left out of that cover. Below 3 months it can rise above the import ask when the year's import slots are full, up to $100,000. Above 15 months it can fall toward $1 when the export slots are full. Workshops and the stored town price follow that cover quote. The Economy tab lists a market's sale price beside it. A new workshop draws from the profitable specialties in `workshopOpening`. A blacksmith's margin is counted for three months of the year. The draw is 70% the best, 20% the second, and 10% another profitable specialty. The workshop stays vacant when none is profitable. An occupied workshop keeps its specialty.
+- **Climate presets, monthly temperature, and the monthly aridity used for salt.** `src/lib/climate.ts`. `monthAridity` is the monthly figure. `deriveClimate` is the yearly summary.
+- **The map itself.** `generateWorld` in `src/lib/generate.ts`, run from `src/workers/map.worker.ts`. Leave this alone unless the terrain generator is the task.
+- **Menus.** `src/components/ledger-panel.tsx`. Population, Education, Treasury, and Economy. Economy has Overview, Resources, and Classes.
+
+**Files**
+
+- `src/app/page.tsx` mounts the app. `src/app/layout.tsx` is the page shell.
+- `src/components/planner-app.tsx` holds the game state and the Advance Month button. New rules have to be called from here or they never run.
+- `src/components/setup-panel.tsx` is the founding form: climate, seed, map size, people, and difficulty.
+- `src/components/map-pane.tsx` draws the map and sends paint and plop clicks.
+- `src/components/building-bars.tsx` is the build toolbar.
+- `src/components/inspector-panel.tsx` is the cell readout and the building card. The lines it shows come from `propertyLines`, `productionLines`, `tradeLines`, and `marketLines`.
+- `src/components/weather-icon.tsx` and `src/lib/weather.ts` are the monthly sky and temperature on the header.
+- `src/components/ui/` holds the buttons, tabs, and inputs. No game rules live there.
+- `src/lib/types.ts` holds the map arrays: terrain, features, fertility, groundwater, and resources.
+- `src/lib/colors.ts` holds the map colors.
+- `src/lib/noise.ts` holds the seeded random numbers.
+- `src/lib/run-generation.ts` starts a new map worker for each Found New State.
+- `src/lib/utils.ts` is a small class-name helper.
+- `scripts/verify-map.ts` checks map generation. `npm run dev` serves the app. `npm run verify` runs that map check.
+ 
+ Next Steps (as of 10/23/2026):
+ Inheritance, marriage, and property acquisition were revised on this date. The rules are in the file guide above. The next mechanic has not been chosen.

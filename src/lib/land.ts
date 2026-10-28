@@ -1,10 +1,13 @@
 import type { Structure } from "@/lib/buildings"
-import { hashSeed, mulberry32 } from "@/lib/noise"
-import { Sex, type People } from "@/lib/people"
+import { noteOperatingIncome, openIncomeMonth, propertySeekers, type People } from "@/lib/people"
 import { Feature, Terrain } from "@/lib/types"
 
 /** A sale price is twenty yearly lease payments. */
 const SALE_PER_LEASE = 20
+/** Farmsteads above this many tiles, and every shop, post, and market, need a purse. */
+const LARGE_FARM = 1000
+/** That purse is this many years of one adult's cost of living. */
+const WEALTH_YEARS = 5
 
 export const LAND_TYPES = ["farmland", "forest", "marginal", "urban", "coast"] as const
 export type LandType = (typeof LAND_TYPES)[number]
@@ -70,10 +73,10 @@ type Quote = {
 }
 
 /**
- * Record new plots, pass a dead owner's plot to a living spouse, charge leases
+ * Record new plots, return a dead owner's plot to the state, charge leases
  * that are due, then offer anything the state still holds.
- * The first offering gives the cheapest affordable plot to the poorest family.
- * Later offerings pick a random family who can afford that plot.
+ * Gated plots go first, largest first, each to the wealthiest buyer who can
+ * pay and, for a large farm or a shop, hold five years of one adult's keep.
  */
 export function settleHoldings(
   holdings: Holdings,
@@ -86,8 +89,12 @@ export function settleHoldings(
   month: number,
   year: number,
   seed: string,
+  adultCost = 0,
   idMap: Int32Array | null = null,
+  workshopsOpen = true,
 ): { holdings: Holdings; people: People; toTreasury: number } {
+  void year
+  void seed
   const byId = new Map(structures.map((structure) => [structure.id, structure]))
   const rows = holdings.rows
     .filter((row) => byId.has(row.structureId))
@@ -104,24 +111,24 @@ export function settleHoldings(
     rows.push({ structureId: structure.id, owner: -1, lease: 0, leaseMonth: month, paid: 0 })
   }
 
-  const wealth = new Int32Array(people.wealth)
+  const openedBooks = openIncomeMonth(people, month)
+  const wealth = new Int32Array(openedBooks.wealth)
+  const income = openedBooks.income
+  const incomeLog = openedBooks.incomeLog
   let toTreasury = 0
   for (const row of rows) {
     if (row.owner < 0) continue
-    if (wealth.length <= row.owner || people.alive[row.owner] !== 0) continue
-    const mate = people.spouse[row.owner]
-    const heir = mate >= 0 && mate < people.alive.length && people.alive[mate] !== 0
-    row.owner = heir ? mate : -1
-    if (!heir) {
-      row.lease = 0
-      row.paid = 0
-    }
+    if (row.owner < people.alive.length && people.alive[row.owner] !== 0) continue
+    row.owner = -1
+    row.lease = 0
+    row.paid = 0
   }
 
   for (const row of rows) {
     if (row.lease <= 0 || row.leaseMonth !== month || row.owner < 0) continue
     if (wealth[row.owner] < row.lease) continue
     wealth[row.owner] -= row.lease
+    noteOperatingIncome(income, incomeLog, row.owner, -row.lease, month)
     toTreasury += row.lease
   }
 
@@ -129,17 +136,13 @@ export function settleHoldings(
   let opened = holdings.opened
   if (unsold.length > 0) {
     const quotes = new Map(unsold.map((row) => [row.structureId, quoteFor(byId.get(row.structureId) as Structure, terrain, feature, size, schedule)]))
-    const heads = familyHeads(people).filter((id) => !rows.some((row) => row.owner === id))
-    if (!opened) {
-      toTreasury += offerToPoorest(unsold, quotes, heads, wealth, month)
-      opened = true
-    } else {
-      const random = mulberry32(hashSeed(`${seed}:land:${year}:${month}`))
-      toTreasury += offerAtRandom(unsold, quotes, heads, wealth, month, random)
-    }
+    const owned = new Set<number>()
+    for (const row of rows) if (row.owner >= 0) owned.add(row.owner)
+    toTreasury += offerByWealth(unsold, quotes, byId, people, owned, wealth, income, incomeLog, month, adultCost, workshopsOpen)
+    opened = true
   }
 
-  return { holdings: { opened, rows }, people: { ...people, wealth }, toTreasury }
+  return { holdings: { opened, rows }, people: { ...openedBooks, wealth, income, incomeLog }, toTreasury }
 }
 
 /** Extra inspector lines for the plot on this cell. */
@@ -171,60 +174,87 @@ export function propertyLines(
   return lines
 }
 
+/** What the treasury pays to take this plot back. A lease is converted at twenty years. */
+export function plotSalePrice(
+  structure: Structure,
+  terrain: Uint8Array,
+  feature: Uint8Array,
+  size: number,
+  schedule: LandSchedule,
+): number {
+  const quote = quoteFor(structure, terrain, feature, size, schedule)
+  return quote.tenure === "sale" ? quote.due : quote.due * SALE_PER_LEASE
+}
+
 /** Lease divided by 12, or the sale price divided by 20 and then by 12. */
 export function monthlyCapital(row: Holding): number {
   if (row.lease > 0) return row.lease / 12
   return row.paid / 240
 }
 
-function offerToPoorest(
+function offerByWealth(
   unsold: Holding[],
   quotes: Map<number, Quote>,
-  heads: number[],
+  byId: Map<number, Structure>,
+  people: People,
+  owned: ReadonlySet<number>,
   wealth: Int32Array,
+  income: Int32Array,
+  incomeLog: Int32Array,
   month: number,
+  adultCost: number,
+  workshopsOpen: boolean,
 ): number {
-  const order = [...heads].sort((a, b) => wealth[a] - wealth[b] || a - b)
+  let seekers = propertySeekers(people, owned)
+  const open = [...unsold].sort((a, b) => {
+    const left = byId.get(a.structureId) as Structure
+    const right = byId.get(b.structureId) as Structure
+    const rank = offerRank(left) - offerRank(right)
+    const tiles = right.tiles.length - left.tiles.length
+    return rank || tiles || a.structureId - b.structureId
+  })
   let paid = 0
-  for (const head of order) {
-    const choices = unsold
-      .filter((row) => row.owner < 0 && affordable(wealth[head], quotes.get(row.structureId) as Quote))
-      .sort((a, b) => {
-        const due = (quotes.get(a.structureId) as Quote).due - (quotes.get(b.structureId) as Quote).due
-        return due || a.structureId - b.structureId
-      })
-    const pick = choices[0]
-    if (!pick) continue
-    paid += assign(pick, quotes.get(pick.structureId) as Quote, head, wealth, month)
-  }
-  return paid
-}
-
-function offerAtRandom(
-  unsold: Holding[],
-  quotes: Map<number, Quote>,
-  heads: number[],
-  wealth: Int32Array,
-  month: number,
-  random: () => number,
-): number {
-  let paid = 0
-  const open = [...unsold].sort((a, b) => a.structureId - b.structureId)
   for (const row of open) {
     if (row.owner >= 0) continue
+    const structure = byId.get(row.structureId) as Structure
+    if (structure.kind === "workshop" && !workshopsOpen) continue
     const quote = quotes.get(row.structureId) as Quote
-    const choices = heads
-      .filter((id) => !unsold.some((item) => item.owner === id) && affordable(wealth[id], quote))
-      .sort((a, b) => a - b)
-    if (choices.length === 0) continue
-    const index = Math.min(choices.length - 1, Math.floor(random() * choices.length))
-    paid += assign(row, quote, choices[index], wealth, month)
+    const gated = needsPurse(structure)
+    const choices = seekers
+      .filter((id) => canBuy(wealth[id] ?? 0, quote, gated, adultCost))
+      .sort((a, b) => (wealth[b] ?? 0) - (wealth[a] ?? 0) || a - b)
+    const pick = choices[0]
+    if (pick === undefined) continue
+    paid += assign(row, quote, pick, wealth, income, incomeLog, month)
+    seekers = seekers.filter((id) => id !== pick)
   }
   return paid
 }
 
-function assign(row: Holding, quote: Quote, head: number, wealth: Int32Array, month: number): number {
+function offerRank(structure: Structure): number {
+  if (structure.kind === "trading-post") return 0
+  if (structure.kind === "market") return 1
+  if (structure.kind === "workshop") return 2
+  if (structure.kind === "farmstead" && structure.tiles.length > LARGE_FARM) return 3
+  return 4
+}
+
+function needsPurse(structure: Structure): boolean {
+  if (structure.kind === "trading-post" || structure.kind === "market" || structure.kind === "workshop") return true
+  return structure.kind === "farmstead" && structure.tiles.length > LARGE_FARM
+}
+
+function assign(
+  row: Holding,
+  quote: Quote,
+  head: number,
+  wealth: Int32Array,
+  income: Int32Array,
+  incomeLog: Int32Array,
+  month: number,
+): number {
   wealth[head] -= quote.due
+  if (quote.tenure === "lease") noteOperatingIncome(income, incomeLog, head, -quote.due, month)
   row.owner = head
   row.lease = quote.tenure === "lease" ? quote.lease : 0
   row.paid = quote.tenure === "sale" ? quote.due : 0
@@ -237,19 +267,10 @@ function affordable(wealth: number, quote: Quote): boolean {
   return quote.due <= Math.floor((wealth * share) / 100)
 }
 
-function familyHeads(people: People): number[] {
-  const heads: number[] = []
-  for (let id = 0; id < people.alive.length; id++) {
-    if (people.alive[id] === 0) continue
-    const mate = people.spouse[id]
-    const mateAlive = mate >= 0 && mate < people.alive.length && people.alive[mate] !== 0
-    if (mateAlive) {
-      if (people.sex[id] === Sex.Male) heads.push(id)
-      continue
-    }
-    if (mate >= 0 && people.age[id] >= 18) heads.push(id)
-  }
-  return heads
+function canBuy(wealth: number, quote: Quote, gated: boolean, adultCost: number): boolean {
+  if (!affordable(wealth, quote)) return false
+  if (!gated) return true
+  return wealth >= WEALTH_YEARS * Math.max(0, Math.floor(adultCost))
 }
 
 function quoteFor(

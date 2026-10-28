@@ -6,7 +6,7 @@ import { Card, CardAction, CardContent, CardHeader, CardTitle } from "@/componen
 import { Input } from "@/components/ui/input"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { LAND_LABEL, LAND_TYPES, type LandRate, type LandSchedule, type LandType } from "@/lib/land"
-import type { CitizenCensus, EconomyCensus, EducationCensus } from "@/lib/people"
+import type { CitizenCensus, ClassCensus, EconomyCensus, EducationCensus } from "@/lib/people"
 import { cn } from "@/lib/utils"
 
 export type LedgerId = "population" | "treasury" | "education" | "economy"
@@ -24,6 +24,7 @@ type Row = {
   label: string
   value: string
   note?: string
+  sub?: string
   detail?: boolean
 }
 
@@ -39,6 +40,7 @@ export function LedgerPanel({
   economy,
   prices,
   living,
+  classes,
   homelessFamilies,
   homelessSingles,
   landIncome,
@@ -55,9 +57,10 @@ export function LedgerPanel({
   lastRate: number | null
   schooling: EducationCensus | null
   economy: EconomyCensus | null
-  prices: { label: string; value: string; note?: string }[]
+  prices: { label: string; value: string; note?: string; sub?: string }[]
   /** One adult's yearly cost of living, in whole dollars. */
   living: number | null
+  classes: ClassCensus | null
   homelessFamilies: number | null
   homelessSingles: number | null
   /** Land payments collected last month, or null before the first month. */
@@ -72,7 +75,7 @@ export function LedgerPanel({
       : kind === "education"
         ? educationRows(schooling)
         : kind === "economy"
-          ? economyRows(economy, living)
+          ? economyRows(economy, living, classes)
           : treasuryRows(cash, landIncome)
   if (kind === "treasury") {
     return (
@@ -80,7 +83,7 @@ export function LedgerPanel({
     )
   }
   if (kind === "economy") {
-    return <EconomyPanel rows={rows} prices={prices} onClose={onClose} />
+    return <EconomyPanel rows={rows} prices={prices} classes={classes} onClose={onClose} />
   }
   return (
     <Card className="w-full shadow-md">
@@ -179,7 +182,7 @@ function populationRows(
   ]
 }
 
-function economyRows(economy: EconomyCensus | null, living: number | null): Row[] {
+function economyRows(economy: EconomyCensus | null, living: number | null, classes: ClassCensus | null): Row[] {
   return [
     { label: "Total Household Wealth", value: money(economy?.total ?? null, true) },
     {
@@ -194,6 +197,12 @@ function economyRows(economy: EconomyCensus | null, living: number | null): Row[
       value: money(economy?.singleAverage ?? null),
     },
     { label: "Median", value: money(economy?.singleMedian ?? null), detail: true },
+    {
+      label: "Avg. Income",
+      note: "Trailing year for each family and each single adult. Sales and fees, minus goods bought and leases. The first year is the year so far.",
+      value: money(classes?.incomeAverage ?? null),
+    },
+    { label: "Median", value: money(classes?.incomeMedian ?? null), detail: true },
     { label: "Unemployed", value: economy ? economy.unemployed.toLocaleString("en-US") : BLANK },
     {
       label: "Unemployment rate",
@@ -302,14 +311,16 @@ function treasuryRows(cash: string, landIncome: number | null): Row[] {
 function EconomyPanel({
   rows,
   prices,
+  classes,
   onClose,
 }: {
   rows: Row[]
-  prices: { label: string; value: string; note?: string }[]
+  prices: { label: string; value: string; note?: string; sub?: string }[]
+  classes: ClassCensus | null
   onClose: () => void
 }) {
   const [tab, setTab] = useState("overview")
-  const resources: Row[] = prices.map((row) => ({ label: row.label, value: row.value, note: row.note }))
+  const resources: Row[] = prices.map((row) => ({ label: row.label, value: row.value, note: row.note, sub: row.sub }))
   return (
     <Card className="w-full shadow-md">
       <CardHeader>
@@ -330,6 +341,7 @@ function EconomyPanel({
           <TabsList className="h-auto w-full flex-wrap justify-start">
             <TabsTrigger value="overview" className="px-1.5 text-xs">Overview</TabsTrigger>
             <TabsTrigger value="resources" className="px-1.5 text-xs">Resources</TabsTrigger>
+            <TabsTrigger value="classes" className="px-1.5 text-xs">Classes</TabsTrigger>
           </TabsList>
           <TabsContent value="overview">
             <RowList rows={rows} />
@@ -337,10 +349,27 @@ function EconomyPanel({
           <TabsContent value="resources">
             <RowList rows={resources} />
           </TabsContent>
+          <TabsContent value="classes">
+            <RowList rows={classRows(classes)} />
+            <p className="mt-3 text-xs leading-relaxed text-muted-foreground">
+              A couple needs twice an adult's cost of living, plus half again for each child at home. A single adult needs one, plus half for each child. A higher band wins when income or wealth reaches it. Savings alone can hold the working class.
+            </p>
+          </TabsContent>
         </Tabs>
       </CardContent>
     </Card>
   )
+}
+
+function classRows(classes: ClassCensus | null): Row[] {
+  const total = classes?.units ?? 0
+  return [
+    { label: "Poor", note: "Income and wealth are both below the household cost.", value: band(classes?.poor, total) },
+    { label: "Working class", note: "Income or wealth covers the household cost.", value: band(classes?.working, total) },
+    { label: "Middle class", note: "Income is at least half again the cost, or wealth is at least 5 times.", value: band(classes?.middle, total) },
+    { label: "Upper-middle class", note: "Income is over 3 times the cost, or wealth is at least 15 times.", value: band(classes?.upper, total) },
+    { label: "Wealthy", note: "Income is over 20 times the cost, or wealth is over 100 times.", value: band(classes?.wealthy, total) },
+  ]
 }
 
 function TreasuryPanel({
@@ -468,7 +497,10 @@ function RowList({ rows }: { rows: Row[] }) {
             <div>{row.label}</div>
             {row.note ? <div className="text-xs leading-snug text-muted-foreground">{row.note}</div> : null}
           </dt>
-          <dd className={cn("tabular-nums", !row.detail && "font-medium")}>{row.value}</dd>
+          <dd className="text-right tabular-nums">
+            <div className={cn(!row.detail && "font-medium")}>{row.value}</div>
+            {row.sub ? <div className="text-xs text-muted-foreground">{row.sub}</div> : null}
+          </dd>
         </div>
       ))}
     </dl>
