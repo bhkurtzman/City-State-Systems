@@ -1,14 +1,16 @@
 import { Feature, Terrain } from "@/lib/types"
 
-/** One farmstead stops accepting tiles at this count. */
+/** A settled farmstead stays within this many tiles. A larger draft is outlined and dropped. */
 export const FARMSTEAD_CAP = 2000
 
 export type PlopKind = "trading-post" | "workshop" | "market"
-export type StructureKind = "farmstead" | PlopKind
-export type BuildTool = StructureKind | "logging-camp" | "mining-camp" | "delete"
+export type StructureKind = "farmstead" | "shack" | "construction-office" | PlopKind
+export type BuildTool = StructureKind | "logging-camp" | "mining-camp" | "cart-path" | "delete"
 
 export const BASIC_BUILDINGS: readonly { id: BuildTool; label: string; enabled: boolean }[] = [
   { id: "farmstead", label: "Farmstead", enabled: true },
+  { id: "shack", label: "Shack", enabled: true },
+  { id: "construction-office", label: "Construction Office", enabled: true },
   { id: "trading-post", label: "Trading Post", enabled: true },
   { id: "logging-camp", label: "Logging Camp", enabled: false },
   { id: "mining-camp", label: "Mining Camp", enabled: false },
@@ -23,9 +25,14 @@ export const PLOP_STYLE: Record<PlopKind, { fill: string; label: string }> = {
 }
 
 export const HOME_STYLE = { fill: "#2f8a3e", label: "H" }
+export const SHACK_STYLE = { fill: HOME_STYLE.fill, label: "S" }
+export const OFFICE_STYLE = { fill: "#e0b400", label: "CO" }
+export const OFFICE_SPAN = 3
 
 const STRUCTURE_NAME: Record<StructureKind, string> = {
   farmstead: "Farmstead",
+  shack: "Shack",
+  "construction-office": "Construction Office",
   "trading-post": "Trading Post",
   workshop: "Workshop",
   market: "Market",
@@ -55,6 +62,65 @@ export function emptySettlement(): Settlement {
 
 export function isPlop(tool: BuildTool | null): tool is PlopKind {
   return tool === "trading-post" || tool === "workshop" || tool === "market"
+}
+
+/** A building dropped by one click: a 2×2 shop, a 1×2 shack, or a 3×3 office. */
+export function isPlaced(tool: BuildTool | null): tool is PlopKind | "shack" | "construction-office" {
+  return isPlop(tool) || tool === "shack" || tool === "construction-office"
+}
+
+/** Prairie, scrub, or barren, and not a mountain. */
+export function shackGround(terrain: Uint8Array, feature: Uint8Array, index: number): boolean {
+  if (terrain[index] === Terrain.Mountain) return false
+  const cover = feature[index]
+  return cover === Feature.Prairie || cover === Feature.Scrub || cover === Feature.Barren
+}
+
+export type ShackPreview = { tiles: [number, number]; open: boolean }
+
+/**
+ * A 1×2 shack. The cell east of the click is used when that pair is on the map
+ * and open. Otherwise the cell to the south. A closed pair is returned so the
+ * ghost can draw red; null when neither pair fits on the map.
+ */
+export function shackPreview(
+  x: number,
+  y: number,
+  size: number,
+  terrain: Uint8Array,
+  feature: Uint8Array,
+  blocked: (index: number) => boolean,
+): ShackPreview | null {
+  if (x < 0 || y < 0 || x >= size || y >= size) return null
+  const origin = y * size + x
+  const east = x + 1 < size ? ([origin, origin + 1] as [number, number]) : null
+  const south = y + 1 < size ? ([origin, origin + size] as [number, number]) : null
+  const open = (pair: [number, number]) => pair.every((index) => shackGround(terrain, feature, index) && !blocked(index))
+  if (east && open(east)) return { tiles: east, open: true }
+  if (south && open(south)) return { tiles: south, open: true }
+  if (east) return { tiles: east, open: false }
+  if (south) return { tiles: south, open: false }
+  return null
+}
+
+export type OfficePreview = { tiles: number[]; open: boolean }
+
+/** A 3×3 office with the click as the northwest corner. Null when the square leaves the map. */
+export function officePreview(
+  x: number,
+  y: number,
+  size: number,
+  terrain: Uint8Array,
+  feature: Uint8Array,
+  blocked: (index: number) => boolean,
+): OfficePreview | null {
+  if (x < 0 || y < 0 || x + OFFICE_SPAN > size || y + OFFICE_SPAN > size) return null
+  const tiles: number[] = []
+  for (let row = 0; row < OFFICE_SPAN; row++) {
+    for (let column = 0; column < OFFICE_SPAN; column++) tiles.push((y + row) * size + (x + column))
+  }
+  const open = tiles.every((index) => !isWater(terrain, feature, index) && !blocked(index))
+  return { tiles, open }
 }
 
 /** Sea, a lake, a river, or wetland. Lakes and rivers are both stored as fresh water. */
@@ -148,6 +214,12 @@ export function applyBuild(
       latch,
     )
   }
+  if (mode === "place" && tool === "shack") {
+    return placeShack(settlement, cells[0].x, cells[0].y, size, terrain, feature)
+  }
+  if (mode === "place" && tool === "construction-office") {
+    return placeOffice(settlement, cells[0].x, cells[0].y, size, terrain, feature)
+  }
   if (mode === "place" && isPlop(tool)) {
     return placePlop(settlement, cells[0].x, cells[0].y, size, tool, terrain, feature)
   }
@@ -169,10 +241,17 @@ export function commitSettlement(
   for (const structure of settlement.structures) {
     if (structure.removing) continue
     if (structure.kind === "farmstead") {
-      const kept = structure.home && homeFits(structure.home, structure.tiles) && dryPair(structure.home, terrain, feature)
-      const home = kept ? structure.home : placeHome(structure.tiles, terrain, feature, size)
+      let tiles = structure.tiles
+      if (tiles.length > FARMSTEAD_CAP) {
+        if (structure.pending) continue
+        const planned = new Set(structure.fresh)
+        tiles = tiles.filter((tile) => !planned.has(tile))
+        if (tiles.length === 0) continue
+      }
+      const kept = structure.home && homeFits(structure.home, tiles) && dryPair(structure.home, terrain, feature)
+      const home = kept ? structure.home : placeHome(tiles, terrain, feature, size)
       if (!home) continue
-      structures.push({ ...structure, pending: false, fresh: [], removing: false, home })
+      structures.push({ ...structure, tiles, pending: false, fresh: [], removing: false, home })
       continue
     }
     structures.push({ ...structure, pending: false, fresh: [], removing: false })
@@ -238,8 +317,6 @@ function addFarm(
       home: null,
     })
   }
-  const count = near.reduce((sum, structure) => sum + structure.tiles.length, 1)
-  if (count > FARMSTEAD_CAP) return settlement
   const host = [...near].sort((a, b) => a.id - b.id)[0]
   const others = near.filter((structure) => structure.id !== host.id)
   const drop = new Set(others.map((structure) => structure.id))
@@ -309,6 +386,46 @@ function placePlop(
   return append(settlement, { kind, tiles, fresh: tiles, pending: true, removing: false, home: null })
 }
 
+function placeShack(
+  settlement: Settlement,
+  x: number,
+  y: number,
+  size: number,
+  terrain: Uint8Array,
+  feature: Uint8Array,
+): Settlement {
+  const preview = shackPreview(x, y, size, terrain, feature, (index) => findStructure(settlement, index) !== undefined)
+  if (!preview?.open) return settlement
+  return append(settlement, {
+    kind: "shack",
+    tiles: [...preview.tiles],
+    fresh: [...preview.tiles],
+    pending: true,
+    removing: false,
+    home: preview.tiles,
+  })
+}
+
+function placeOffice(
+  settlement: Settlement,
+  x: number,
+  y: number,
+  size: number,
+  terrain: Uint8Array,
+  feature: Uint8Array,
+): Settlement {
+  const preview = officePreview(x, y, size, terrain, feature, (index) => findStructure(settlement, index) !== undefined)
+  if (!preview?.open) return settlement
+  return append(settlement, {
+    kind: "construction-office",
+    tiles: preview.tiles,
+    fresh: preview.tiles,
+    pending: true,
+    removing: false,
+    home: null,
+  })
+}
+
 function removeTile(
   settlement: Settlement,
   structure: Structure,
@@ -360,7 +477,7 @@ function components(tiles: readonly number[], size: number): number[][] {
   return groups
 }
 
-/** A closed farmstead absorbs the unoccupied cells it surrounds, up to the cap. */
+/** A closed farmstead absorbs the unoccupied cells it surrounds. */
 function closeFarms(
   settlement: Settlement,
   size: number,
@@ -382,7 +499,7 @@ function enclose(
 ): Settlement {
   const structure = settlement.structures.find((item) => item.id === id)
   if (!structure || structure.kind !== "farmstead" || structure.removing) return settlement
-  if (structure.tiles.length < 8 || structure.tiles.length >= FARMSTEAD_CAP) return settlement
+  if (structure.tiles.length < 8) return settlement
 
   let minX = size
   let minY = size
@@ -458,16 +575,11 @@ function enclose(
 
   const added: number[] = []
   const merge = new Map<number, Structure>()
-  let count = structure.tiles.length
   for (let head = 0; head < queue.length; head++) {
-    if (count >= FARMSTEAD_CAP) break
     const index = queue[head]
     const near = adjacentFarms(settlement, index, size).filter((item) => item.id !== structure.id && !merge.has(item.id))
-    const extra = near.reduce((sum, item) => sum + item.tiles.length, 0)
-    if (count + 1 + extra > FARMSTEAD_CAP) continue
     added.push(index)
     for (const item of near) merge.set(item.id, item)
-    count += 1 + extra
     const x = index % size
     const y = (index - x) / size
     if (x > minX) enqueue(index - 1)

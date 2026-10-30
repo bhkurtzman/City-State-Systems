@@ -5,11 +5,13 @@ import { Button } from "@/components/ui/button"
 import { Card, CardAction, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import type { OfficeCrew, PublicWages } from "@/lib/construction"
+import type { Structure } from "@/lib/buildings"
 import { LAND_LABEL, LAND_TYPES, type LandRate, type LandSchedule, type LandType } from "@/lib/land"
 import type { CitizenCensus, ClassCensus, EconomyCensus, EducationCensus } from "@/lib/people"
 import { cn } from "@/lib/utils"
 
-export type LedgerId = "population" | "treasury" | "education" | "economy"
+export type LedgerId = "population" | "treasury" | "education" | "economy" | "government"
 
 const BLANK = "—"
 
@@ -18,6 +20,7 @@ const TITLES: Record<LedgerId, string> = {
   education: "Education",
   treasury: "Treasury",
   economy: "Economy",
+  government: "Government",
 }
 
 type Row = {
@@ -46,6 +49,10 @@ export function LedgerPanel({
   landIncome,
   land,
   onLand,
+  wages,
+  onWage,
+  offices,
+  structures,
   onClose,
 }: {
   kind: LedgerId
@@ -67,6 +74,10 @@ export function LedgerPanel({
   landIncome: number | null
   land: LandSchedule
   onLand: (type: LandType, patch: Partial<LandRate>) => void
+  wages: PublicWages
+  onWage: (grade: keyof PublicWages, amount: number) => void
+  offices: readonly OfficeCrew[]
+  structures: readonly Structure[]
   onClose: () => void
 }) {
   const rows =
@@ -84,6 +95,19 @@ export function LedgerPanel({
   }
   if (kind === "economy") {
     return <EconomyPanel rows={rows} prices={prices} classes={classes} onClose={onClose} />
+  }
+  if (kind === "government") {
+    return (
+      <GovernmentPanel
+        wages={wages}
+        onWage={onWage}
+        offices={offices}
+        structures={structures}
+        living={living}
+        median={classes?.incomeMedian ?? null}
+        onClose={onClose}
+      />
+    )
   }
   return (
     <Card className="w-full shadow-md">
@@ -211,7 +235,7 @@ function economyRows(economy: EconomyCensus | null, living: number | null, class
     },
     {
       label: "Cost of living",
-      note: "One adult's food, clothing, and leather for a year, plus half a household's fuel.",
+      note: "Food, working-class clothing and leather, a year of fuel, and two urban tiles.",
       value: money(living, true),
     },
   ]
@@ -352,7 +376,7 @@ function EconomyPanel({
           <TabsContent value="classes">
             <RowList rows={classRows(classes)} />
             <p className="mt-3 text-xs leading-relaxed text-muted-foreground">
-              A couple needs twice an adult's cost of living, plus half again for each child at home. A single adult needs one, plus half for each child. A higher band wins when income or wealth reaches it. Savings alone can hold the working class.
+              Each household pays the full cost once. Every other person adds food, clothing, and leather at three quarters of the adult rate. A higher band wins when income or wealth reaches it. Savings alone can hold the working class.
             </p>
           </TabsContent>
         </Tabs>
@@ -504,5 +528,103 @@ function RowList({ rows }: { rows: Row[] }) {
         </div>
       ))}
     </dl>
+  )
+}
+
+const WAGE_GRADES: { id: keyof PublicWages; label: string; note?: string }[] = [
+  { id: "e1", label: "E1", note: "Laborer" },
+  { id: "e2", label: "E2" },
+  { id: "e3", label: "E3" },
+]
+
+function GovernmentPanel({
+  wages,
+  onWage,
+  offices,
+  structures,
+  living,
+  median,
+  onClose,
+}: {
+  wages: PublicWages
+  onWage: (grade: keyof PublicWages, amount: number) => void
+  offices: readonly OfficeCrew[]
+  structures: readonly Structure[]
+  living: number | null
+  median: number | null
+  onClose: () => void
+}) {
+  const [tab, setTab] = useState("employees")
+  const sites = structures.filter((structure) => structure.kind === "construction-office" && !structure.removing)
+  return (
+    <Card className="w-full shadow-md">
+      <CardHeader>
+        <CardTitle>Government</CardTitle>
+        <CardAction>
+          <Button type="button" variant="outline" size="sm" aria-label="Close" onClick={onClose}>
+            X
+          </Button>
+        </CardAction>
+      </CardHeader>
+      <CardContent>
+        <Tabs
+          value={tab}
+          onValueChange={(value) => {
+            if (typeof value === "string") setTab(value)
+          }}
+        >
+          <TabsList className="h-auto w-full flex-wrap justify-start">
+            <TabsTrigger value="employees" className="px-1.5 text-xs">Public Employees</TabsTrigger>
+            <TabsTrigger value="construction" className="px-1.5 text-xs">Construction</TabsTrigger>
+          </TabsList>
+          <TabsContent value="employees">
+            <div className="grid gap-3">
+              {WAGE_GRADES.map((grade) => (
+                <label key={grade.id} className="grid grid-cols-[4.5rem_minmax(0,1fr)] items-center gap-2 text-sm">
+                  <span>
+                    {grade.label}
+                    {grade.note ? <span className="block text-xs text-muted-foreground">{grade.note}</span> : null}
+                  </span>
+                  <Input
+                    type="number"
+                    min={0}
+                    step={1}
+                    aria-label={`${grade.label} yearly wage`}
+                    value={wages[grade.id]}
+                    onChange={(event) => onWage(grade.id, Math.max(0, Math.floor(Number(event.target.value) || 0)))}
+                  />
+                </label>
+              ))}
+            </div>
+            <p className="mt-4 text-xs leading-relaxed text-muted-foreground">
+              Cost of living {money(living, true)}. Median income {money(median)}.
+            </p>
+          </TabsContent>
+          <TabsContent value="construction">
+            {sites.length === 0 ? (
+              <p className="text-sm text-muted-foreground">No construction offices.</p>
+            ) : (
+              <ul className="grid gap-3 text-sm">
+                {sites.map((structure) => {
+                  const office = offices.find((item) => item.structureId === structure.id)
+                  const target = office?.target ?? 0
+                  const crew = office?.crew.length ?? 0
+                  const leaving = Math.max(0, crew - target)
+                  return (
+                    <li key={structure.id}>
+                      <div className="font-medium">{structure.pending ? "Planned office" : `Office ${structure.id}`}</div>
+                      <div className="text-xs text-muted-foreground">
+                        {crew} of {target} laborers
+                        {leaving > 0 ? `. ${leaving} leave in January` : ""}
+                      </div>
+                    </li>
+                  )
+                })}
+              </ul>
+            )}
+          </TabsContent>
+        </Tabs>
+      </CardContent>
+    </Card>
   )
 }

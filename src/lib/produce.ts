@@ -21,10 +21,12 @@ export const GOODS = [
   "dried-fruit",
   "vegetables",
   "dairy",
+  "cheese",
   "meat",
   "hide",
   "wood",
   "lumber",
+  "barrels",
   "fish",
   "cured-fish",
   "cured-meat",
@@ -40,7 +42,7 @@ export const GOODS = [
 export type Good = (typeof GOODS)[number]
 
 /** One craft, rolled when a workshop is first owned and then kept. */
-export type ShopSpecialty = "sawmill" | "blacksmith" | "smokehouse"
+export type ShopSpecialty = "sawmill" | "blacksmith" | "smokehouse" | "creamery" | "cooper"
 
 const CROP_LABEL: Record<Crop, string> = {
   grain: "Grain",
@@ -58,10 +60,12 @@ export const GOOD_LABEL: Record<Good, string> = {
   "dried-fruit": "Dried fruit",
   vegetables: "Vegetables",
   dairy: "Dairy",
+  cheese: "Cheese",
   meat: "Meat",
   hide: "Hides",
   wood: "Wood",
   lumber: "Lumber",
+  barrels: "Barrels",
   fish: "Fish",
   "cured-fish": "Cured fish",
   "cured-meat": "Cured meat",
@@ -79,6 +83,8 @@ const SHOP_LABEL: Record<ShopSpecialty, string> = {
   sawmill: "Sawmill",
   blacksmith: "Blacksmith",
   smokehouse: "Smokehouse",
+  creamery: "Creamery",
+  cooper: "Cooper",
 }
 
 /** How many equal shares the prairie is split into, including the fallow share. */
@@ -96,6 +102,8 @@ export type FarmRecord = {
   store: Record<Good, number>
   /** Dollars per ton the market paid for goods it is holding to resell. */
   cost?: Partial<Record<Good, number>>
+  /** Hundredths an earlier month set aside to export. The next trade month returns them to the barn. */
+  trade?: Partial<Record<Good, number>>
   /** Set once, the first month a workshop has an owner. */
   specialty?: ShopSpecialty
 }
@@ -115,7 +123,7 @@ const NOVEMBER = 10
 const FOREST_CLEAR = 180
 const WOODLAND_CLEAR = FOREST_CLEAR * 2
 /** Hundredths. One farmstead's fish for the year. */
-const FISH_CAP = 2000
+const FISH_CAP = 1500
 
 const FIELD_CROPS: Crop[] = ["grain", "fiber", "fruit", "vegetables"]
 const GARDEN_CROPS: Crop[] = ["fiber", "fruit", "vegetables"]
@@ -125,18 +133,18 @@ export function emptyFarms(): Farms {
   return { rows: [] }
 }
 
-/** Hundredths. A house opens with half a ton of each staple and 20 tons of wood. */
+/** Hundredths. A house opens with half a ton of grain, vegetables, and fruit, 2 tons of dairy, and 20 tons of wood. */
 const HOUSEHOLD_START: Partial<Record<Good, number>> = {
   grain: 50,
   vegetables: 50,
   fruit: 50,
-  dairy: 50,
+  dairy: 200,
   wood: 2000,
 }
 
 /**
- * Hundredths. One year of a business's supplies: 1 t grain, 0.05 t leather,
- * 0.05 t textiles, and 0.025 t steel tools rounded to the nearest hundredth.
+ * Hundredths. A trading post opens with one year of supplies: 1 t grain,
+ * 0.05 t leather, 0.05 t textiles, and 0.025 t steel tools.
  */
 const BUSINESS_YEAR: Partial<Record<Good, number>> = {
   grain: 100,
@@ -145,8 +153,30 @@ const BUSINESS_YEAR: Partial<Record<Good, number>> = {
   "steel-tools": 3,
 }
 
+/** Hundredths a market tries to keep on the shelf. It refills after the pile falls under half. */
+export const SHELF_TARGET: Partial<Record<Good, number>> = {
+  clothing: 50,
+  "steel-tools": 50,
+  leather: 50,
+  textiles: 50,
+  meat: 300,
+  fish: 500,
+  grain: 500,
+  dairy: 1000,
+  fruit: 1000,
+  vegetables: 1000,
+  coal: 1000,
+  wood: 5000,
+  salt: 100,
+}
+
+/** Half a shelf target, rounded to the nearest tenth of a ton. */
+function halfShelf(target: number): number {
+  return Math.round(target / 20) * 10
+}
+
 function isHousehold(kind: Structure["kind"]): boolean {
-  return kind === "farmstead" || kind === "market" || kind === "trading-post" || kind === "workshop"
+  return kind === "farmstead" || kind === "shack" || kind === "market" || kind === "trading-post" || kind === "workshop"
 }
 
 function isBusiness(kind: Structure["kind"]): boolean {
@@ -199,10 +229,13 @@ function climateBonus(preset: PresetId, good: Good): number {
   return 0
 }
 
+const GARDEN_WEIGHT: Partial<Record<Crop, number>> = { fiber: 40, fruit: 20, vegetables: 20 }
+
 function pick(options: readonly Crop[], preset: PresetId, rng: () => number, taken: readonly Crop[] = []): Crop {
   const favored = specialty(preset)
   const open = options.filter((crop) => !taken.includes(crop))
-  const weights = open.map((crop) => (crop === "dairy" ? 2 : 1) * (favored.has(crop) ? 2 : 1))
+  const garden = open.every((crop) => crop === "fiber" || crop === "fruit" || crop === "vegetables")
+  const weights = open.map((crop) => (garden ? (GARDEN_WEIGHT[crop] ?? 0) + (favored.has(crop) ? 20 : 0) : (crop === "dairy" ? 2 : 1) * (favored.has(crop) ? 2 : 1)))
   const total = weights.reduce((sum, weight) => sum + weight, 0)
   let roll = rng() * total
   for (let i = 0; i < open.length; i++) {
@@ -226,7 +259,7 @@ function improvesSoil(layout: Layout, uses: readonly Crop[]): boolean {
  * Harvest this calendar month, then let a new owner or a finished orchard pick again.
  * Forest is cleared above 180 tiles and woodland above 360. Two cut-points are spent,
  * woodland first at one point and forest at two. One wetland tile is drained every year.
- * A farmstead's April fish haul stops at 20 tons.
+ * A farmstead's April fish haul stops at 15 tons.
  */
 type Land = { feature: Uint8Array; fertility: Uint8Array; changed: boolean }
 
@@ -244,8 +277,9 @@ export function workFarms(
   idMap: Int32Array | null = null,
   aridity = 99,
   openingRanks: readonly ShopSpecialty[] = [],
+  wealth: Int32Array | null = null,
 ): { farms: Farms; feature: Uint8Array; fertility: Uint8Array; changedLand: boolean } {
-  const standing = structures.filter((structure) => !structure.pending && !structure.removing && (structure.kind === "farmstead" || isBusiness(structure.kind)))
+  const standing = structures.filter((structure) => !structure.pending && !structure.removing && (structure.kind === "farmstead" || structure.kind === "shack" || structure.kind === "construction-office" || isBusiness(structure.kind)))
   const ownerOf = new Map(owners.map((row) => [row.structureId, row.owner]))
   const land: Land = { feature: featureIn, fertility: fertilityIn, changed: false }
   const writeLand = () => {
@@ -259,19 +293,31 @@ export function workFarms(
   for (const structure of standing) {
     const owner = ownerOf.get(structure.id) ?? -1
     const previous = farms.rows.find((row) => row.structureId === structure.id)
-    let record = previous ? { ...previous, uses: [...previous.uses], store: { ...emptyStore(), ...previous.store } } : null
+    let record: FarmRecord | null = previous
+      ? { ...previous, uses: [...previous.uses], store: { ...emptyStore(), ...previous.store }, trade: previous.trade ? { ...previous.trade } : undefined }
+      : null
     if (record) {
       for (const good of GOODS) if (!Number.isFinite(record.store[good])) record.store[good] = 0
     }
     if (record && idMap && record.owner >= 0) record.owner = record.owner < idMap.length ? idMap[record.owner] : -1
     if (owner < 0) {
-      if (record) rows.push(record)
+      if (structure.kind === "construction-office") {
+        if (!record) record = stockRecord(structure, -1, seed)
+        rows.push(record)
+      } else if (record) rows.push(record)
       continue
     }
     const planted = record !== null
     if (!record) record = structure.kind === "farmstead" ? rollRecord(structure, land, preset, owner, seed, year, month) : stockRecord(structure, owner, seed)
     if (structure.kind === "workshop" && !record.specialty) {
-      record.specialty = pickShopSpecialty(openingRanks, structure.id, seed, year, month) ?? rollSpecialty(structure.id, seed)
+      const cash = wealth && owner >= 0 && owner < wealth.length ? wealth[owner] ?? 0 : 0
+      const affordable = openingRanks.filter((specialty) => canFoundShop(specialty, cash))
+      record.specialty = pickShopSpecialty(affordable, structure.id, seed, year, month) ?? rollSpecialty(structure.id, seed, cash) ?? undefined
+      if (record.specialty === "creamery") {
+        record.store.salt += 10
+        record.store.textiles += 10
+      }
+      if (record.specialty === "cooper") record.store.fiber += 20
     }
     if (structure.kind !== "farmstead") {
       record.owner = owner
@@ -284,6 +330,7 @@ export function workFarms(
     if (ownerChanged || harvest.replant) {
       const next = rollRecord(structure, land, preset, owner, seed, year, month)
       next.store = record.store
+      next.trade = record.trade
       record = next
     }
     rows.push(record)
@@ -344,8 +391,21 @@ export function pickShopSpecialty(
   return rest[Math.min(rest.length - 1, Math.floor(rng() * rest.length))]
 }
 
-function rollSpecialty(id: number, seed: string): ShopSpecialty {
-  const kinds: ShopSpecialty[] = ["sawmill", "blacksmith", "smokehouse"]
+const SHOP_PURSE: Record<ShopSpecialty, number> = {
+  sawmill: 1000,
+  blacksmith: 5000,
+  smokehouse: 1000,
+  creamery: 1000,
+  cooper: 1000,
+}
+
+function canFoundShop(specialty: ShopSpecialty, cash: number): boolean {
+  return cash >= SHOP_PURSE[specialty]
+}
+
+function rollSpecialty(id: number, seed: string, cash: number): ShopSpecialty | null {
+  const kinds = (["sawmill", "blacksmith", "smokehouse", "creamery", "cooper"] as const).filter((kind) => canFoundShop(kind, cash))
+  if (kinds.length === 0) return null
   const roll = mulberry32(hashSeed(`${seed}:shop:${id}`))()
   return kinds[Math.min(kinds.length - 1, Math.floor(roll * kinds.length))]
 }
@@ -363,8 +423,20 @@ function openingStore(kind: Structure["kind"]): Record<Good, number> {
   if (isHousehold(kind)) {
     for (const good of GOODS) store[good] += HOUSEHOLD_START[good] ?? 0
   }
-  if (isBusiness(kind)) {
+  if (kind === "trading-post") {
     for (const good of GOODS) store[good] += BUSINESS_YEAR[good] ?? 0
+  }
+  if (kind === "farmstead") {
+    store.leather += 10
+    store.textiles += 10
+    store["steel-tools"] += 10
+  }
+  if (kind === "workshop") store["steel-tools"] += 10
+  if (kind === "market") {
+    for (const good of GOODS) {
+      const target = SHELF_TARGET[good]
+      if (target) store[good] = Math.max(store[good], halfShelf(target))
+    }
   }
   return store
 }
@@ -516,6 +588,7 @@ export function productionLines(
   farms: Farms,
   people: People | null,
 ): PropertyLine[] {
+  if (structure.kind === "construction-office") return supplyLines(structure, farms)
   if (structure.pending) return []
   const record = farms.rows.find((row) => row.structureId === structure.id)
   if (!record || record.owner < 0) return []
@@ -530,6 +603,20 @@ export function productionLines(
     lines.push({ label: GOOD_LABEL[good], value: formatTons(record.store[good]) })
   }
   if (people) lines.push({ label: "Yearly need", value: yearlyNeed(people, record.owner) })
+  return lines
+}
+
+/** The office pantry. Empty until construction supplies are stocked. */
+function supplyLines(structure: Structure, farms: Farms): PropertyLine[] {
+  const record = farms.rows.find((row) => row.structureId === structure.id)
+  const lines: PropertyLine[] = []
+  if (record) {
+    for (const good of GOODS) {
+      if ((record.store[good] ?? 0) <= 0) continue
+      lines.push({ label: GOOD_LABEL[good], value: formatTons(record.store[good]) })
+    }
+  }
+  if (lines.length === 0) lines.push({ label: "Supplies", value: "None" })
   return lines
 }
 
@@ -562,7 +649,7 @@ export function familyPortions(people: People, owner: number): { scale: number; 
 function yearlyNeed(people: People, owner: number): string {
   const family = familyPortions(people, owner)
   if (family.scale <= 0) return "—"
-  return `${formatNeed(family.scale * 0.1)} meat or fish, or ${formatNeed(family.scale * 0.2)} dairy · ${formatNeed(family.scale * 0.3)} fruit or vegetables · ${formatNeed(family.scale * 0.1)} grain`
+  return `${formatNeed(family.scale * 0.1)} meat or fish, or ${formatNeed(family.scale * 0.4)} dairy · ${formatNeed(family.scale * 0.3)} fruit or vegetables · ${formatNeed(family.scale * 0.1)} grain`
 }
 
 function portion(age: number): number {

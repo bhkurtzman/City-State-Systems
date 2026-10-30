@@ -90,8 +90,9 @@ export type People = {
   /** Secondary attendance, in tenths of a quality-weighted year. */
   secondaryYears: Uint8Array
   /**
-   * Current work. Student while on a school roll, then the job of the oldest
-   * house the person or their spouse owns. Otherwise Idle under 18 and Unemployed at 18.
+ * Current work. Student while on a school roll, then the job of the oldest
+ * house the person or their spouse owns. A state laborer is written after that
+ * when the house left him unemployed. Otherwise Idle under 18 and Unemployed at 18.
    */
   occupation: Uint8Array
   /** 1 while living. Dead rows stay until the January purge. */
@@ -121,8 +122,10 @@ export type People = {
 /** Plots, prices, and the adult cost of living for one month of kinship. Founding passes null. */
 export type KinBooks = {
   holdings: Holdings
-  /** One adult's yearly cost of living, in whole dollars. */
+  /** One household's full yearly cost, in whole dollars. */
   adultCost: number
+  /** Food, clothing, and leather for one extra person, at three quarters of the adult rate. */
+  memberCost: number
   /** Dollars the treasury pays to take a plot back. */
   salePrice: (structureId: number) => number
 }
@@ -137,6 +140,7 @@ export const OCCUPATION = {
   shopkeeper: 5,
   unemployed: 6,
   retired: 7,
+  laborer: 8,
 } as const
 
 export const OCCUPATION_LABEL = [
@@ -148,13 +152,14 @@ export const OCCUPATION_LABEL = [
   "Shopkeeper",
   "Unemployed",
   "Retired",
+  "Laborer",
 ] as const
 
 /** A house someone lives in. The lowest id is the oldest, and that one sets the job. */
 export type HouseholdHome = {
   id: number
   owner: number
-  kind: "farmstead" | "market" | "trading-post" | "workshop"
+  kind: "farmstead" | "market" | "trading-post" | "workshop" | "shack"
 }
 
 const HOME_JOB: Record<HouseholdHome["kind"], number> = {
@@ -162,6 +167,7 @@ const HOME_JOB: Record<HouseholdHome["kind"], number> = {
   "trading-post": OCCUPATION.trader,
   workshop: OCCUPATION.craftsman,
   market: OCCUPATION.shopkeeper,
+  shack: OCCUPATION.unemployed,
 }
 
 /** Years a woman spends in each birth band. Matches the fertility table. */
@@ -430,7 +436,8 @@ export function householdHomes(
       structure.kind !== "farmstead" &&
       structure.kind !== "market" &&
       structure.kind !== "trading-post" &&
-      structure.kind !== "workshop"
+      structure.kind !== "workshop" &&
+      structure.kind !== "shack"
     ) {
       continue
     }
@@ -446,12 +453,16 @@ export function householdHomes(
  * Otherwise the owner of a house and their living spouse take that house's job,
  * and so do the eldest son still in his father's house and that son's wife.
  * The oldest house wins when the household owns more than one. Everyone else
- * is Idle under 18 and Unemployed at 18.
+ * is Idle under 18 and Unemployed at 18. A listed laborer whose house did not
+ * give him a job is then a Laborer.
  */
+const NO_LABORERS: ReadonlySet<number> = new Set()
+
 export function assignOccupations(
   people: People,
   homes: readonly HouseholdHome[],
   schools: SchoolSession = NO_SCHOOLS,
+  laborers: ReadonlySet<number> = NO_LABORERS,
 ): People {
   const byOwner = new Map<number, { id: number; job: number }[]>()
   for (const home of homes) {
@@ -479,6 +490,7 @@ export function assignOccupations(
     const job = householdJob(people, byOwner, i) ?? heirJob(people, byOwner, headOf, eldest, i)
     if (job !== null) occupation[i] = job
     else occupation[i] = people.age[i] < MIN_ADULT_AGE ? OCCUPATION.idle : OCCUPATION.unemployed
+    if (laborers.has(i) && occupation[i] === OCCUPATION.unemployed) occupation[i] = OCCUPATION.laborer
   }
   return { ...people, occupation }
 }
@@ -501,7 +513,7 @@ export function residenceCensus(
     const mate = people.spouse[i]
     const mateAlive = isAlive(people, mate)
     if (mateAlive) {
-      if (i > mate || headOf[i] !== i) continue
+      if (headOf[i] !== i) continue
       if (!owners.has(i) && !owners.has(mate)) homelessFamilies += 1
       continue
     }
@@ -526,19 +538,16 @@ export type ClassCensus = {
 }
 
 /**
- * One adult's cost of living, scaled per household. A couple needs twice that.
- * The eldest son still in his father's house, and that son's wife, each add a full adult.
- * Their children add a full adult from 18 and half before that. Other unmarried
- * children at home, adopted children, and retired parents add half.
- * A single adult needs one, plus those same additions. Wealthy through working
- * are tested from the top. Poor is whatever is left.
+ * The full cost once per household, plus the smaller food and clothing share
+ * for every other person there. Wealthy through working are tested from the top.
+ * Poor is whatever is left.
  */
-export function classCensus(people: People, adultCost: number, homes: readonly HouseholdHome[] = []): ClassCensus {
+export function classCensus(people: People, adultCost: number, memberCost: number, homes: readonly HouseholdHome[] = []): ClassCensus {
   const incomes: number[] = []
   const counts = { poor: 0, working: 0, middle: 0, upper: 0, wealthy: 0 }
   for (const unit of households(people, homes)) {
     incomes.push(unit.income)
-    counts[classify(unit.income, unit.wealth, householdCost(adultCost, unit.adults, unit.dependents))] += 1
+    counts[classify(unit.income, unit.wealth, householdCost(adultCost, memberCost, unit.size))] += 1
   }
   return {
     units: incomes.length,
@@ -548,20 +557,21 @@ export function classCensus(people: People, adultCost: number, homes: readonly H
   }
 }
 
-function householdCost(adultCost: number, adults: number, dependents: number): number {
-  return Math.round(adultCost * (adults + dependents * 0.5))
+function householdCost(full: number, member: number, size: number): number {
+  return Math.round(full + member * Math.max(0, size - 1))
 }
 
 /** Class of each household head, and the head every living person follows. */
 export function householdRanks(
   people: People,
   adultCost: number,
+  memberCost: number,
   homes: readonly HouseholdHome[],
 ): { rank: Map<number, SocialClass>; headOf: Int32Array } {
   const headOf = residenceMap(people, ownersOf(homes))
   const rank = new Map<number, SocialClass>()
   for (const unit of households(people, homes)) {
-    rank.set(unit.head, classify(unit.income, unit.wealth, householdCost(adultCost, unit.adults, unit.dependents)))
+    rank.set(unit.head, classify(unit.income, unit.wealth, householdCost(adultCost, memberCost, unit.size)))
   }
   return { rank, headOf }
 }
@@ -582,14 +592,12 @@ type HouseholdRoll = {
   couple: boolean
   income: number
   wealth: number
-  adults: number
-  dependents: number
+  size: number
 }
 
 function households(people: People, homes: readonly HouseholdHome[]): HouseholdRoll[] {
   const owned = ownersOf(homes)
   const headOf = residenceMap(people, owned)
-  const eldest = eldestByFather(people)
   const members = new Map<number, number[]>()
   for (let id = 0; id < people.age.length; id++) {
     if (people.alive[id] === 0) continue
@@ -610,45 +618,9 @@ function households(people: People, homes: readonly HouseholdHome[]): HouseholdR
       income += people.income?.[id] ?? 0
       wealth += people.wealth[id] ?? 0
     }
-    const weight = weighHousehold(people, head, list, eldest)
-    units.push({ head, couple, income, wealth, adults: weight.adults, dependents: weight.dependents })
+    units.push({ head, couple, income, wealth, size: list.length })
   }
   return units
-}
-
-/** Heads count in full. A folded heir's own adults do too. Everyone else at home is half. */
-function weighHousehold(
-  people: People,
-  head: number,
-  members: readonly number[],
-  eldest: Int32Array,
-): { adults: number; dependents: number } {
-  const mate = people.spouse[head]
-  const couple = isAlive(people, mate)
-  let adults = couple ? 2 : 1
-  let dependents = 0
-  const heir = people.sex[head] === Sex.Male ? eldest[head] : -1
-  const heirHome = heir >= 0 && heir !== head && members.includes(heir)
-  const heirWife = heirHome ? people.spouse[heir] : -1
-  for (const id of members) {
-    if (id === head || (couple && id === mate)) continue
-    if (heirHome && id === heir) {
-      if (people.age[id] >= MIN_ADULT_AGE) adults += 1
-      else dependents += 1
-      continue
-    }
-    if (heirHome && heirWife >= 0 && id === heirWife && isAlive(people, heirWife)) {
-      adults += 1
-      continue
-    }
-    if (heirHome && (people.father[id] === heir || people.mother[id] === heir)) {
-      if (people.age[id] >= MIN_ADULT_AGE) adults += 1
-      else dependents += 1
-      continue
-    }
-    dependents += 1
-  }
-  return { adults, dependents }
 }
 
 function householdJob(
@@ -1069,6 +1041,7 @@ export function advancePeople(
       income,
       rows,
       adultCost: kin?.adultCost ?? 0,
+      memberCost: kin?.memberCost ?? 0,
       salePrice: kin?.salePrice ?? (() => 0),
       toTreasury: 0,
     },
@@ -1290,6 +1263,7 @@ type KinState = {
   income: Int32Array
   rows: Holding[] | null
   adultCost: number
+  memberCost: number
   salePrice: (structureId: number) => number
   toTreasury: number
 }
@@ -1635,7 +1609,7 @@ function retireChildlessFather(state: KinState, bride: number) {
 }
 
 function purseGift(state: KinState, payer: number, unit: HouseholdRoll, share: number): number {
-  const cost = householdCost(state.adultCost, unit.adults, unit.dependents)
+  const cost = householdCost(state.adultCost, state.memberCost, unit.size)
   if (classify(unit.income, unit.wealth, cost) === "poor") return 0
   const purse = state.wealth[payer]
   const cap = Math.floor(purse * share)
@@ -1776,9 +1750,9 @@ function payHeir(
 }
 
 const FOUNDING_CASH = {
-  warrior: { level: 500, year: 50 },
-  merchant: { level: 1500, year: 150 },
-  explorer: { level: 250, year: 30 },
+  warrior: { level: 500, year: 100, from: 18 },
+  merchant: { level: 1500, year: 150, from: 25 },
+  explorer: { level: 250, year: 60, from: 18 },
 } as const
 
 /** Level 0 pays the base stake. Each further level adds the same amount again. */
@@ -1791,7 +1765,7 @@ function grantFoundingWealth(people: People, founderId: string) {
       continue
     }
     if (people.mother[i] < 0) {
-      const years = people.age[i] > 25 ? people.age[i] - 25 : 0
+      const years = people.age[i] > rates.from ? people.age[i] - rates.from : 0
       people.wealth[i] = people.sex[i] === Sex.Male ? (people.education[i] + 1) * rates.level + years * rates.year : 0
       continue
     }

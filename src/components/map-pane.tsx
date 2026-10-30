@@ -2,9 +2,10 @@
 
 import { useEffect, useImperativeHandle, useRef, useState, type PointerEvent as ReactPointerEvent, type Ref } from "react"
 import { Card, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
-import { HOME_STYLE, isPlop, isWater, PLOP_STYLE, type BuildTool, type Structure } from "@/lib/buildings"
+import { FARMSTEAD_CAP, HOME_STYLE, isPlaced, isWater, OFFICE_STYLE, officePreview, PLOP_STYLE, SHACK_STYLE, shackPreview, type BuildTool, type Structure } from "@/lib/buildings"
 import { paintLayer } from "@/lib/colors"
-import type { LayerId, World } from "@/lib/types"
+import { cardinalLine } from "@/lib/roads"
+import { Terrain, type LayerId, type World } from "@/lib/types"
 
 export type MapPaneHandle = {
   zoomBy: (factor: number) => void
@@ -19,6 +20,7 @@ type MapPaneProps = {
   cell: Cell | null
   generation: number
   structures: Structure[]
+  roads: readonly { index: number; done: boolean }[]
   tool: BuildTool | null
   onSelect: (cell: Cell) => void
   onBuild: (cells: Cell[], mode: "tap" | "stroke" | "place", latch: Set<number>, allowNew: boolean) => void
@@ -27,7 +29,7 @@ type MapPaneProps = {
 
 type View = { x: number; y: number; zoom: number }
 
-export function MapPane({ world, layer, cell, generation, structures, tool, onSelect, onBuild, handle }: MapPaneProps) {
+export function MapPane({ world, layer, cell, generation, structures, roads, tool, onSelect, onBuild, handle }: MapPaneProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const bitmapRef = useRef<HTMLCanvasElement | null>(null)
   const viewRef = useRef<View>({ x: 0, y: 0, zoom: 1 })
@@ -40,21 +42,27 @@ export function MapPane({ world, layer, cell, generation, structures, tool, onSe
     moved: boolean
     painting: boolean
     last: Cell | null
+    anchor: Cell | null
     startedStroke: boolean
     latch: Set<number>
   } | null>(null)
   const worldRef = useRef(world)
   const cellRef = useRef(cell)
   const structuresRef = useRef(structures)
+  const roadsRef = useRef(roads)
   const toolRef = useRef(tool)
   const hoverRef = useRef<Cell | null>(null)
+  const previewRef = useRef<Cell[] | null>(null)
   const [hover, setHover] = useState<Cell | null>(null)
+  const [preview, setPreview] = useState<Cell[] | null>(null)
 
   worldRef.current = world
   cellRef.current = cell
   structuresRef.current = structures
+  roadsRef.current = roads
   toolRef.current = tool
   hoverRef.current = hover
+  previewRef.current = preview
 
   const draw = () => {
     const canvas = canvasRef.current
@@ -79,7 +87,10 @@ export function MapPane({ world, layer, cell, generation, structures, tool, onSe
     context.fillRect(0, 0, width, height)
     const view = viewRef.current
     context.drawImage(bitmap, view.x, view.y, current.size * view.zoom, current.size * view.zoom)
+    drawRoads(context, roadsRef.current, current.size, view)
     drawStructures(context, structuresRef.current, current.size, view)
+    const roadLine = previewRef.current ?? (toolRef.current === "cart-path" && hoverRef.current ? [hoverRef.current] : null)
+    drawRoadPreview(context, roadLine, structuresRef.current, current, view)
     drawGhost(context, hoverRef.current, toolRef.current, structuresRef.current, current, view)
     const selected = cellRef.current
     if (!selected) return
@@ -169,7 +180,7 @@ export function MapPane({ world, layer, cell, generation, structures, tool, onSe
 
   useEffect(() => {
     draw()
-  }, [cell, structures, tool, hover])
+  }, [cell, structures, roads, tool, hover, preview])
 
   const cellAt = (event: ReactPointerEvent<HTMLCanvasElement>): Cell | null => {
     const current = worldRef.current
@@ -192,13 +203,15 @@ export function MapPane({ world, layer, cell, generation, structures, tool, onSe
             className={tool ? "h-full w-full touch-none cursor-crosshair" : "h-full w-full touch-none"}
             onContextMenu={(event) => event.preventDefault()}
             onPointerDown={(event) => {
+              if (event.button === 1) event.preventDefault()
               try {
                 event.currentTarget.setPointerCapture(event.pointerId)
               } catch {
                 // A pointer the browser is no longer tracking cannot be captured.
               }
               const active = toolRef.current
-              const painting = event.button === 0 && (active === "farmstead" || active === "delete")
+              const painting = event.button === 0 && (active === "farmstead" || active === "delete" || active === "cart-path")
+              const origin = cellAt(event)
               dragRef.current = {
                 x: event.clientX,
                 y: event.clientY,
@@ -206,7 +219,8 @@ export function MapPane({ world, layer, cell, generation, structures, tool, onSe
                 originY: event.clientY,
                 moved: false,
                 painting,
-                last: cellAt(event),
+                last: origin,
+                anchor: origin,
                 startedStroke: false,
                 latch: new Set(),
               }
@@ -214,12 +228,18 @@ export function MapPane({ world, layer, cell, generation, structures, tool, onSe
             onPointerMove={(event) => {
               const active = toolRef.current
               const drag = dragRef.current
-              if (!drag && isPlop(active)) {
+              if (!drag && (isPlaced(active) || active === "cart-path")) {
                 const next = cellAt(event)
                 setHover((current) => (sameCell(current, next) ? current : next))
               }
               if (!drag) return
               if (Math.hypot(event.clientX - drag.originX, event.clientY - drag.originY) > 3) drag.moved = true
+              if (drag.painting && active === "cart-path") {
+                const next = cellAt(event)
+                if (next) drag.last = next
+                if (drag.moved && drag.anchor && drag.last) setPreview(cardinalLine(drag.anchor, drag.last))
+                return
+              }
               if (drag.painting) {
                 const next = cellAt(event)
                 if (drag.moved && next && drag.last) {
@@ -249,6 +269,18 @@ export function MapPane({ world, layer, cell, generation, structures, tool, onSe
               const drag = dragRef.current
               dragRef.current = null
               if (!drag || !world) return
+              if (toolRef.current === "cart-path") {
+                setPreview(null)
+                if (!drag.painting) {
+                  if (drag.moved) return
+                  const picked = cellAt(event)
+                  if (picked) onSelect(picked)
+                  return
+                }
+                const line = drag.moved && drag.anchor && drag.last ? cardinalLine(drag.anchor, drag.last) : drag.last ? [drag.last] : []
+                if (line.length > 0) onBuild(line, "stroke", drag.latch, true)
+                return
+              }
               if (drag.painting) {
                 if (!drag.moved && drag.last) onBuild([drag.last], "tap", drag.latch, true)
                 return
@@ -256,7 +288,7 @@ export function MapPane({ world, layer, cell, generation, structures, tool, onSe
               if (drag.moved) return
               const picked = cellAt(event)
               if (!picked) return
-              if (isPlop(toolRef.current)) onBuild([picked], "place", drag.latch, false)
+              if (isPlaced(toolRef.current)) onBuild([picked], "place", drag.latch, false)
               else onSelect(picked)
             }}
             onPointerLeave={() => setHover(null)}
@@ -310,12 +342,59 @@ function orthogonalLine(from: Cell, to: Cell): Cell[] {
   return cells
 }
 
+function drawRoads(
+  context: CanvasRenderingContext2D,
+  roads: readonly { index: number; done: boolean }[],
+  size: number,
+  view: View,
+) {
+  for (const road of roads) {
+    const x = road.index % size
+    const y = (road.index - x) / size
+    paintRoadCell(context, x, y, view, road.done ? "rgba(214, 122, 42, 1)" : "rgba(255, 214, 96, 0.98)")
+  }
+}
+
+function drawRoadPreview(
+  context: CanvasRenderingContext2D,
+  cells: readonly Cell[] | null,
+  structures: readonly Structure[],
+  world: World,
+  view: View,
+) {
+  if (!cells) return
+  for (const cell of cells) {
+    const index = cell.y * world.size + cell.x
+    const ground = world.terrain[index]
+    const illegal =
+      ground === Terrain.Sea ||
+      ground === Terrain.Fresh ||
+      ground === Terrain.Mountain ||
+      structures.some((structure) => structure.tiles.includes(index))
+    paintRoadCell(context, cell.x, cell.y, view, illegal ? "rgba(232, 72, 48, 0.95)" : "rgba(255, 214, 96, 0.72)")
+  }
+}
+
+function paintRoadCell(context: CanvasRenderingContext2D, x: number, y: number, view: View, fill: string) {
+  const pad = view.zoom * 0.08
+  context.fillStyle = fill
+  context.fillRect(view.x + x * view.zoom + pad, view.y + y * view.zoom + pad, Math.max(1, view.zoom - pad * 2), Math.max(1, view.zoom - pad * 2))
+}
+
 function drawStructures(context: CanvasRenderingContext2D, structures: readonly Structure[], size: number, view: View) {
   for (const structure of structures) {
     const alpha = structure.removing ? 0.38 : structure.pending ? 0.78 : 1
     if (structure.kind === "farmstead") {
       strokeFarm(context, structure, size, view, alpha)
       if (structure.home) drawLabelBox(context, structure.home, size, view, HOME_STYLE.fill, HOME_STYLE.label, alpha)
+      continue
+    }
+    if (structure.kind === "shack") {
+      drawLabelBox(context, structure.tiles, size, view, SHACK_STYLE.fill, SHACK_STYLE.label, alpha)
+      continue
+    }
+    if (structure.kind === "construction-office") {
+      drawLabelBox(context, structure.tiles, size, view, OFFICE_STYLE.fill, OFFICE_STYLE.label, alpha)
       continue
     }
     const style = PLOP_STYLE[structure.kind]
@@ -358,9 +437,10 @@ function strokeFarm(
       context.lineTo(sx + z, sy + z)
     }
   }
-  context.strokeStyle = structure.removing ? "rgba(176, 64, 48, 0.95)" : "rgba(236, 255, 242, 0.95)"
+  const over = structure.tiles.length > FARMSTEAD_CAP
+  context.strokeStyle = structure.removing ? "rgba(176, 64, 48, 0.95)" : over ? "rgba(232, 196, 64, 0.95)" : "rgba(236, 255, 242, 0.95)"
   context.stroke()
-  context.strokeStyle = structure.removing ? "rgba(176, 64, 48, 0.55)" : "rgba(86, 168, 104, 0.7)"
+  context.strokeStyle = structure.removing ? "rgba(176, 64, 48, 0.55)" : over ? "rgba(212, 168, 32, 0.85)" : "rgba(86, 168, 104, 0.7)"
   context.stroke()
   context.restore()
 }
@@ -373,7 +453,23 @@ function drawGhost(
   world: World,
   view: View,
 ) {
-  if (!hover || !isPlop(tool)) return
+  if (!hover || !isPlaced(tool)) return
+  if (tool === "shack") {
+    const preview = shackPreview(hover.x, hover.y, world.size, world.terrain, world.feature, (index) =>
+      structures.some((structure) => structure.tiles.includes(index)),
+    )
+    if (!preview) return
+    drawLabelBox(context, preview.tiles, world.size, view, preview.open ? SHACK_STYLE.fill : "rgba(168, 48, 36, 0.9)", SHACK_STYLE.label, 0.45)
+    return
+  }
+  if (tool === "construction-office") {
+    const preview = officePreview(hover.x, hover.y, world.size, world.terrain, world.feature, (index) =>
+      structures.some((structure) => structure.tiles.includes(index)),
+    )
+    if (!preview) return
+    drawLabelBox(context, preview.tiles, world.size, view, preview.open ? OFFICE_STYLE.fill : "rgba(168, 48, 36, 0.9)", OFFICE_STYLE.label, 0.45)
+    return
+  }
   const size = world.size
   const tiles = [hover.y * size + hover.x, hover.y * size + hover.x + 1, (hover.y + 1) * size + hover.x, (hover.y + 1) * size + hover.x + 1]
   const inside = hover.x + 1 < size && hover.y + 1 < size

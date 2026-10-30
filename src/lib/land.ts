@@ -6,8 +6,11 @@ import { Feature, Terrain } from "@/lib/types"
 const SALE_PER_LEASE = 20
 /** Farmsteads above this many tiles, and every shop, post, and market, need a purse. */
 const LARGE_FARM = 1000
-/** That purse is this many years of one adult's cost of living. */
+/** That purse is this many years of one adult's cost of living, after the opening decade. */
 const WEALTH_YEARS = 5
+const OPENING_YEARS = 10
+const OPENING_MARKET = 2000
+const OPENING_HOLDING = 1000
 
 export const LAND_TYPES = ["farmland", "forest", "marginal", "urban", "coast"] as const
 export type LandType = (typeof LAND_TYPES)[number]
@@ -76,7 +79,9 @@ type Quote = {
  * Record new plots, return a dead owner's plot to the state, charge leases
  * that are due, then offer anything the state still holds.
  * Gated plots go first, largest first, each to the wealthiest buyer who can
- * pay and, for a large farm or a shop, hold five years of one adult's keep.
+ * pay. For the first ten years a market needs $2,000 and a post, workshop, or
+ * large farm needs $1,000. After that the purse is five years of one adult's keep.
+ * A shack is offered last and uses the small-farm purse rule.
  */
 export function settleHoldings(
   holdings: Holdings,
@@ -92,12 +97,15 @@ export function settleHoldings(
   adultCost = 0,
   idMap: Int32Array | null = null,
   workshopsOpen = true,
+  foundedYear = year,
 ): { holdings: Holdings; people: People; toTreasury: number } {
-  void year
   void seed
   const byId = new Map(structures.map((structure) => [structure.id, structure]))
   const rows = holdings.rows
-    .filter((row) => byId.has(row.structureId))
+    .filter((row) => {
+      const structure = byId.get(row.structureId)
+      return structure !== undefined && structure.kind !== "construction-office"
+    })
     .map((row) => ({ ...row }))
   if (idMap) {
     for (const row of rows) {
@@ -106,7 +114,7 @@ export function settleHoldings(
     }
   }
   for (const structure of structures) {
-    if (structure.pending || structure.removing) continue
+    if (structure.pending || structure.removing || structure.kind === "construction-office") continue
     if (rows.some((row) => row.structureId === structure.id)) continue
     rows.push({ structureId: structure.id, owner: -1, lease: 0, leaseMonth: month, paid: 0 })
   }
@@ -138,7 +146,7 @@ export function settleHoldings(
     const quotes = new Map(unsold.map((row) => [row.structureId, quoteFor(byId.get(row.structureId) as Structure, terrain, feature, size, schedule)]))
     const owned = new Set<number>()
     for (const row of rows) if (row.owner >= 0) owned.add(row.owner)
-    toTreasury += offerByWealth(unsold, quotes, byId, people, owned, wealth, income, incomeLog, month, adultCost, workshopsOpen)
+    toTreasury += offerByWealth(unsold, quotes, byId, people, owned, wealth, income, incomeLog, month, adultCost, workshopsOpen, year, foundedYear)
     opened = true
   }
 
@@ -155,6 +163,7 @@ export function propertyLines(
   size: number,
   schedule: LandSchedule,
 ): PropertyLine[] {
+  if (structure.kind === "construction-office") return [{ label: "Owner", value: "State" }]
   if (structure.pending) return [{ label: "Offer", value: "Not for sale yet" }]
   const row = holdings.rows.find((item) => item.structureId === structure.id)
   if (!row || row.owner < 0) {
@@ -186,6 +195,12 @@ export function plotSalePrice(
   return quote.tenure === "sale" ? quote.due : quote.due * SALE_PER_LEASE
 }
 
+/** One urban tile for a year: the lease, or a sale price divided by 20. */
+export function yearlyUrbanTile(schedule: LandSchedule): number {
+  const rate = schedule.urban
+  return rate.tenure === "lease" ? rate.price : rate.price / SALE_PER_LEASE
+}
+
 /** Lease divided by 12, or the sale price divided by 20 and then by 12. */
 export function monthlyCapital(row: Holding): number {
   if (row.lease > 0) return row.lease / 12
@@ -204,6 +219,8 @@ function offerByWealth(
   month: number,
   adultCost: number,
   workshopsOpen: boolean,
+  year: number,
+  foundedYear: number,
 ): number {
   let seekers = propertySeekers(people, owned)
   const open = [...unsold].sort((a, b) => {
@@ -219,9 +236,8 @@ function offerByWealth(
     const structure = byId.get(row.structureId) as Structure
     if (structure.kind === "workshop" && !workshopsOpen) continue
     const quote = quotes.get(row.structureId) as Quote
-    const gated = needsPurse(structure)
     const choices = seekers
-      .filter((id) => canBuy(wealth[id] ?? 0, quote, gated, adultCost))
+      .filter((id) => canBuy(wealth[id] ?? 0, quote, structure, adultCost, year, foundedYear))
       .sort((a, b) => (wealth[b] ?? 0) - (wealth[a] ?? 0) || a - b)
     const pick = choices[0]
     if (pick === undefined) continue
@@ -236,7 +252,8 @@ function offerRank(structure: Structure): number {
   if (structure.kind === "market") return 1
   if (structure.kind === "workshop") return 2
   if (structure.kind === "farmstead" && structure.tiles.length > LARGE_FARM) return 3
-  return 4
+  if (structure.kind === "farmstead") return 4
+  return 5
 }
 
 function needsPurse(structure: Structure): boolean {
@@ -267,10 +284,16 @@ function affordable(wealth: number, quote: Quote): boolean {
   return quote.due <= Math.floor((wealth * share) / 100)
 }
 
-function canBuy(wealth: number, quote: Quote, gated: boolean, adultCost: number): boolean {
+function openingPurse(structure: Structure): number {
+  if (structure.kind === "market") return OPENING_MARKET
+  return OPENING_HOLDING
+}
+
+function canBuy(wealth: number, quote: Quote, structure: Structure, adultCost: number, year: number, foundedYear: number): boolean {
   if (!affordable(wealth, quote)) return false
-  if (!gated) return true
-  return wealth >= WEALTH_YEARS * Math.max(0, Math.floor(adultCost))
+  if (!needsPurse(structure)) return true
+  const keep = year < foundedYear + OPENING_YEARS ? openingPurse(structure) : WEALTH_YEARS * Math.max(0, Math.floor(adultCost))
+  return wealth >= keep
 }
 
 function quoteFor(

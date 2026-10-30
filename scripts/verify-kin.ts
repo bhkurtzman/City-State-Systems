@@ -75,6 +75,7 @@ const retiring = people(4, (table, id) => {
 const handed = advancePeople(retiring, 2, 3, "kin-retire", emptyEpidemic(), undefined, {
   holdings: plot(0),
   adultCost: 100,
+  memberCost: 75,
   salePrice: () => plotSalePrice(farm, terrain, feature, 4, schedule),
 })
 assert("eldest son receives the plot", handed.holdings?.rows[0].owner === 2, `owner ${handed.holdings?.rows[0].owner}`)
@@ -99,6 +100,7 @@ const seeded = people(4, (table, id) => {
 const january = advancePeople(seeded, 3, 0, "kin-seed", emptyEpidemic(), undefined, {
   holdings: emptyHoldings(),
   adultCost: 100,
+  memberCost: 75,
   salePrice: () => 0,
 })
 assert("younger son receives the 20% seed", january.people.wealth[3] === 2000, String(january.people.wealth[3]))
@@ -119,7 +121,7 @@ const folded = people(4, (table, id) => {
   table.father[id] = rows.father ?? -1
   table.mother[id] = rows.mother ?? -1
 })
-const classes = classCensus(folded, 100, [{ id: 1, owner: 0, kind: "farmstead" }])
+const classes = classCensus(folded, 100, 75, [{ id: 1, owner: 0, kind: "farmstead" }])
 const economy = economyCensus(folded, [{ id: 1, owner: 0, kind: "farmstead" }])
 assert("heir's family is one household", classes.units === 1, String(classes.units))
 assert("that household is the only family", economy.familyAverage === 460, String(economy.familyAverage))
@@ -172,6 +174,7 @@ const widow = people(3, (table, id) => {
 const passed = advancePeople(widow, 4, 5, "kin-widow", emptyEpidemic(), undefined, {
   holdings: plot(1),
   adultCost: 100,
+  memberCost: 75,
   salePrice: () => 50,
 })
 assert("widow hands the purse to the son at 18", passed.people.wealth[2] === 800, String(passed.people.wealth[2]))
