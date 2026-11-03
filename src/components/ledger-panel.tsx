@@ -46,7 +46,9 @@ export function LedgerPanel({
   classes,
   homelessFamilies,
   homelessSingles,
-  landIncome,
+  ongoingExpenses,
+  capitalExpenses,
+  capitalIncome,
   land,
   onLand,
   wages,
@@ -70,8 +72,12 @@ export function LedgerPanel({
   classes: ClassCensus | null
   homelessFamilies: number | null
   homelessSingles: number | null
-  /** Land payments collected last month, or null before the first month. */
-  landIncome: number | null
+  /** Construction-office salaries over the last twelve months, or null before the first month. */
+  ongoingExpenses: number | null
+  /** Treasury resource purchases over the last twelve months, or null before the first month. */
+  capitalExpenses: number | null
+  /** Land receipts and resource sales over the last twelve months, or null before the first month. */
+  capitalIncome: number | null
   land: LandSchedule
   onLand: (type: LandType, patch: Partial<LandRate>) => void
   wages: PublicWages
@@ -87,7 +93,7 @@ export function LedgerPanel({
         ? educationRows(schooling)
         : kind === "economy"
           ? economyRows(economy, living, classes)
-          : treasuryRows(cash, landIncome)
+          : treasuryRows(cash, ongoingExpenses, capitalExpenses, capitalIncome)
   if (kind === "treasury") {
     return (
       <TreasuryPanel rows={rows} land={land} onLand={onLand} onClose={onClose} />
@@ -308,24 +314,29 @@ function band(count: number | undefined, total: number): string {
   return `${count.toLocaleString("en-US")} (${percent}%)`
 }
 
-function treasuryRows(cash: string, landIncome: number | null): Row[] {
+function treasuryMoney(amount: number | null): string {
+  if (amount === null) return BLANK
+  return `$${amount.toLocaleString("en-US")}`
+}
+
+function treasuryRows(cash: string, ongoingExpenses: number | null, capitalExpenses: number | null, capitalIncome: number | null): Row[] {
   return [
     { label: "Cash", value: cash },
     {
       label: "Ongoing expenses",
-      note: "Last month. Maintenance, salaries, and the like.",
-      value: BLANK,
+      note: "Last year. Salaries.",
+      value: treasuryMoney(ongoingExpenses),
     },
     {
       label: "Capital expenses",
-      note: "Last month. Infrastructure, equipment, and other contracts.",
-      value: BLANK,
+      note: "Last year. Purchases of resources.",
+      value: treasuryMoney(capitalExpenses),
     },
-    { label: "Tax income", note: "Last month.", value: BLANK },
+    { label: "Tax income", note: "Last year.", value: BLANK },
     {
       label: "Capital income",
-      note: "Last month. Sales of land, resources, and the like.",
-      value: landIncome === null ? BLANK : `$${landIncome.toLocaleString("en-US")}`,
+      note: "Last year. Sales of land, resources, and the like.",
+      value: treasuryMoney(capitalIncome),
     },
     { label: "Debt", value: BLANK },
     { label: "Interest rate", value: BLANK },

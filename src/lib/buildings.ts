@@ -3,9 +3,24 @@ import { Feature, Terrain } from "@/lib/types"
 /** A settled farmstead stays within this many tiles. A larger draft is outlined and dropped. */
 export const FARMSTEAD_CAP = 2000
 
-export type PlopKind = "trading-post" | "workshop" | "market"
-export type StructureKind = "farmstead" | "shack" | "construction-office" | PlopKind
+export type PlopKind = "trading-post" | "workshop" | "market" | "sawpit"
+export type StructureKind = "farmstead" | "shack" | "construction-office" | "caravan-house" | PlopKind
 export type BuildTool = StructureKind | "logging-camp" | "mining-camp" | "cart-path" | "delete"
+
+/** Standing buildings of these kinds, not ones marked for removal. Deleting one frees the slot. */
+export const BUILD_CAP: Partial<Record<BuildTool, number>> = {
+  "construction-office": 1,
+  "trading-post": 3,
+  market: 1,
+  sawpit: 1,
+}
+
+export function canBuild(structures: readonly Structure[], tool: BuildTool | null): boolean {
+  if (!tool || tool === "delete") return true
+  const cap = BUILD_CAP[tool]
+  if (cap === undefined) return true
+  return structures.filter((structure) => structure.kind === tool && !structure.removing).length < cap
+}
 
 export const BASIC_BUILDINGS: readonly { id: BuildTool; label: string; enabled: boolean }[] = [
   { id: "farmstead", label: "Farmstead", enabled: true },
@@ -14,28 +29,34 @@ export const BASIC_BUILDINGS: readonly { id: BuildTool; label: string; enabled: 
   { id: "trading-post", label: "Trading Post", enabled: true },
   { id: "logging-camp", label: "Logging Camp", enabled: false },
   { id: "mining-camp", label: "Mining Camp", enabled: false },
-  { id: "workshop", label: "Workshop", enabled: true },
   { id: "market", label: "Market", enabled: true },
+  { id: "sawpit", label: "Sawpit", enabled: true },
 ]
 
 export const PLOP_STYLE: Record<PlopKind, { fill: string; label: string }> = {
   "trading-post": { fill: "#6e4420", label: "TP" },
   workshop: { fill: "#e07a1a", label: "WS" },
   market: { fill: "#2c6cb5", label: "M" },
+  sawpit: { fill: "#a56b2f", label: "SP" },
 }
 
 export const HOME_STYLE = { fill: "#2f8a3e", label: "H" }
 export const SHACK_STYLE = { fill: HOME_STYLE.fill, label: "S" }
 export const OFFICE_STYLE = { fill: "#e0b400", label: "CO" }
+export const CARAVAN_STYLE = { fill: "#7a2f4a", label: "CH" }
 export const OFFICE_SPAN = 3
+export const CARAVAN_WIDTH = 2
+export const CARAVAN_HEIGHT = 3
 
 const STRUCTURE_NAME: Record<StructureKind, string> = {
   farmstead: "Farmstead",
   shack: "Shack",
   "construction-office": "Construction Office",
   "trading-post": "Trading Post",
+  "caravan-house": "Caravan House",
   workshop: "Workshop",
   market: "Market",
+  sawpit: "Sawpit",
 }
 
 export type Structure = {
@@ -61,12 +82,12 @@ export function emptySettlement(): Settlement {
 }
 
 export function isPlop(tool: BuildTool | null): tool is PlopKind {
-  return tool === "trading-post" || tool === "workshop" || tool === "market"
+  return tool === "trading-post" || tool === "workshop" || tool === "market" || tool === "sawpit"
 }
 
 /** A building dropped by one click: a 2×2 shop, a 1×2 shack, or a 3×3 office. */
-export function isPlaced(tool: BuildTool | null): tool is PlopKind | "shack" | "construction-office" {
-  return isPlop(tool) || tool === "shack" || tool === "construction-office"
+export function isPlaced(tool: BuildTool | null): tool is PlopKind | "shack" | "construction-office" | "caravan-house" {
+  return isPlop(tool) || tool === "shack" || tool === "construction-office" || tool === "caravan-house"
 }
 
 /** Prairie, scrub, or barren, and not a mountain. */
@@ -123,11 +144,54 @@ export function officePreview(
   return { tiles, open }
 }
 
+export type CaravanPreview = { tiles: number[]; open: boolean }
+
+/** A 2×3 caravan house with the click as the northwest corner. */
+export function caravanPreview(
+  x: number,
+  y: number,
+  size: number,
+  terrain: Uint8Array,
+  feature: Uint8Array,
+  blocked: (index: number) => boolean,
+): CaravanPreview | null {
+  if (x < 0 || y < 0 || x + CARAVAN_WIDTH > size || y + CARAVAN_HEIGHT > size) return null
+  const tiles: number[] = []
+  for (let row = 0; row < CARAVAN_HEIGHT; row++) {
+    for (let column = 0; column < CARAVAN_WIDTH; column++) tiles.push((y + row) * size + (x + column))
+  }
+  const open = tiles.every((index) => raisedGround(terrain, feature, index) && !blocked(index))
+  return { tiles, open }
+}
+
 /** Sea, a lake, a river, or wetland. Lakes and rivers are both stored as fresh water. */
 export function isWater(terrain: Uint8Array, feature: Uint8Array, index: number): boolean {
   const ground = terrain[index]
   if (ground === Terrain.Sea || ground === Terrain.Fresh) return true
   return feature[index] === Feature.Wetland
+}
+
+/** A workshop or caravan house. Wetland and mountain are refused. Woods are cleared later. */
+export function raisedGround(terrain: Uint8Array, feature: Uint8Array, index: number): boolean {
+  if (terrain[index] === Terrain.Mountain) return false
+  return !isWater(terrain, feature, index)
+}
+
+/** Woodland is 20 man-hours and 2 t. Forest is 50 man-hours and 5 t. The wood waits for the building's pantry. */
+export function coverClear(feature: Uint8Array, tiles: readonly number[]): { hours: number; wood: number } {
+  let hours = 0
+  let wood = 0
+  for (const index of tiles) {
+    const cover = feature[index]
+    if (cover === Feature.Woodland) {
+      hours += 20
+      wood += 200
+    } else if (cover === Feature.Forest) {
+      hours += 50
+      wood += 500
+    }
+  }
+  return { hours, wood }
 }
 
 /** Northwest corner plus the other three cells, or null when the footprint leaves the map. */
@@ -197,12 +261,13 @@ export function applyBuild(
   mode: "tap" | "stroke" | "place",
   latch: Set<number>,
   allowNew = false,
+  roads: ReadonlySet<number> = new Set(),
 ): Settlement {
   if (cells.length === 0 || tool === null) return settlement
   if (tool === "farmstead") {
     return mode === "tap"
-      ? tapFarm(settlement, pack(cells[0], size), size, terrain, feature)
-      : paintStroke(settlement, cells.map((cell) => pack(cell, size)), size, terrain, feature, allowNew)
+      ? tapFarm(settlement, pack(cells[0], size), size, terrain, feature, roads)
+      : paintStroke(settlement, cells.map((cell) => pack(cell, size)), size, terrain, feature, allowNew, roads)
   }
   if (tool === "delete") {
     return eraseStroke(
@@ -212,16 +277,22 @@ export function applyBuild(
       terrain,
       feature,
       latch,
+      roads,
     )
   }
   if (mode === "place" && tool === "shack") {
-    return placeShack(settlement, cells[0].x, cells[0].y, size, terrain, feature)
+    return placeShack(settlement, cells[0].x, cells[0].y, size, terrain, feature, roads)
   }
   if (mode === "place" && tool === "construction-office") {
-    return placeOffice(settlement, cells[0].x, cells[0].y, size, terrain, feature)
+    if (!canBuild(settlement.structures, tool)) return settlement
+    return placeOffice(settlement, cells[0].x, cells[0].y, size, terrain, feature, roads)
+  }
+  if (mode === "place" && tool === "caravan-house") {
+    return placeCaravan(settlement, cells[0].x, cells[0].y, size, terrain, feature, roads)
   }
   if (mode === "place" && isPlop(tool)) {
-    return placePlop(settlement, cells[0].x, cells[0].y, size, tool, terrain, feature)
+    if (!canBuild(settlement.structures, tool)) return settlement
+    return placePlop(settlement, cells[0].x, cells[0].y, size, tool, terrain, feature, roads)
   }
   return settlement
 }
@@ -266,17 +337,18 @@ function paintStroke(
   terrain: Uint8Array,
   feature: Uint8Array,
   allowNew: boolean,
+  roads: ReadonlySet<number>,
 ): Settlement {
   let next = settlement
   let canCreate = allowNew
   for (const index of indices) {
     if (findStructure(next, index) || adjacentFarms(next, index, size).length > 0) canCreate = false
     const before = next
-    next = addFarm(next, index, size, terrain, feature, canCreate)
+    next = addFarm(next, index, size, terrain, feature, canCreate, roads)
     if (next !== before) canCreate = false
   }
   if (next === settlement) return settlement
-  return closeFarms(next, size, terrain, feature)
+  return closeFarms(next, size, terrain, feature, roads)
 }
 
 function tapFarm(
@@ -285,14 +357,15 @@ function tapFarm(
   size: number,
   terrain: Uint8Array,
   feature: Uint8Array,
+  roads: ReadonlySet<number>,
 ): Settlement {
   const structure = findStructure(settlement, index)
   if (structure?.kind === "farmstead" && (structure.pending || structure.fresh.includes(index))) {
-    return closeFarms(removeTile(settlement, structure, index, terrain, feature, size), size, terrain, feature)
+    return closeFarms(removeTile(settlement, structure, index, terrain, feature, size), size, terrain, feature, roads)
   }
-  const next = addFarm(settlement, index, size, terrain, feature, true)
+  const next = addFarm(settlement, index, size, terrain, feature, true, roads)
   if (next === settlement) return settlement
-  return closeFarms(next, size, terrain, feature)
+  return closeFarms(next, size, terrain, feature, roads)
 }
 
 function addFarm(
@@ -302,9 +375,10 @@ function addFarm(
   terrain: Uint8Array,
   feature: Uint8Array,
   allowNew: boolean,
+  roads: ReadonlySet<number>,
 ): Settlement {
   if (index < 0 || index >= size * size) return settlement
-  if (findStructure(settlement, index)) return settlement
+  if (roads.has(index) || findStructure(settlement, index)) return settlement
   const near = adjacentFarms(settlement, index, size)
   if (near.length === 0) {
     if (!allowNew) return settlement
@@ -345,6 +419,7 @@ function eraseStroke(
   terrain: Uint8Array,
   feature: Uint8Array,
   latch: Set<number>,
+  roads: ReadonlySet<number>,
 ): Settlement {
   let next = settlement
   for (const index of indices) {
@@ -359,6 +434,7 @@ function eraseStroke(
       continue
     }
     if (latch.has(structure.id)) continue
+    if (structure.removing && !canBuild(next.structures, structure.kind)) continue
     latch.add(structure.id)
     next = {
       ...next,
@@ -368,7 +444,7 @@ function eraseStroke(
     }
   }
   if (next === settlement) return settlement
-  return closeFarms(next, size, terrain, feature)
+  return closeFarms(next, size, terrain, feature, roads)
 }
 
 function placePlop(
@@ -379,10 +455,15 @@ function placePlop(
   kind: PlopKind,
   terrain: Uint8Array,
   feature: Uint8Array,
+  roads: ReadonlySet<number>,
 ): Settlement {
   const tiles = plopTiles(x, y, size)
   if (!tiles) return settlement
-  if (tiles.some((index) => isWater(terrain, feature, index) || findStructure(settlement, index))) return settlement
+  const blocked = (index: number) =>
+    (kind === "workshop" ? !raisedGround(terrain, feature, index) : isWater(terrain, feature, index)) ||
+    roads.has(index) ||
+    findStructure(settlement, index) !== undefined
+  if (tiles.some(blocked)) return settlement
   return append(settlement, { kind, tiles, fresh: tiles, pending: true, removing: false, home: null })
 }
 
@@ -393,8 +474,9 @@ function placeShack(
   size: number,
   terrain: Uint8Array,
   feature: Uint8Array,
+  roads: ReadonlySet<number>,
 ): Settlement {
-  const preview = shackPreview(x, y, size, terrain, feature, (index) => findStructure(settlement, index) !== undefined)
+  const preview = shackPreview(x, y, size, terrain, feature, (index) => roads.has(index) || findStructure(settlement, index) !== undefined)
   if (!preview?.open) return settlement
   return append(settlement, {
     kind: "shack",
@@ -413,11 +495,33 @@ function placeOffice(
   size: number,
   terrain: Uint8Array,
   feature: Uint8Array,
+  roads: ReadonlySet<number>,
 ): Settlement {
-  const preview = officePreview(x, y, size, terrain, feature, (index) => findStructure(settlement, index) !== undefined)
+  const preview = officePreview(x, y, size, terrain, feature, (index) => roads.has(index) || findStructure(settlement, index) !== undefined)
   if (!preview?.open) return settlement
   return append(settlement, {
     kind: "construction-office",
+    tiles: preview.tiles,
+    fresh: preview.tiles,
+    pending: true,
+    removing: false,
+    home: null,
+  })
+}
+
+function placeCaravan(
+  settlement: Settlement,
+  x: number,
+  y: number,
+  size: number,
+  terrain: Uint8Array,
+  feature: Uint8Array,
+  roads: ReadonlySet<number>,
+): Settlement {
+  const preview = caravanPreview(x, y, size, terrain, feature, (index) => roads.has(index) || findStructure(settlement, index) !== undefined)
+  if (!preview?.open) return settlement
+  return append(settlement, {
+    kind: "caravan-house",
     tiles: preview.tiles,
     fresh: preview.tiles,
     pending: true,
@@ -483,10 +587,11 @@ function closeFarms(
   size: number,
   terrain: Uint8Array,
   feature: Uint8Array,
+  roads: ReadonlySet<number>,
 ): Settlement {
   let next = settlement
   const ids = next.structures.filter((item) => item.kind === "farmstead" && !item.removing).map((item) => item.id)
-  for (const id of ids) next = enclose(next, id, size, terrain, feature)
+  for (const id of ids) next = enclose(next, id, size, terrain, feature, roads)
   return next
 }
 
@@ -496,6 +601,7 @@ function enclose(
   size: number,
   terrain: Uint8Array,
   feature: Uint8Array,
+  roads: ReadonlySet<number>,
 ): Settlement {
   const structure = settlement.structures.find((item) => item.id === id)
   if (!structure || structure.kind !== "farmstead" || structure.removing) return settlement
@@ -560,7 +666,7 @@ function enclose(
     const y = (index - x) / size
     if (x < minX || y < minY || x > maxX || y > maxY) return
     const slot = local(x, y)
-    if (seen[slot] || queued[slot] || farm.has(index) || occupied.has(index)) return
+    if (seen[slot] || queued[slot] || farm.has(index) || occupied.has(index) || roads.has(index)) return
     queued[slot] = 1
     queue.push(index)
   }

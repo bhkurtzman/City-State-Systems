@@ -144,11 +144,12 @@ const HOUSEHOLD_START: Partial<Record<Good, number>> = {
 
 /**
  * Hundredths. A trading post opens with one year of supplies: 1 t grain,
- * 0.05 t leather, 0.05 t textiles, and 0.025 t steel tools.
+ * 0.03 t leather, 0.05 t textiles, and 0.03 t steel tools.
+ * Leather use is half of the old 0.05 t, rounded up to a hundredth.
  */
 const BUSINESS_YEAR: Partial<Record<Good, number>> = {
   grain: 100,
-  leather: 5,
+  leather: 3,
   textiles: 5,
   "steel-tools": 3,
 }
@@ -176,11 +177,11 @@ function halfShelf(target: number): number {
 }
 
 function isHousehold(kind: Structure["kind"]): boolean {
-  return kind === "farmstead" || kind === "shack" || kind === "market" || kind === "trading-post" || kind === "workshop"
+  return kind === "farmstead" || kind === "shack" || kind === "market" || kind === "trading-post" || kind === "caravan-house" || kind === "workshop" || kind === "sawpit"
 }
 
 function isBusiness(kind: Structure["kind"]): boolean {
-  return kind === "market" || kind === "workshop" || kind === "trading-post"
+  return kind === "market" || kind === "workshop" || kind === "trading-post" || kind === "caravan-house" || kind === "sawpit"
 }
 
 function emptyStore(): Record<Good, number> {
@@ -278,6 +279,7 @@ export function workFarms(
   aridity = 99,
   openingRanks: readonly ShopSpecialty[] = [],
   wealth: Int32Array | null = null,
+  buildReserve: (structureId: number) => number = () => 0,
 ): { farms: Farms; feature: Uint8Array; fertility: Uint8Array; changedLand: boolean } {
   const standing = structures.filter((structure) => !structure.pending && !structure.removing && (structure.kind === "farmstead" || structure.kind === "shack" || structure.kind === "construction-office" || isBusiness(structure.kind)))
   const ownerOf = new Map(owners.map((row) => [row.structureId, row.owner]))
@@ -309,15 +311,12 @@ export function workFarms(
     }
     const planted = record !== null
     if (!record) record = structure.kind === "farmstead" ? rollRecord(structure, land, preset, owner, seed, year, month) : stockRecord(structure, owner, seed)
+    if (structure.kind === "sawpit" && !record.specialty) record.specialty = "sawmill"
     if (structure.kind === "workshop" && !record.specialty) {
-      const cash = wealth && owner >= 0 && owner < wealth.length ? wealth[owner] ?? 0 : 0
+      const purse = wealth && owner >= 0 && owner < wealth.length ? wealth[owner] ?? 0 : 0
+      const cash = purse - Math.max(0, buildReserve(structure.id))
       const affordable = openingRanks.filter((specialty) => canFoundShop(specialty, cash))
       record.specialty = pickShopSpecialty(affordable, structure.id, seed, year, month) ?? rollSpecialty(structure.id, seed, cash) ?? undefined
-      if (record.specialty === "creamery") {
-        record.store.salt += 10
-        record.store.textiles += 10
-      }
-      if (record.specialty === "cooper") record.store.fiber += 20
     }
     if (structure.kind !== "farmstead") {
       record.owner = owner
@@ -420,18 +419,24 @@ function saltFromAridity(aridity: number): number {
 
 function openingStore(kind: Structure["kind"]): Record<Good, number> {
   const store = emptyStore()
-  if (isHousehold(kind)) {
+  if (isHousehold(kind) && kind !== "workshop") {
     for (const good of GOODS) store[good] += HOUSEHOLD_START[good] ?? 0
   }
   if (kind === "trading-post") {
     for (const good of GOODS) store[good] += BUSINESS_YEAR[good] ?? 0
+  }
+  if (kind === "caravan-house") {
+    store.grain += 200
+    store.leather += 6
+    store.textiles += 10
+    store["steel-tools"] += 6
   }
   if (kind === "farmstead") {
     store.leather += 10
     store.textiles += 10
     store["steel-tools"] += 10
   }
-  if (kind === "workshop") store["steel-tools"] += 10
+  if (kind === "sawpit") store["steel-tools"] += 10
   if (kind === "market") {
     for (const good of GOODS) {
       const target = SHELF_TARGET[good]

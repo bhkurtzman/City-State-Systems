@@ -25,6 +25,8 @@ function people(count: number, fill: (people: People, id: number) => void): Peop
     father: new Int32Array(count).fill(-1),
     livesWith: new Int32Array(count).fill(-1),
     retired: new Uint8Array(count),
+    surname: new Uint16Array(count),
+    surnames: [],
   }
   table.alive.fill(1)
   table.vigor.fill(2)

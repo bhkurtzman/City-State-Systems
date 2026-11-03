@@ -1,13 +1,18 @@
 "use client"
 
 import { Button } from "@/components/ui/button"
-import { BASIC_BUILDINGS, type BuildTool } from "@/lib/buildings"
+import { BASIC_BUILDINGS, BUILD_CAP, canBuild, type BuildTool, type Structure } from "@/lib/buildings"
 import { cn } from "@/lib/utils"
 
-export type BuildCategory = "basic" | "infrastructure"
+export type BuildCategory = "basic" | "infrastructure" | "production"
 
 const INFRASTRUCTURE: readonly { id: BuildTool; label: string; enabled: boolean }[] = [
   { id: "cart-path", label: "Cart Path", enabled: true },
+]
+
+const PRODUCTION: readonly { id: BuildTool; label: string; enabled: boolean }[] = [
+  { id: "workshop", label: "Workshop", enabled: true },
+  { id: "caravan-house", label: "Caravan House", enabled: true },
 ]
 
 export function CategoryBar({
@@ -44,6 +49,15 @@ export function CategoryBar({
       <Button
         type="button"
         size="sm"
+        variant={category === "production" ? "secondary" : "outline"}
+        aria-pressed={category === "production"}
+        onClick={() => onCategory("production")}
+      >
+        Production/Trade
+      </Button>
+      <Button
+        type="button"
+        size="sm"
         variant={tool === "delete" ? "secondary" : "outline"}
         aria-pressed={tool === "delete"}
         className="ml-auto"
@@ -58,30 +72,36 @@ export function CategoryBar({
 export function BuildingMenu({
   category,
   tool,
+  structures,
   onTool,
 }: {
   category: BuildCategory
   tool: BuildTool | null
+  structures: readonly Structure[]
   onTool: (tool: BuildTool) => void
 }) {
-  const buildings = category === "infrastructure" ? INFRASTRUCTURE : BASIC_BUILDINGS
+  const buildings = category === "infrastructure" ? INFRASTRUCTURE : category === "production" ? PRODUCTION : BASIC_BUILDINGS
   return (
     <div className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto">
-      {buildings.map((building) => (
-        <Button
-          key={building.id}
-          type="button"
-          size="sm"
-          variant={tool === building.id ? "secondary" : "outline"}
-          aria-pressed={tool === building.id}
-          disabled={!building.enabled}
-          title={building.enabled ? undefined : "Not available yet"}
-          className={cn("shrink-0", !building.enabled && "opacity-50")}
-          onClick={() => onTool(building.id)}
-        >
-          {building.label}
-        </Button>
-      ))}
+      {buildings.map((building) => {
+        const room = canBuild(structures, building.id)
+        const cap = BUILD_CAP[building.id]
+        return (
+          <Button
+            key={building.id}
+            type="button"
+            size="sm"
+            variant={tool === building.id ? "secondary" : "outline"}
+            aria-pressed={tool === building.id}
+            disabled={!building.enabled || !room}
+            title={!building.enabled ? "Not available yet" : !room && cap !== undefined ? `Limit of ${cap}` : undefined}
+            className={cn("shrink-0", (!building.enabled || !room) && "opacity-50")}
+            onClick={() => onTool(building.id)}
+          >
+            {building.label}
+          </Button>
+        )
+      })}
     </div>
   )
 }

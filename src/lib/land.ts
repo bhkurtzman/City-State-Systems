@@ -98,6 +98,7 @@ export function settleHoldings(
   idMap: Int32Array | null = null,
   workshopsOpen = true,
   foundedYear = year,
+  caravan: CaravanOffer | null = null,
 ): { holdings: Holdings; people: People; toTreasury: number } {
   void seed
   const byId = new Map(structures.map((structure) => [structure.id, structure]))
@@ -146,7 +147,7 @@ export function settleHoldings(
     const quotes = new Map(unsold.map((row) => [row.structureId, quoteFor(byId.get(row.structureId) as Structure, terrain, feature, size, schedule)]))
     const owned = new Set<number>()
     for (const row of rows) if (row.owner >= 0) owned.add(row.owner)
-    toTreasury += offerByWealth(unsold, quotes, byId, people, owned, wealth, income, incomeLog, month, adultCost, workshopsOpen, year, foundedYear)
+    toTreasury += offerByWealth(unsold, quotes, byId, people, owned, wealth, income, incomeLog, month, adultCost, workshopsOpen, year, foundedYear, rows, caravan)
     opened = true
   }
 
@@ -173,8 +174,9 @@ export function propertyLines(
       { label: "Price", value: quote.tenure === "sale" ? dollars(quote.due) : `${dollars(quote.due)} a year` },
     ]
   }
+  const houseName = people.surnames[people.surname[row.owner]]
   const lines: PropertyLine[] = [
-    { label: "Owner", value: `Family ${row.owner}` },
+    { label: "Owner", value: houseName || `Family ${row.owner}` },
     { label: "Purse", value: dollars(people.wealth[row.owner] ?? 0) },
   ]
   if (row.lease > 0) lines.push({ label: "Lease", value: `${dollars(row.lease)} a year` })
@@ -207,6 +209,15 @@ export function monthlyCapital(row: Holding): number {
   return row.paid / 240
 }
 
+type CaravanOffer = {
+  /** Dollars required besides the land price. */
+  extra: (structure: Structure) => number
+  /** A finished road reaches the map edge from this house. */
+  linked: (structure: Structure) => boolean
+  /** Man-hour bill paid to the treasury when the family buys. */
+  labor: (structure: Structure) => number
+}
+
 function offerByWealth(
   unsold: Holding[],
   quotes: Map<number, Quote>,
@@ -221,7 +232,10 @@ function offerByWealth(
   workshopsOpen: boolean,
   year: number,
   foundedYear: number,
+  rows: Holding[],
+  caravan: CaravanOffer | null,
 ): number {
+  let traders = caravanTraders(rows, byId, people)
   let seekers = propertySeekers(people, owned)
   const open = [...unsold].sort((a, b) => {
     const left = byId.get(a.structureId) as Structure
@@ -235,19 +249,57 @@ function offerByWealth(
     if (row.owner >= 0) continue
     const structure = byId.get(row.structureId) as Structure
     if (structure.kind === "workshop" && !workshopsOpen) continue
+    if (structure.kind === "caravan-house" && !caravan?.linked(structure)) continue
     const quote = quotes.get(row.structureId) as Quote
-    const choices = seekers
-      .filter((id) => canBuy(wealth[id] ?? 0, quote, structure, adultCost, year, foundedYear))
-      .sort((a, b) => (wealth[b] ?? 0) - (wealth[a] ?? 0) || a - b)
+    const builds = structure.kind === "caravan-house" || structure.kind === "workshop"
+    const extra = builds ? caravan?.extra(structure) ?? (structure.kind === "caravan-house" ? Number.POSITIVE_INFINITY : 0) : 0
+    const pool = structure.kind === "caravan-house" ? [...new Set([...traders, ...seekers])] : seekers
+    const choices = pool
+      .filter((id) => canBuy(wealth[id] ?? 0, quote, structure, adultCost, year, foundedYear, extra))
+      .sort((a, b) => Number(traders.includes(b)) - Number(traders.includes(a)) || (wealth[b] ?? 0) - (wealth[a] ?? 0) || a - b)
     const pick = choices[0]
     if (pick === undefined) continue
     paid += assign(row, quote, pick, wealth, income, incomeLog, month)
+    if ((structure.kind === "caravan-house" || structure.kind === "workshop") && caravan) {
+      const labor = caravan.labor(structure)
+      if (labor > 0 && pick < wealth.length) {
+        wealth[pick] -= labor
+        noteOperatingIncome(income, incomeLog, pick, -labor, month)
+        paid += labor
+      }
+      if (structure.kind === "caravan-house") vacatePosts(rows, byId, pick)
+    }
     seekers = seekers.filter((id) => id !== pick)
+    traders = traders.filter((id) => id !== pick)
   }
   return paid
 }
 
+/** Heads who already run a trading post. They are offered a caravan house ahead of everyone else. */
+function caravanTraders(rows: readonly Holding[], byId: Map<number, Structure>, people: People): number[] {
+  const ids: number[] = []
+  for (const row of rows) {
+    if (row.owner < 0 || ids.includes(row.owner)) continue
+    if (byId.get(row.structureId)?.kind !== "trading-post") continue
+    if (row.owner >= people.alive.length || people.alive[row.owner] === 0) continue
+    if ((people.retired?.[row.owner] ?? 0) !== 0) continue
+    ids.push(row.owner)
+  }
+  return ids
+}
+
+/** The trading post goes back to the state when its family takes a caravan house. */
+function vacatePosts(rows: Holding[], byId: Map<number, Structure>, head: number) {
+  for (const row of rows) {
+    if (row.owner !== head || byId.get(row.structureId)?.kind !== "trading-post") continue
+    row.owner = -1
+    row.lease = 0
+    row.paid = 0
+  }
+}
+
 function offerRank(structure: Structure): number {
+  if (structure.kind === "caravan-house") return -1
   if (structure.kind === "trading-post") return 0
   if (structure.kind === "market") return 1
   if (structure.kind === "workshop") return 2
@@ -289,7 +341,13 @@ function openingPurse(structure: Structure): number {
   return OPENING_HOLDING
 }
 
-function canBuy(wealth: number, quote: Quote, structure: Structure, adultCost: number, year: number, foundedYear: number): boolean {
+function canBuy(wealth: number, quote: Quote, structure: Structure, adultCost: number, year: number, foundedYear: number, extra = 0): boolean {
+  if (structure.kind === "caravan-house") return wealth >= quote.due + extra
+  if (structure.kind === "workshop") {
+    const opening = openingPurse(structure)
+    const keep = year < foundedYear + OPENING_YEARS ? opening : Math.max(opening, WEALTH_YEARS * Math.max(0, Math.floor(adultCost)))
+    return wealth >= quote.due + extra + keep
+  }
   if (!affordable(wealth, quote)) return false
   if (!needsPurse(structure)) return true
   const keep = year < foundedYear + OPENING_YEARS ? openingPurse(structure) : WEALTH_YEARS * Math.max(0, Math.floor(adultCost))

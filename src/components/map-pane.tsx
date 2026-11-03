@@ -2,7 +2,7 @@
 
 import { useEffect, useImperativeHandle, useRef, useState, type PointerEvent as ReactPointerEvent, type Ref } from "react"
 import { Card, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
-import { FARMSTEAD_CAP, HOME_STYLE, isPlaced, isWater, OFFICE_STYLE, officePreview, PLOP_STYLE, SHACK_STYLE, shackPreview, type BuildTool, type Structure } from "@/lib/buildings"
+import { CARAVAN_STYLE, caravanPreview, FARMSTEAD_CAP, HOME_STYLE, isPlaced, isWater, OFFICE_STYLE, officePreview, PLOP_STYLE, raisedGround, SHACK_STYLE, shackPreview, type BuildTool, type Structure } from "@/lib/buildings"
 import { paintLayer } from "@/lib/colors"
 import { cardinalLine } from "@/lib/roads"
 import { Terrain, type LayerId, type World } from "@/lib/types"
@@ -91,7 +91,7 @@ export function MapPane({ world, layer, cell, generation, structures, roads, too
     drawStructures(context, structuresRef.current, current.size, view)
     const roadLine = previewRef.current ?? (toolRef.current === "cart-path" && hoverRef.current ? [hoverRef.current] : null)
     drawRoadPreview(context, roadLine, structuresRef.current, current, view)
-    drawGhost(context, hoverRef.current, toolRef.current, structuresRef.current, current, view)
+    drawGhost(context, hoverRef.current, toolRef.current, structuresRef.current, roadsRef.current, current, view)
     const selected = cellRef.current
     if (!selected) return
     const sx = view.x + selected.x * view.zoom
@@ -397,6 +397,10 @@ function drawStructures(context: CanvasRenderingContext2D, structures: readonly 
       drawLabelBox(context, structure.tiles, size, view, OFFICE_STYLE.fill, OFFICE_STYLE.label, alpha)
       continue
     }
+    if (structure.kind === "caravan-house") {
+      drawLabelBox(context, structure.tiles, size, view, CARAVAN_STYLE.fill, CARAVAN_STYLE.label, alpha)
+      continue
+    }
     const style = PLOP_STYLE[structure.kind]
     drawLabelBox(context, structure.tiles, size, view, style.fill, style.label, alpha)
   }
@@ -450,24 +454,29 @@ function drawGhost(
   hover: Cell | null,
   tool: BuildTool | null,
   structures: readonly Structure[],
+  roads: readonly { index: number }[],
   world: World,
   view: View,
 ) {
   if (!hover || !isPlaced(tool)) return
+  const paved = new Set(roads.map((road) => road.index))
+  const taken = (index: number) => paved.has(index) || structures.some((structure) => structure.tiles.includes(index))
   if (tool === "shack") {
-    const preview = shackPreview(hover.x, hover.y, world.size, world.terrain, world.feature, (index) =>
-      structures.some((structure) => structure.tiles.includes(index)),
-    )
+    const preview = shackPreview(hover.x, hover.y, world.size, world.terrain, world.feature, taken)
     if (!preview) return
     drawLabelBox(context, preview.tiles, world.size, view, preview.open ? SHACK_STYLE.fill : "rgba(168, 48, 36, 0.9)", SHACK_STYLE.label, 0.45)
     return
   }
   if (tool === "construction-office") {
-    const preview = officePreview(hover.x, hover.y, world.size, world.terrain, world.feature, (index) =>
-      structures.some((structure) => structure.tiles.includes(index)),
-    )
+    const preview = officePreview(hover.x, hover.y, world.size, world.terrain, world.feature, taken)
     if (!preview) return
     drawLabelBox(context, preview.tiles, world.size, view, preview.open ? OFFICE_STYLE.fill : "rgba(168, 48, 36, 0.9)", OFFICE_STYLE.label, 0.45)
+    return
+  }
+  if (tool === "caravan-house") {
+    const preview = caravanPreview(hover.x, hover.y, world.size, world.terrain, world.feature, taken)
+    if (!preview) return
+    drawLabelBox(context, preview.tiles, world.size, view, preview.open ? CARAVAN_STYLE.fill : "rgba(168, 48, 36, 0.9)", CARAVAN_STYLE.label, 0.45)
     return
   }
   const size = world.size
@@ -477,8 +486,8 @@ function drawGhost(
     !inside ||
     tiles.some(
       (index) =>
-        isWater(world.terrain, world.feature, index) ||
-        structures.some((structure) => structure.tiles.includes(index)),
+        (tool === "workshop" ? !raisedGround(world.terrain, world.feature, index) : isWater(world.terrain, world.feature, index)) ||
+        taken(index),
     )
   const style = PLOP_STYLE[tool]
   const sx = view.x + hover.x * view.zoom

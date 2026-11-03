@@ -14,6 +14,12 @@ const WOODLAND_YIELD = 200
 const FOREST_YIELD = 500
 const WETLAND_WOOD = 100
 const SUPPLY_LOT = 10
+/** A staffed office keeps these on hand for buildings under construction. */
+const OFFICE_PANTRY: readonly { good: Good; hundredths: number }[] = [
+  { good: "lumber", hundredths: 5000 },
+  { good: "steel-parts", hundredths: 50 },
+  { good: "textiles", hundredths: 20 },
+]
 
 export type RoadTile = {
   index: number
@@ -209,8 +215,22 @@ export function projectLines(
   ]
 }
 
-/** Wood the project cannot cover, plus a November top-up of tools and leather to 0.1 t. */
-export function supplyOrders(book: RoadBook, farms: Farms, structures: readonly Structure[], month: number): StateNeed[] {
+/** What a staffed office still needs to reach its lumber, steel parts, and textiles. */
+export function pantryOrders(farms: Farms, structures: readonly Structure[], staffed: ReadonlySet<number>): StateNeed[] {
+  const orders: StateNeed[] = []
+  for (const structure of structures) {
+    if (structure.kind !== "construction-office" || structure.pending || structure.removing || !staffed.has(structure.id)) continue
+    const row = farms.rows.find((item) => item.structureId === structure.id)
+    if (!row) continue
+    for (const item of OFFICE_PANTRY) {
+      const held = row.store[item.good] ?? 0
+      if (held < item.hundredths) orders.push({ structureId: structure.id, good: item.good, hundredths: item.hundredths - held })
+    }
+  }
+  return orders
+}
+
+export function supplyOrders(book: RoadBook, farms: Farms, structures: readonly Structure[], month: number, staffed: ReadonlySet<number> = new Set()): StateNeed[] {
   const orders: StateNeed[] = []
   const standing = structures.filter((structure) => structure.kind === "construction-office" && !structure.pending && !structure.removing)
   for (const structure of standing) {
@@ -230,6 +250,7 @@ export function supplyOrders(book: RoadBook, farms: Farms, structures: readonly 
     const short = need - yieldWood - (row.store.wood ?? 0)
     if (short > 0) orders.push({ structureId: structure.id, good: "wood", hundredths: short })
   }
+  orders.push(...pantryOrders(farms, structures, staffed))
   return orders
 }
 

@@ -1,5 +1,6 @@
 import type { Holding, Holdings } from "@/lib/land"
 import { hashSeed, mulberry32 } from "@/lib/noise"
+import { foundingSurnames } from "@/lib/surnames"
 
 export const Sex = {
   Female: 0,
@@ -117,6 +118,10 @@ export type People = {
   livesWith: Int32Array
   /** 1 after a parent has handed the household to a child. */
   retired: Uint8Array
+  /** Index into `surnames`. A wife takes her husband's. A child takes the father's. */
+  surname: Uint16Array
+  /** Family names for this people. Founding writes one per family. */
+  surnames: readonly string[]
 }
 
 /** Plots, prices, and the adult cost of living for one month of kinship. Founding passes null. */
@@ -141,6 +146,7 @@ export const OCCUPATION = {
   unemployed: 6,
   retired: 7,
   laborer: 8,
+  teamster: 9,
 } as const
 
 export const OCCUPATION_LABEL = [
@@ -153,19 +159,22 @@ export const OCCUPATION_LABEL = [
   "Unemployed",
   "Retired",
   "Laborer",
+  "Teamster",
 ] as const
 
 /** A house someone lives in. The lowest id is the oldest, and that one sets the job. */
 export type HouseholdHome = {
   id: number
   owner: number
-  kind: "farmstead" | "market" | "trading-post" | "workshop" | "shack"
+  kind: "farmstead" | "market" | "trading-post" | "workshop" | "shack" | "caravan-house" | "sawpit"
 }
 
 const HOME_JOB: Record<HouseholdHome["kind"], number> = {
   farmstead: OCCUPATION.farmer,
   "trading-post": OCCUPATION.trader,
+  "caravan-house": OCCUPATION.trader,
   workshop: OCCUPATION.craftsman,
+  sawpit: OCCUPATION.craftsman,
   market: OCCUPATION.shopkeeper,
   shack: OCCUPATION.unemployed,
 }
@@ -436,7 +445,9 @@ export function householdHomes(
       structure.kind !== "farmstead" &&
       structure.kind !== "market" &&
       structure.kind !== "trading-post" &&
+      structure.kind !== "caravan-house" &&
       structure.kind !== "workshop" &&
+      structure.kind !== "sawpit" &&
       structure.kind !== "shack"
     ) {
       continue
@@ -454,7 +465,7 @@ export function householdHomes(
  * and so do the eldest son still in his father's house and that son's wife.
  * The oldest house wins when the household owns more than one. Everyone else
  * is Idle under 18 and Unemployed at 18. A listed laborer whose house did not
- * give him a job is then a Laborer.
+ * give him a job is then a Laborer. A caravan hand in the same position is a Teamster.
  */
 const NO_LABORERS: ReadonlySet<number> = new Set()
 
@@ -463,6 +474,7 @@ export function assignOccupations(
   homes: readonly HouseholdHome[],
   schools: SchoolSession = NO_SCHOOLS,
   laborers: ReadonlySet<number> = NO_LABORERS,
+  teamsters: ReadonlySet<number> = NO_LABORERS,
 ): People {
   const byOwner = new Map<number, { id: number; job: number }[]>()
   for (const home of homes) {
@@ -491,6 +503,7 @@ export function assignOccupations(
     if (job !== null) occupation[i] = job
     else occupation[i] = people.age[i] < MIN_ADULT_AGE ? OCCUPATION.idle : OCCUPATION.unemployed
     if (laborers.has(i) && occupation[i] === OCCUPATION.unemployed) occupation[i] = OCCUPATION.laborer
+    if (teamsters.has(i) && occupation[i] === OCCUPATION.unemployed) occupation[i] = OCCUPATION.teamster
   }
   return { ...people, occupation }
 }
@@ -798,7 +811,8 @@ function median(values: readonly number[]): number | null {
  * Ages 6 and older then roll an education level from their intellect.
  * The father then starts the household purse from that education and his age.
  * Children of 16 or 17 start with $50, and unmarried children of 18 or older with $100.
- * The same seed and founder always rebuild it.
+ * Each founding family draws one surname from the selected lineage banks.
+ * The husband, wife, and children share it. The same seed and founder always rebuild it.
  */
 export function foundPeople(
   seed: string,
@@ -807,8 +821,14 @@ export function foundPeople(
   openingYear: number,
   openingMonth: number,
   difficulty: DifficultyId,
+  lineages: readonly string[] = [],
 ): { people: People; epidemic: Epidemic } {
   const rng = mulberry32(hashSeed(`${seed}|${founderId}|families`))
+  const surnames = foundingSurnames(
+    mulberry32(hashSeed(`${seed}|${[...lineages].sort().join("|")}|${families}|surnames`)),
+    lineages,
+    families,
+  )
   const age: number[] = []
   const sex: number[] = []
   const birthMonth: number[] = []
@@ -819,6 +839,7 @@ export function foundPeople(
   const spouse: number[] = []
   const mother: number[] = []
   const father: number[] = []
+  const house: number[] = []
 
   for (let family = 0; family < families; family++) {
     const couple = rollCouple(rng)
@@ -826,6 +847,7 @@ export function foundPeople(
     const fatherId = motherId + 1
     add(age, sex, birthMonth, cooldown, vigor, intellect, willpower, spouse, mother, father, couple.mother, Sex.Female, fatherId, -1, -1)
     add(age, sex, birthMonth, cooldown, vigor, intellect, willpower, spouse, mother, father, couple.father, Sex.Male, motherId, -1, -1)
+    house.push(family, family)
 
     const younger = Math.min(couple.mother, couple.father)
     const chance = motherFertility(couple.mother)
@@ -835,6 +857,7 @@ export function foundPeople(
       const childAge = younger - bornWhenYoungerWas
       const childSex = rng() < 0.5 ? Sex.Female : Sex.Male
       add(age, sex, birthMonth, cooldown, vigor, intellect, willpower, spouse, mother, father, childAge, childSex, -1, motherId, fatherId)
+      house.push(family)
       children += 1
       if (children >= MAX_CHILDREN) break
     }
@@ -864,7 +887,7 @@ export function foundPeople(
   }
 
   const step = advancePeople(
-    pack(age, sex, birthMonth, cooldown, vigor, intellect, willpower, spouse, mother, father),
+    pack(age, sex, birthMonth, cooldown, vigor, intellect, willpower, spouse, mother, father, house, surnames),
     openingYear,
     openingMonth,
     seed,
@@ -999,6 +1022,8 @@ export function advancePeople(
   const father = new Int32Array(people.father)
   const livesWith = livesWithColumn(people, count)
   const retired = retiredColumn(people, count)
+  const surname = new Uint16Array(people.surname)
+  const surnames = people.surnames
   const rows = kin ? kin.holdings.rows.map((row) => ({ ...row })) : null
   const wave = resolveEpidemic(epidemic, year, month, seed)
 
@@ -1079,6 +1104,7 @@ export function advancePeople(
     if (marriages() >= accept) continue
     spouse[i] = wife
     spouse[wife] = i
+    surname[wife] = surname[i]
     wealth[i] += wealth[wife]
     wealth[wife] = 0
     mergeIncome(income, incomeLog, i, wife)
@@ -1135,6 +1161,8 @@ export function advancePeople(
       father,
       livesWith,
       retired,
+      surname,
+      surnames,
     }
   } else {
     const grownCount = count + born.length
@@ -1159,6 +1187,8 @@ export function advancePeople(
       father: new Int32Array(grownCount),
       livesWith: new Int32Array(grownCount),
       retired: new Uint8Array(grownCount),
+      surname: new Uint16Array(grownCount),
+      surnames,
     }
     grown.age.set(age)
     grown.sex.set(sex)
@@ -1181,6 +1211,7 @@ export function advancePeople(
     grown.livesWith.set(livesWith)
     grown.livesWith.fill(-1, count)
     grown.retired.set(retired)
+    grown.surname.set(surname)
     for (let i = 0; i < born.length; i++) {
       const at = count + i
       const child = born[i]
@@ -1201,6 +1232,7 @@ export function advancePeople(
       grown.father[at] = child.fatherId
       grown.livesWith[at] = -1
       grown.retired[at] = 0
+      grown.surname[at] = surname[child.fatherId]
     }
     next = grown
   }
@@ -1647,6 +1679,8 @@ function kinView(state: KinState): People {
     father: state.father,
     livesWith: state.livesWith,
     retired: state.retired,
+    surname: new Uint16Array(count),
+    surnames: [],
   }
 }
 
@@ -1829,6 +1863,7 @@ export function purgeUnlinkedDead(people: People): { people: People; idMap: Int3
   const livesWith = new Int32Array(kept)
   livesWith.fill(-1)
   const retired = new Uint8Array(kept)
+  const surname = new Uint16Array(kept)
   for (let i = 0; i < count; i++) {
     const at = map[i]
     if (at < 0) continue
@@ -1853,6 +1888,7 @@ export function purgeUnlinkedDead(people: People): { people: People; idMap: Int3
     const homeId = people.livesWith?.[i] ?? -1
     livesWith[at] = homeId < 0 ? -1 : map[homeId]
     retired[at] = people.retired?.[i] ?? 0
+    surname[at] = people.surname[i]
   }
   return {
     people: {
@@ -1876,6 +1912,8 @@ export function purgeUnlinkedDead(people: People): { people: People; idMap: Int3
       father,
       livesWith,
       retired,
+      surname,
+      surnames: people.surnames,
     },
     idMap: map,
   }
@@ -2291,6 +2329,8 @@ function pack(
   spouse: number[],
   mother: number[],
   father: number[],
+  house: number[],
+  surnames: readonly string[],
 ): People {
   return {
     age: Uint8Array.from(age),
@@ -2313,6 +2353,8 @@ function pack(
     father: Int32Array.from(father),
     livesWith: new Int32Array(age.length).fill(-1),
     retired: new Uint8Array(age.length),
+    surname: Uint16Array.from(house),
+    surnames,
   }
 }
 
