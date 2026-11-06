@@ -2,7 +2,7 @@
 export const CELL_M = 10
 export const CHUNK = 256
 
-export const SIZES = [256, 512, 1024] as const
+export const SIZES = [512, 1024, 2048] as const
 export type MapSize = (typeof SIZES)[number]
 
 export const Terrain = {

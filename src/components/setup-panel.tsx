@@ -22,7 +22,7 @@ import {
   formatGrowing,
   type PresetId,
 } from "@/lib/climate"
-import type { ClimateIndices, Coast, MapSize, MonthClimate } from "@/lib/types"
+import { SIZES, type ClimateIndices, type Coast, type MapSize, type MonthClimate } from "@/lib/types"
 
 const COASTS: { id: Coast; label: string }[] = [
   { id: "none", label: "No coast" },
@@ -32,11 +32,11 @@ const COASTS: { id: Coast; label: string }[] = [
   { id: "west", label: "West coast" },
 ]
 
-const SIZES: { id: MapSize; label: string }[] = [
-  { id: 256, label: "Small · 256×256 · 2.56 km" },
-  { id: 512, label: "Medium · 512×512 · 5.12 km" },
-  { id: 1024, label: "Large · 1024×1024 · 10.24 km" },
-]
+const SIZE_LABEL: Record<MapSize, string> = {
+  512: "Small · 512×512 · 5.12 km",
+  1024: "Medium · 1024×1024 · 10.24 km",
+  2048: "Large · 2048×2048 · 20.48 km",
+}
 
 type SetupPanelProps = {
   presetId: PresetId
@@ -248,9 +248,8 @@ export function SetupPanel(props: SetupPanelProps) {
             <Select
               value={String(props.size)}
               onValueChange={(value) => {
-                if (value === "256" || value === "512" || value === "1024") {
-                  props.onSize(Number(value) as MapSize)
-                }
+                const next = Number(value)
+                if (SIZES.includes(next as MapSize)) props.onSize(next as MapSize)
               }}
             >
               <SelectTrigger id="size" className="w-full">
@@ -258,8 +257,8 @@ export function SetupPanel(props: SetupPanelProps) {
               </SelectTrigger>
               <SelectContent>
                 {SIZES.map((size) => (
-                  <SelectItem key={size.id} value={String(size.id)}>
-                    {size.label}
+                  <SelectItem key={size} value={String(size)}>
+                    {SIZE_LABEL[size]}
                   </SelectItem>
                 ))}
               </SelectContent>

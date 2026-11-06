@@ -264,11 +264,12 @@ export function climateFactor(indices: ClimateIndices): number {
 }
 
 export function aridityLabel(aridity: number): string {
-  if (aridity < 0.05) return "Hyper-arid"
-  if (aridity < 0.2) return "Arid"
-  if (aridity < 0.5) return "Semi-arid"
-  if (aridity < 0.65) return "Dry sub-humid"
-  return "Humid"
+  if (aridity < 0.1) return "Dry"
+  if (aridity < 0.4) return "Arid"
+  if (aridity < 0.8) return "Semi-Arid"
+  if (aridity < 1) return "Semi-Humid"
+  if (aridity <= 1.5) return "Humid"
+  return "Wet"
 }
 
 export function formatGrowing(monthsCount: number): string {

@@ -89,4 +89,4 @@ People are columns of typed arrays. Money is whole dollars. Barn stock is hundre
 - `scripts/verify-map.ts` checks map generation. `npm run dev` serves the app. `npm run verify` runs that map check.
  
  Next Steps (as of 10/30/2026):
- Shacks and the construction office are in place. The office pantry is empty. The next step is stocking construction supplies.
+ 

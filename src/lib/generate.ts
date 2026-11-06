@@ -3,6 +3,7 @@ import { clamp, createNoise, hashSeed, mulberry32, smoothstep, type Noise } from
 import {
   Feature,
   Resource,
+  SIZES,
   Terrain,
   type Coast,
   type GenerateRequest,
@@ -34,6 +35,11 @@ const FLOOD_EPS = 0.012
 const SEA_LEVEL = 0.32
 const LAKE_MIN_AREA = 16
 const OPEN_RADIUS = 6
+const STREAM_HEAD_GAP = 8
+/** A river with this many headwaters will not end in a pond. */
+const RIVER_LAKE_HEADS = 8
+/** Minimum lake cells per headwater before a large river may stop there. */
+const RIVER_LAKE_CELLS_PER_HEAD = 32
 
 class MinHeap {
   private pri: number[] = []
@@ -154,60 +160,69 @@ function keepSeaOnEdge(sea: Uint8Array, width: number, height: number) {
   }
 }
 
-function uplandAt(
-  noise: Noise,
-  x: number,
-  y: number,
-  span: number,
-  coast: Coast,
-  relief: number,
-  reliefAmp: number,
-  ridgeGate: number,
-): { lift: number; kind: number } {
-  const reliefT = clamp(relief, 0, 100) / 100
-  if (reliefT < 0.1 || ridgeGate <= 0) return { lift: 0, kind: Terrain.Flat }
+/** Land fully surrounded by sea is ocean, not a lake basin. */
+function fillSeaHoles(sea: Uint8Array, width: number, height: number) {
+  const n = width * height
+  const open = new Uint8Array(n)
+  const stack = new Int32Array(n)
+  let top = 0
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      if (x !== 0 && y !== 0 && x !== width - 1 && y !== height - 1) continue
+      const i = y * width + x
+      if (sea[i]) continue
+      open[i] = 1
+      stack[top++] = i
+    }
+  }
+  while (top > 0) {
+    const i = stack[--top]
+    const x = i % width
+    const y = (i / width) | 0
+    for (let k = 0; k < 4; k++) {
+      const nx = x + DX[k]
+      const ny = y + DY[k]
+      if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue
+      const j = ny * width + nx
+      if (sea[j] || open[j]) continue
+      open[j] = 1
+      stack[top++] = j
+    }
+  }
+  for (let i = 0; i < n; i++) {
+    if (!sea[i] && !open[i]) sea[i] = 1
+  }
+}
 
-  const hillPresence = smoothstep(0.1, 0.36, reliefT)
-  const mountainPresence = smoothstep(0.26, 0.55, reliefT)
-  const band = smoothstep(0.5, 0.95, reliefT)
-  const warpFreq = 1 / (span * 0.6)
-  const wx = noise.simplex(x * warpFreq, y * warpFreq)
-  const wy = noise.simplex(x * warpFreq + 19.2, y * warpFreq + 7.4)
-  const px = x + wx * span * 0.05
-  const py = y + wy * span * 0.05
-  const along = coast === "east" || coast === "west" ? Math.PI / 2 : 0
-  const bend = coast === "none" ? 0.45 : 0.35
-  const turn = along + noise.simplex(x / (span * 0.8) + 4.2, y / (span * 0.8) + 8.1) * bend
-  const c = Math.cos(turn)
-  const s = Math.sin(turn)
-  const length = span * 0.85
-  const width = span * 0.82
-  const rx = px * c - py * s
-  const ry = px * s + py * c
-  const sharp = noise.ridged(rx / length, ry / width, 1)
-  const spine = Math.pow(Math.max(sharp, 0), 0.84 - 0.3 * band)
-  const faded = spine * (0.55 + 0.45 * ridgeGate) * (0.72 + 0.28 * hillPresence)
-  const roughScale = span * (0.1 + 0.04 * (1 - reliefT))
-  const rough = Math.pow(
-    Math.max(noise.ridged(px / roughScale + 6, py / (roughScale * 0.85) + 14, 1), 0),
-    0.75,
-  )
-  const jagged = smoothstep(0.55, 0.84, rough)
-  const crestBase = smoothstep(0.72 - 0.24 * band, 0.9 - 0.1 * band, faded)
-  const breakT = smoothstep(0.32, 0.5, reliefT) * (1 - smoothstep(0.6, 0.84, reliefT))
-  const crest = crestBase * (1 - breakT * 0.5 * (1 - jagged))
-  const foothill = smoothstep(0.58 - 0.22 * band, 0.78 - 0.14 * band, faded)
-  const broad = Math.pow(
-    Math.max(noise.ridged(px / (span * 0.22) + 3, py / (span * 0.18) + 11, 1), 0),
-    0.65,
-  )
-  const clump = noise.fbm01(px / (span * 0.34) + 2, py / (span * 0.34) + 8, 2)
-  const hillMask = smoothstep(0.55 - 0.16 * reliefT, 0.78 - 0.1 * reliefT, clump)
-  const extra = smoothstep(0.66, 0.86, broad) * hillMask * smoothstep(0.34, 0.75, reliefT) * ridgeGate
-  const lift = (crest + foothill * 0.48) * reliefAmp + extra * reliefAmp * 0.55
-  if (crest >= 0.4 && mountainPresence >= 0.4) return { lift, kind: Terrain.Mountain }
-  if (foothill >= 0.4 || extra >= 0.48) return { lift, kind: Terrain.Hill }
-  return { lift, kind: Terrain.Flat }
+/** Fixed meters: 400 m ridges, 200 m spurs, 80 m crests. A cell is 10 m. */
+const RIDGE_SCALES = [40, 20, 8]
+
+function rangeAt(noise: Noise, x: number, y: number, reliefT: number, hillScale: number): { lift: number; kind: number } {
+  const coverage = smoothstep(0.1, 0.95, reliefT)
+  if (coverage <= 0) return { lift: 0, kind: Terrain.Flat }
+  const plateau = noise.fbm01(x / hillScale, y / hillScale, 2)
+  // High bar at low relief, so hills are rare peaks with plains between them.
+  const hillCut = 0.86 - 0.5 * coverage
+  const present = smoothstep(hillCut, Math.min(0.98, hillCut + 0.16), plateau)
+  if (present <= 0.04) return { lift: 0, kind: Terrain.Flat }
+  let ridge = 0
+  let weight = 0
+  let amp = 1
+  for (const scale of RIDGE_SCALES) {
+    ridge += amp * noise.ridged(x / scale + 2.2, y / scale + 6.4, 1)
+    weight += amp
+    amp *= 0.55
+  }
+  ridge /= weight
+  const coarse = noise.ridged(x / 40 + 2.2, y / 40 + 6.4, 1)
+  const fine = noise.ridged(x / 8 + 1.7, y / 8 + 4.1, 1)
+  const ridgeAmp = (0.02 + 0.14 * reliefT) * coverage
+  const lift = present * (0.012 + ridgeAmp * (0.32 + 0.68 * ridge)) * coverage
+  const mountainT = smoothstep(0.38, 0.92, reliefT)
+  const crestCut = 0.84 - 0.16 * mountainT
+  const crest = mountainT > 0 && coarse > crestCut && fine > 0.5 - 0.15 * mountainT && present > 0.5
+  if (crest) return { lift, kind: Terrain.Mountain }
+  return { lift, kind: Terrain.Hill }
 }
 
 function buildElevation(
@@ -224,12 +239,9 @@ function buildElevation(
   const elev = new Float32Array(n)
   const sea = new Uint8Array(n)
   const upland = new Uint8Array(n)
-  const reliefAmp = 0.05 + (clamp(relief, 0, 100) / 100) * 0.58
+  const reliefT = clamp(relief, 0, 100) / 100
   const humid = smoothstep(0.08, 1.05, aridity)
   const span = Math.min(width, height)
-  const riseFull = span * 0.55
-  const taperNear = span * 0.012
-  const taperFar = span * 0.45
 
   if (coast !== "none") {
     for (let y = 0; y < height; y++) {
@@ -239,6 +251,7 @@ function buildElevation(
       }
     }
     keepSeaOnEdge(sea, width, height)
+    fillSeaHoles(sea, width, height)
   }
 
   const fromSea = coast === "none" ? null : edt(sea, width, height)
@@ -249,28 +262,27 @@ function buildElevation(
     }
     for (let x = 0; x < width; x++) {
       const i = y * width + x
-      const roll = noise.fbm01(x / (span * 0.42), y / (span * 0.42), 3)
-      const bowlN = noise.fbm01(x / (span * 0.5) + 17, y / (span * 0.5) + 4, 3)
-      const bowl = smoothstep(0.48, 0.22, bowlN)
-      const bowlIrreg = noise.fbm01(x / (span * 0.18) + 6, y / (span * 0.18), 2)
-      const bowlDepth = bowl * (0.03 + 0.08 * humid + 0.09 * smoothstep(0.22, 0.82, bowlIrreg))
       if (sea[i]) {
         const bath = noise.fbm01(x / (span * 0.16) + 2, y / (span * 0.16), 2)
         elev[i] = clamp(SEA_LEVEL - 0.02 - bath * 0.035, 0, SEA_LEVEL - 0.008)
         continue
       }
-      let ridgeGate = 1
-      let base = 0.5 + (roll - 0.5) * 0.1
+      const inland = fromSea ? clamp(fromSea[i] / (span * 0.7), 0, 1) : 1 - y / Math.max(1, height - 1)
+      const ramp = (fromSea ? SEA_LEVEL + 0.02 : 0.06) + 0.24 * inland
+      const range = rangeAt(noise, x, y, reliefT, span * 0.45)
+      let lift = range.lift
+      let kind = range.kind
       if (fromSea) {
-        const distance = fromSea[i]
-        const shelf = smoothstep(0, riseFull, distance)
-        ridgeGate = smoothstep(taperNear, taperFar, distance)
-        base = SEA_LEVEL + 0.012 + shelf * 0.055 + (roll - 0.5) * 0.035
+        const gate = smoothstep(28, 150, fromSea[i])
+        lift *= gate
+        if (gate < 0.45) kind = Terrain.Flat
       }
-      const range = uplandAt(noise, x, y, span, coast, relief, reliefAmp, ridgeGate)
-      const bowls = bowlDepth * (range.kind === Terrain.Mountain ? 0.25 : 1) * ridgeGate
-      upland[i] = range.kind
-      elev[i] = clamp(base + range.lift - bowls, 0, 1)
+      const swell = (noise.fbm01(x / 280 + 4, y / 280 + 9, 2) - 0.5) * (0.012 + 0.04 * humid)
+      const pocketScale = span * (90 / 1024)
+      const pocket = smoothstep(0.15, 0.05, noise.fbm01(x / pocketScale + 11, y / pocketScale + 3, 2)) * humid * 0.32
+      upland[i] = kind
+      elev[i] = clamp(ramp + lift + swell - pocket, 0, 1)
+      if (fromSea && fromSea[i] <= 36) elev[i] = Math.max(elev[i], SEA_LEVEL + 0.012)
     }
   }
   return { elev, sea, upland }
@@ -369,6 +381,10 @@ function markBasins(
   const n = width * height
   const lake = new Uint8Array(n)
   const failed = new Uint8Array(n)
+  const lakeArea = new Int32Array(n)
+  const lakeId = new Int32Array(n)
+  lakeId.fill(-1)
+  const basinPool = new Uint8Array(n)
   const flooded = new Uint8Array(n)
   for (let i = 0; i < n; i++) {
     if (!sea[i] && water[i] - elev[i] > FLOOD_EPS) flooded[i] = 1
@@ -376,6 +392,8 @@ function markBasins(
   const pour = new Int32Array(n)
   pour.fill(-2)
   const minDepth = lakeMinDepth(aridity)
+  const minLake = Math.max(1, Math.round(LAKE_MIN_AREA * (width / 1024) ** 2))
+  const minBasin = Math.max(1, Math.round(8 * (width / 1024) ** 2))
   const maxLake = Math.floor(n * 0.08)
   const maxSink = Math.floor(n * 0.04)
 
@@ -420,8 +438,8 @@ function markBasins(
     }
     const depth = spill - minElev
     const area = cells.length
-    if (area < 8 || depth < 0.03) continue
-    if (area >= LAKE_MIN_AREA && area <= maxLake && depth >= minDepth) {
+    if (area < minBasin || depth < 0.03) continue
+    if (area >= minLake && area <= maxLake && depth >= minDepth) {
       let marked = 0
       for (const i of cells) {
         if (water[i] - elev[i] > FLOOD_EPS) {
@@ -429,16 +447,27 @@ function markBasins(
           marked++
         }
       }
-      if (marked >= LAKE_MIN_AREA) lakeBasins++
-      else {
+      if (marked >= minLake) {
+        const id = lakeBasins++
+        for (const i of cells) {
+          if (!lake[i]) continue
+          lakeArea[i] = marked
+          lakeId[i] = id
+        }
+      } else {
         for (const i of cells) lake[i] = 0
       }
       continue
     }
     if (area > maxSink) continue
-    for (const i of cells) failed[i] = 1
+    const wet = smoothstep(0.4, 2, aridity)
+    const reach = 0.0065 * wet
+    for (const i of cells) {
+      failed[i] = 1
+      if (wet > 0 && elev[i] <= minElev + reach) basinPool[i] = 1
+    }
   }
-  return { lake, failed, lakeBasins }
+  return { lake, failed, lakeBasins, lakeArea, lakeId, basinPool }
 }
 
 function boxBlur(src: Float32Array, width: number, height: number, radius: number): Float32Array {
@@ -532,7 +561,8 @@ function flowDown(
     else surface[i] = water[i]
   }
   const span = Math.min(width, height)
-  const radius = guide ? 2 : Math.max(4, Math.round(span * 0.028))
+  // 7 cells is 70 m. A blur that grows with the map erases gullies on large maps.
+  const radius = guide ? 2 : 7
   const field = boxBlur(surface, width, height, radius)
   const meanderScale = Math.max(16, Math.round(span * 0.14))
   const valleyScale = Math.max(28, Math.round(span * 0.22))
@@ -651,37 +681,100 @@ function traceRivers(
     if (indeg[d] === 0) queue[qt++] = d
   }
 
-  const span = Math.min(width, height)
   const reliefT = clamp(relief, 0, 100) / 100
-  const areaScale = (span / 256) * (span / 256)
-  // Cells are 10 m on every map, so a catchment that grows with map area
-  // hides hill and mountain streams on large maps. Ease that growth.
-  const steepScale = (span / 256) ** 1.5
+  // Each cell is 10 m, so these counts are a fixed catchment area on every map.
   const moisture = streamMoisture(annualPrecip, aridity)
   const drain = 2.4 - 2 * moisture
-  const steepMin = Math.max(20, Math.round((70 + 260 * reliefT * reliefT) * steepScale * drain))
-  const flatMin = Math.max(steepMin, Math.round(1600 * areaScale * drain))
-  const wetlandMin = Math.max(24, Math.round(140 * areaScale * drain))
+  // 0 is fully dry and 2 is fully wet.
+  const dryness = 1 - smoothstep(0, 2, aridity)
+  const steepMin = Math.max(600, Math.round((1400 + 2000 * reliefT * reliefT) * drain * (1 + 3 * dryness)))
+  const flatMin = Math.max(steepMin, Math.round(4800 * drain * (1 + 3 * dryness)))
+  const wetlandMin = Math.max(24, Math.round(140 * drain))
   const channel = new Uint8Array(n)
 
   const start = (origin: number) => {
+    if (sea[origin] || lake[origin]) return
+    const mine = new Set<number>()
+    const beside = (cell: number, previous: number) => {
+      const x = cell % width
+      const y = (cell / width) | 0
+      for (let k = 0; k < 8; k++) {
+        const nx = x + DX[k]
+        const ny = y + DY[k]
+        if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue
+        const neighbor = ny * width + nx
+        if (neighbor === previous || mine.has(neighbor)) continue
+        if (channel[neighbor]) return neighbor
+      }
+      return -1
+    }
+    if (beside(origin, -1) >= 0) return
     let j = origin
+    let previous = -1
     for (let guard = 0; guard < n && j >= 0; guard++) {
-      if (sea[j] || lake[j]) break
+      if (j !== origin && (sea[j] || lake[j])) break
+      if (j !== origin) {
+        const join = beside(j, previous)
+        if (join >= 0) {
+          if (previous === origin) channel[origin] = 0
+          else down[previous] = join
+          break
+        }
+      }
       channel[j] = 1
+      mine.add(j)
       const next = down[j]
       if (next < 0 || next === j) break
+      previous = j
       j = next
     }
   }
 
+  const qualifies = new Uint8Array(n)
   for (let i = 0; i < n; i++) {
     if (sea[i] || lake[i]) continue
     const steep = landform[i] === Terrain.Hill || landform[i] === Terrain.Mountain
     const converged = joins[i] >= 2 || accum[i] >= steepMin * 3
-    if (steep && accum[i] >= steepMin && (reliefT < 0.55 || converged)) start(i)
-    else if (!steep && reliefT <= 0.4 && accum[i] >= flatMin) start(i)
+    if (steep && accum[i] >= steepMin && (reliefT < 0.55 || converged)) qualifies[i] = 1
+    else if (!steep && accum[i] >= flatMin) qualifies[i] = 1
   }
+
+  const heads: number[] = []
+  for (let i = 0; i < n; i++) {
+    if (!qualifies[i]) continue
+    const x = i % width
+    const y = (i / width) | 0
+    let fed = false
+    for (let k = 0; k < 8; k++) {
+      const nx = x + DX[k]
+      const ny = y + DY[k]
+      if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue
+      const j = ny * width + nx
+      if (down[j] === i && qualifies[j]) {
+        fed = true
+        break
+      }
+    }
+    if (!fed) heads.push(i)
+  }
+  heads.sort((a, b) => accum[b] - accum[a])
+
+  const blocked = new Uint8Array(n)
+  const accept = (origin: number) => {
+    if (blocked[origin]) return
+    start(origin)
+    const x = origin % width
+    const y = (origin / width) | 0
+    const x0 = Math.max(0, x - STREAM_HEAD_GAP)
+    const x1 = Math.min(width - 1, x + STREAM_HEAD_GAP)
+    const y0 = Math.max(0, y - STREAM_HEAD_GAP)
+    const y1 = Math.min(height - 1, y + STREAM_HEAD_GAP)
+    for (let yy = y0; yy <= y1; yy++) {
+      const row = yy * width
+      for (let xx = x0; xx <= x1; xx++) blocked[row + xx] = 1
+    }
+  }
+  for (const origin of heads) accept(origin)
   if (reliefT <= 0.35) {
     const seen = new Uint8Array(n)
     const stack = new Int32Array(n)
@@ -718,7 +811,7 @@ function traceRivers(
           stack[top++] = j
         }
       }
-      if (bestExit >= 0) start(bestExit)
+      if (bestExit >= 0) accept(bestExit)
     }
   }
 
@@ -764,7 +857,8 @@ function widenChannels(
     if (span <= 1) continue
     const x = i % mapW
     const y = (i / mapW) | 0
-    const radius = span / 2
+    // span is the number of headwaters upstream. Half a log keeps a creek one cell wide until four heads join.
+    const radius = Math.log2(span) * 0.5
     const reach = Math.ceil(radius)
     const limit2 = radius * radius + 1e-4
     for (let oy = -reach; oy <= reach; oy++) {
@@ -796,44 +890,190 @@ function widenChannels(
   return wide
 }
 
-function carveValleys(
+function carveDrainage(
   elev: Float32Array,
-  channel: Uint8Array,
-  accum: Int32Array,
-  landform: Uint8Array,
+  down: Int32Array,
   sea: Uint8Array,
+  lake: Uint8Array,
+  landform: Uint8Array,
   width: number,
   height: number,
   reliefT: number,
 ) {
   const n = width * height
-  let maxAccum = 1
-  for (let i = 0; i < n; i++) if (channel[i] && accum[i] > maxAccum) maxAccum = accum[i]
-  const logMax = Math.log2(1 + maxAccum)
+  const accum = new Int32Array(n)
+  const indeg = new Int32Array(n)
+  for (let i = 0; i < n; i++) {
+    accum[i] = sea[i] ? 0 : 1
+    const d = down[i]
+    if (d >= 0 && d !== i && !sea[d]) indeg[d]++
+  }
+  const queue = new Int32Array(n)
+  let qh = 0
+  let qt = 0
+  for (let i = 0; i < n; i++) if (!sea[i] && indeg[i] === 0) queue[qt++] = i
+  while (qh < qt) {
+    const i = queue[qh++]
+    const d = down[i]
+    if (d < 0 || d === i || sea[d]) continue
+    accum[d] += accum[i]
+    indeg[d]--
+    if (indeg[d] === 0) queue[qt++] = d
+  }
+
+  const logMax = Math.log2(1 + n)
   const cut = new Float32Array(n)
-  for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) {
-      const i = y * width + x
-      if (!channel[i]) continue
-      const share = Math.log2(1 + accum[i]) / logMax
-      const inRange = landform[i] === Terrain.Hill || landform[i] === Terrain.Mountain
-      const depth = (0.018 + 0.06 * reliefT) * (0.4 + 0.6 * share) * (inRange ? 1.7 : 0.7)
-      if (depth > cut[i]) cut[i] = depth
-      for (let k = 0; k < 4; k++) {
-        const nx = x + DX[k]
-        const ny = y + DY[k]
-        if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue
+  const floor = new Uint8Array(n)
+  for (let i = 0; i < n; i++) {
+    if (sea[i] || lake[i] || accum[i] < 64) continue
+    const share = Math.log2(1 + accum[i]) / logMax
+    const radius = 1.4 + Math.min(11, share * 16)
+    const depth = (0.014 + 0.055 * reliefT) * (0.3 + share)
+    const x = i % width
+    const y = (i / width) | 0
+    const reach = Math.ceil(radius)
+    const limit2 = radius * radius
+    for (let oy = -reach; oy <= reach; oy++) {
+      const ny = y + oy
+      if (ny < 0 || ny >= height) continue
+      for (let ox = -reach; ox <= reach; ox++) {
+        const dist2 = ox * ox + oy * oy
+        if (dist2 > limit2) continue
+        const nx = x + ox
+        if (nx < 0 || nx >= width) continue
         const j = ny * width + nx
-        if (sea[j] || channel[j]) continue
-        const shoulder = depth * 0.45
-        if (shoulder > cut[j]) cut[j] = shoulder
-        if (inRange && landform[j] === Terrain.Mountain && depth >= 0.016) landform[j] = Terrain.Hill
+        if (sea[j] || lake[j]) continue
+        const fall = 1 - Math.sqrt(dist2) / radius
+        const amount = depth * fall
+        if (amount <= cut[j]) continue
+        cut[j] = amount
+        if (fall > 0.72) floor[j] = 1
       }
     }
   }
   for (let i = 0; i < n; i++) {
-    if (cut[i] > 0) elev[i] = clamp(elev[i] - cut[i], 0, 1)
+    if (sea[i] || cut[i] <= 0) continue
+    elev[i] = clamp(elev[i] - cut[i], 0, 1)
+    if (floor[i]) landform[i] = Terrain.Flat
   }
+}
+
+/** Large rivers cross ponds. The pond stays in `drained` so it can be drawn as wetland. */
+function continuePastSmallLakes(
+  channel: Uint8Array,
+  down: Int32Array,
+  heads: Int32Array,
+  lakeId: Int32Array,
+  lakeArea: Int32Array,
+  pfDown: Int32Array,
+  sea: Uint8Array,
+  width: number,
+  height: number,
+): Uint8Array {
+  const n = width * height
+  let lakeCount = 0
+  for (let i = 0; i < n; i++) if (lakeId[i] >= lakeCount) lakeCount = lakeId[i] + 1
+  const refused = new Uint8Array(lakeCount)
+  const drained = new Uint8Array(n)
+
+  const isDrained = (cell: number) => {
+    const id = lakeId[cell]
+    return id >= 0 && refused[id] === 1
+  }
+  const accepts = (cell: number, headCount: number) => {
+    if (headCount < RIVER_LAKE_HEADS) return true
+    return lakeArea[cell] >= headCount * RIVER_LAKE_CELLS_PER_HEAD
+  }
+  const spillOf = (start: number) => {
+    let j = start
+    for (let guard = 0; guard < n; guard++) {
+      if (lakeId[j] < 0) return j
+      const next = pfDown[j]
+      if (next < 0 || next === j) return -1
+      j = next
+    }
+    return -1
+  }
+  const beside = (cell: number, previous: number, mine: Set<number>) => {
+    const x = cell % width
+    const y = (cell / width) | 0
+    for (let k = 0; k < 8; k++) {
+      const nx = x + DX[k]
+      const ny = y + DY[k]
+      if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue
+      const neighbor = ny * width + nx
+      if (neighbor === previous || mine.has(neighbor)) continue
+      if (channel[neighbor]) return neighbor
+    }
+    return -1
+  }
+
+  const extendFrom = (shore: number, headCount: number) => {
+    let previous = shore
+    let j = down[shore]
+    const mine = new Set<number>()
+    mine.add(shore)
+    for (let guard = 0; guard < n && j >= 0 && j !== previous; guard++) {
+      if (sea[j] || mine.has(j)) {
+        down[previous] = j
+        return
+      }
+      if (lakeId[j] >= 0 && !isDrained(j)) {
+        if (accepts(j, headCount) || spillOf(j) < 0) {
+          down[previous] = j
+          return
+        }
+        refused[lakeId[j]] = 1
+      }
+      if (channel[j]) {
+        down[previous] = j
+        return
+      }
+      if (!isDrained(j)) {
+        const join = beside(j, previous, mine)
+        if (join >= 0) {
+          down[previous] = join
+          return
+        }
+      }
+      channel[j] = 1
+      mine.add(j)
+      down[previous] = j
+      let next = isDrained(j) ? pfDown[j] : down[j]
+      if (!isDrained(j) && isDrained(previous) && next >= 0 && lakeId[next] === lakeId[previous]) {
+        const alt = pfDown[j]
+        if (alt >= 0 && alt !== j && lakeId[alt] !== lakeId[previous]) next = alt
+        else return
+      }
+      if (next < 0 || next === j) return
+      down[j] = next
+      previous = j
+      j = next
+    }
+  }
+
+  let grew = true
+  for (let spins = 0; grew && spins < 12; spins++) {
+    grew = false
+    for (let i = 0; i < n; i++) {
+      if (!channel[i]) continue
+      const next = down[i]
+      if (next < 0 || lakeId[next] < 0 || isDrained(next)) continue
+      if (accepts(next, heads[i]) || spillOf(next) < 0) continue
+      refused[lakeId[next]] = 1
+      grew = true
+    }
+    for (let i = 0; i < n; i++) {
+      if (!channel[i]) continue
+      const next = down[i]
+      if (next < 0 || !isDrained(next) || channel[next]) continue
+      extendFrom(i, Math.max(1, heads[i]))
+      grew = true
+    }
+  }
+
+  for (let i = 0; i < n; i++) if (isDrained(i)) drained[i] = 1
+  return drained
 }
 
 function assertRivers(
@@ -960,19 +1200,53 @@ function openFlatGate(aridity: number): number {
   return Feature.Barren
 }
 
-function failedSinkCover(aridity: number): number {
-  if (aridity >= 0.4) return Feature.Wetland
-  if (aridity >= 0.2) return Feature.Prairie
-  if (aridity >= 0.1) return Feature.Scrub
-  return Feature.Barren
-}
-
 function aspectAdjust(gdx: number, gdy: number, slope: number, latitude: number): number {
   if (slope < HILL_SLOPE * 0.5) return 0
-  if (Math.abs(gdy) <= Math.abs(gdx)) return 0
+  if (Math.abs(gdx) > Math.abs(gdy)) {
+    // East matches north in the northern hemisphere. West matches south. This pair does not flip south of the equator.
+    return gdx > 0 ? -0.2 : 0.2
+  }
   const facesSouth = gdy < 0
   if (latitude >= 0) return facesSouth ? -0.2 : 0.2
   return facesSouth ? 0.2 : -0.2
+}
+
+/** Cells of Chebyshev distance from the marked sources. */
+function chebyshevDistance(source: Uint8Array, width: number, height: number): Int16Array {
+  const n = width * height
+  const dist = new Int16Array(n)
+  dist.fill(32767)
+  for (let i = 0; i < n; i++) if (source[i]) dist[i] = 0
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const i = y * width + x
+      let d = dist[i]
+      if (x > 0) d = Math.min(d, dist[i - 1] + 1)
+      if (y > 0) d = Math.min(d, dist[i - width] + 1)
+      if (x > 0 && y > 0) d = Math.min(d, dist[i - width - 1] + 1)
+      if (x + 1 < width && y > 0) d = Math.min(d, dist[i - width + 1] + 1)
+      dist[i] = d
+    }
+  }
+  for (let y = height - 1; y >= 0; y--) {
+    for (let x = width - 1; x >= 0; x--) {
+      const i = y * width + x
+      let d = dist[i]
+      if (x + 1 < width) d = Math.min(d, dist[i + 1] + 1)
+      if (y + 1 < height) d = Math.min(d, dist[i + width] + 1)
+      if (x + 1 < width && y + 1 < height) d = Math.min(d, dist[i + width + 1] + 1)
+      if (x > 0 && y + 1 < height) d = Math.min(d, dist[i + width - 1] + 1)
+      dist[i] = d
+    }
+  }
+  return dist
+}
+
+/** Medium-map distances: 2 cells at 600 mm, 32 cells at 2000 mm. Other maps scale by width / 1024. */
+function forestReach(annualPrecip: number, span: number): number {
+  if (annualPrecip < 600) return 0
+  const t = clamp((annualPrecip - 600) / 1400, 0, 1)
+  return Math.max(1, Math.round((2 + 30 * t) * (span / 1024)))
 }
 
 function gaussian(rng: () => number): number {
@@ -1109,8 +1383,8 @@ export function generateDetailed(
   onProgress?: ProgressFn,
 ): { world: World; diagnostics: Diagnostics } {
   const size = request.size
-  if (size !== 256 && size !== 512 && size !== 1024) {
-    throw new Error("Map size must be 256, 512, or 1024.")
+  if (!SIZES.includes(size)) {
+    throw new Error("Map size must be 512, 1024, or 2048.")
   }
   const width = size
   const height = size
@@ -1145,7 +1419,10 @@ export function generateDetailed(
   onProgress?.(0.36, "Finding lakes")
   const { water, pfDown } = priorityFlood(elev, sea, width, height)
   const basins = markBasins(elev, water, pfDown, sea, indices.aridity, width, height)
-  const draftDown = flowDown(elev, water, sea, basins.lake, width, height, null)
+  const drained = flowDown(elev, water, sea, basins.lake, width, height, null)
+  onProgress?.(0.46, "Cutting valleys")
+  carveDrainage(elev, drained, sea, basins.lake, landform, width, height, request.relief / 100)
+  const draftDown = flowDown(elev, elev, sea, basins.lake, width, height, null)
   onProgress?.(0.5, "Tracing rivers")
   const draft = traceRivers(
     draftDown,
@@ -1159,8 +1436,19 @@ export function generateDetailed(
     indices.annualPrecip,
     indices.aridity,
   )
-  carveValleys(elev, draft.channel, draft.accum, landform, sea, width, height, request.relief / 100)
   const channel = draft.channel
+  const arriving = channelWidths(channel, draftDown, n)
+  const drainedLakes = continuePastSmallLakes(
+    channel,
+    draftDown,
+    arriving,
+    basins.lakeId,
+    basins.lakeArea,
+    pfDown,
+    sea,
+    width,
+    height,
+  )
   assertRivers(channel, draftDown, sea, basins.lake, width, height)
   const sized = channelWidths(channel, draftDown, n)
   const wide = widenChannels(channel, sized, sea, width, height)
@@ -1188,7 +1476,7 @@ export function generateDetailed(
       terrain[i] = Terrain.Sea
       continue
     }
-    if (basins.lake[i]) {
+    if (basins.lake[i] && !drainedLakes[i]) {
       terrain[i] = Terrain.Fresh
       lakeCells++
       continue
@@ -1201,7 +1489,7 @@ export function generateDetailed(
 
   const fresh = new Uint8Array(n)
   for (let i = 0; i < n; i++) if (terrain[i] === Terrain.Fresh) fresh[i] = 1
-  const nearFresh = dilate8(fresh, width, height, 2)
+  const nearFresh = dilate8(fresh, width, height, 1)
 
   const hillMark = new Uint8Array(n)
   for (let i = 0; i < n; i++) {
@@ -1222,7 +1510,6 @@ export function generateDetailed(
     for (let x = 0; x < width; x++) {
       const i = y * width + x
       if (landform[i] !== Terrain.Flat) continue
-      if (slope[i] >= HILL_SLOPE * 0.5) continue
       const x0 = Math.max(0, x - OPEN_RADIUS)
       const y0 = Math.max(0, y - OPEN_RADIUS)
       const x1 = Math.min(width - 1, x + OPEN_RADIUS)
@@ -1242,6 +1529,7 @@ export function generateDetailed(
 
   onProgress?.(0.7, "Laying down cover")
   const noise = createNoise(seed ^ 0x85ebca6b)
+  const prairieScale = Math.min(width, height) * 0.45 * (84 / 220)
   const feature = new Uint8Array(n)
   const prairieGround = new Uint8Array(n)
   for (let y = 0; y < height; y++) {
@@ -1254,24 +1542,86 @@ export function generateDetailed(
       }
       const gradient = slopeAt(elev, sea, width, height, x, y)
       const score = indices.aridity + aspectAdjust(gradient.gdx, gradient.gdy, slope[i], latitude)
-      const field = noise.fbm01(x / 84, y / 84, 3)
-      const clearing = noise.fbm01(x / 30 + 20, y / 30 + 9, 2)
-      const prairieZone = field >= 0.42 || (field < 0.42 && clearing > 0.74)
+      const field = noise.fbm01(x / prairieScale, y / prairieScale, 3)
+      const clearingScale = Math.min(width, height) * 0.45 * (30 / 220)
+      const clearing = noise.fbm01(x / clearingScale + 20, y / clearingScale + 9, 2)
+      const prairieZone = field >= 0.42 || (field < 0.42 && clearing > 0.88)
       if (open[i] && prairieZone) {
         prairieGround[i] = 1
         feature[i] = openFlatGate(indices.aridity)
       } else {
         feature[i] = coverBands(score)
       }
-      if (basins.failed[i] && landform[i] !== Terrain.Mountain) {
-        feature[i] = failedSinkCover(indices.aridity)
+      if (basins.basinPool[i] && landform[i] !== Terrain.Mountain) {
+        feature[i] = Feature.Wetland
         failedSinkCells++
       }
     }
   }
+  if (indices.aridity >= 0.4) {
+    for (let i = 0; i < n; i++) {
+      if (!prairieGround[i] || terrain[i] === Terrain.Fresh || sea[i]) continue
+      if (nearFresh[i]) feature[i] = Feature.Wetland
+    }
+  }
+  const aridT = clamp((indices.aridity - 0.4) / 1.6, 0, 1)
+  const marshShare =
+    indices.aridity < 0.4
+      ? 0
+      : (0.01 + 0.09 * Math.pow(aridT, 1.35)) * (1 - smoothstep(0.05, 0.5, request.relief / 100))
+  if (marshShare > 0) {
+    const marshAt = (x: number, y: number) => noise.fbm01(x / 70 + 4, y / 70 + 12, 2)
+    const samples: number[] = []
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const i = y * width + x
+        if (!prairieGround[i] || terrain[i] === Terrain.Fresh || sea[i]) continue
+        samples.push(marshAt(x, y))
+      }
+    }
+    if (samples.length > 0) {
+      samples.sort((a, b) => a - b)
+      const rank = Math.min(samples.length - 1, Math.floor((1 - marshShare) * samples.length))
+      const cutoff = samples[rank]
+      for (let y = 0; y < height; y++) {
+        for (let x = 0; x < width; x++) {
+          const i = y * width + x
+          if (!prairieGround[i] || terrain[i] === Terrain.Fresh || sea[i]) continue
+          if (marshAt(x, y) >= cutoff) feature[i] = Feature.Wetland
+        }
+      }
+    }
+  }
+  const reach = forestReach(indices.annualPrecip, Math.min(width, height))
+  if (reach > 0) {
+    const woods = new Uint8Array(n)
+    for (let i = 0; i < n; i++) if (feature[i] === Feature.Forest) woods[i] = 1
+    const fromWoods = chebyshevDistance(woods, width, height)
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const i = y * width + x
+        if (feature[i] !== Feature.Prairie || fromWoods[i] > reach) continue
+        feature[i] = Feature.Forest
+        prairieGround[i] = 0
+      }
+    }
+  }
+  if (indices.aridity < 0.4) {
+    const river = new Uint8Array(n)
+    for (let i = 0; i < n; i++) {
+      if (terrain[i] === Terrain.Fresh && (!basins.lake[i] || drainedLakes[i])) river[i] = 1
+    }
+    const bank = dilate8(river, width, height, 2)
+    const bankCover = indices.aridity < 0.1 ? Feature.Scrub : Feature.Woodland
+    for (let i = 0; i < n; i++) {
+      if (!bank[i] || sea[i] || terrain[i] === Terrain.Fresh) continue
+      feature[i] = bankCover
+      prairieGround[i] = 0
+    }
+  }
   for (let i = 0; i < n; i++) {
-    if (!prairieGround[i] || terrain[i] === Terrain.Fresh || sea[i]) continue
-    if (nearFresh[i]) feature[i] = Feature.Wetland
+    if (!drainedLakes[i] || sea[i] || terrain[i] === Terrain.Fresh) continue
+    feature[i] = Feature.Wetland
   }
 
   onProgress?.(0.82, "Measuring soil and water")
