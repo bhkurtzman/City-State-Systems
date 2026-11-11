@@ -2,9 +2,9 @@
 
 import { useEffect, useImperativeHandle, useRef, useState, type PointerEvent as ReactPointerEvent, type Ref } from "react"
 import { Card, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
-import { CARAVAN_STYLE, caravanPreview, FARMSTEAD_CAP, HOME_STYLE, isPlaced, isWater, OFFICE_STYLE, officePreview, PLOP_STYLE, raisedGround, SHACK_STYLE, shackPreview, type BuildTool, type Structure } from "@/lib/buildings"
+import { CARAVAN_STYLE, caravanPreview, FARMSTEAD_CAP, farmRect, HOME_STYLE, isPlaced, isWater, OFFICE_STYLE, officePreview, PLOP_STYLE, raisedGround, SHACK_STYLE, shackPreview, type BuildTool, type Structure } from "@/lib/buildings"
 import { paintLayer } from "@/lib/colors"
-import { cardinalLine } from "@/lib/roads"
+import { bridgeTileOpen, cardinalLine } from "@/lib/roads"
 import { Terrain, type LayerId, type World } from "@/lib/types"
 
 export type MapPaneHandle = {
@@ -20,16 +20,19 @@ type MapPaneProps = {
   cell: Cell | null
   generation: number
   structures: Structure[]
-  roads: readonly { index: number; done: boolean }[]
+  roads: readonly { index: number; done: boolean; bridge?: boolean }[]
   tool: BuildTool | null
+  farmDraw: "draw" | "rect"
+  farmNorth: number
+  farmEast: number
   onSelect: (cell: Cell) => void
-  onBuild: (cells: Cell[], mode: "tap" | "stroke" | "place", latch: Set<number>, allowNew: boolean) => void
+  onBuild: (cells: Cell[], mode: "tap" | "stroke" | "place" | "stamp", latch: Set<number>, allowNew: boolean) => void
   handle: Ref<MapPaneHandle>
 }
 
 type View = { x: number; y: number; zoom: number }
 
-export function MapPane({ world, layer, cell, generation, structures, roads, tool, onSelect, onBuild, handle }: MapPaneProps) {
+export function MapPane({ world, layer, cell, generation, structures, roads, tool, farmDraw, farmNorth, farmEast, onSelect, onBuild, handle }: MapPaneProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const bitmapRef = useRef<HTMLCanvasElement | null>(null)
   const viewRef = useRef<View>({ x: 0, y: 0, zoom: 1 })
@@ -51,6 +54,7 @@ export function MapPane({ world, layer, cell, generation, structures, roads, too
   const structuresRef = useRef(structures)
   const roadsRef = useRef(roads)
   const toolRef = useRef(tool)
+  const farmRef = useRef({ mode: farmDraw, north: farmNorth, east: farmEast })
   const hoverRef = useRef<Cell | null>(null)
   const previewRef = useRef<Cell[] | null>(null)
   const [hover, setHover] = useState<Cell | null>(null)
@@ -61,6 +65,7 @@ export function MapPane({ world, layer, cell, generation, structures, roads, too
   structuresRef.current = structures
   roadsRef.current = roads
   toolRef.current = tool
+  farmRef.current = { mode: farmDraw, north: farmNorth, east: farmEast }
   hoverRef.current = hover
   previewRef.current = preview
 
@@ -89,9 +94,9 @@ export function MapPane({ world, layer, cell, generation, structures, roads, too
     context.drawImage(bitmap, view.x, view.y, current.size * view.zoom, current.size * view.zoom)
     drawRoads(context, roadsRef.current, current.size, view)
     drawStructures(context, structuresRef.current, current.size, view)
-    const roadLine = previewRef.current ?? (toolRef.current === "cart-path" && hoverRef.current ? [hoverRef.current] : null)
-    drawRoadPreview(context, roadLine, structuresRef.current, current, view)
-    drawGhost(context, hoverRef.current, toolRef.current, structuresRef.current, roadsRef.current, current, view)
+    const roadLine = previewRef.current ?? (roadStroke(toolRef.current) && hoverRef.current ? [hoverRef.current] : null)
+    drawRoadPreview(context, roadLine, structuresRef.current, current, view, toolRef.current === "wooden-bridge")
+    drawGhost(context, hoverRef.current, toolRef.current, farmRef.current, structuresRef.current, roadsRef.current, current, view)
     const selected = cellRef.current
     if (!selected) return
     const sx = view.x + selected.x * view.zoom
@@ -180,7 +185,7 @@ export function MapPane({ world, layer, cell, generation, structures, roads, too
 
   useEffect(() => {
     draw()
-  }, [cell, structures, roads, tool, hover, preview])
+  }, [cell, structures, roads, tool, farmDraw, farmNorth, farmEast, hover, preview])
 
   const cellAt = (event: ReactPointerEvent<HTMLCanvasElement>): Cell | null => {
     const current = worldRef.current
@@ -210,7 +215,8 @@ export function MapPane({ world, layer, cell, generation, structures, roads, too
                 // A pointer the browser is no longer tracking cannot be captured.
               }
               const active = toolRef.current
-              const painting = event.button === 0 && (active === "farmstead" || active === "delete" || active === "cart-path")
+              const stamping = active === "farmstead" && farmRef.current.mode === "rect"
+              const painting = event.button === 0 && !stamping && (active === "farmstead" || active === "delete" || roadStroke(active))
               const origin = cellAt(event)
               dragRef.current = {
                 x: event.clientX,
@@ -228,13 +234,14 @@ export function MapPane({ world, layer, cell, generation, structures, roads, too
             onPointerMove={(event) => {
               const active = toolRef.current
               const drag = dragRef.current
-              if (!drag && (isPlaced(active) || active === "cart-path")) {
+              const stamping = active === "farmstead" && farmRef.current.mode === "rect"
+              if (!drag && (isPlaced(active) || roadStroke(active) || stamping)) {
                 const next = cellAt(event)
                 setHover((current) => (sameCell(current, next) ? current : next))
               }
               if (!drag) return
               if (Math.hypot(event.clientX - drag.originX, event.clientY - drag.originY) > 3) drag.moved = true
-              if (drag.painting && active === "cart-path") {
+              if (drag.painting && roadStroke(active)) {
                 const next = cellAt(event)
                 if (next) drag.last = next
                 if (drag.moved && drag.anchor && drag.last) setPreview(cardinalLine(drag.anchor, drag.last))
@@ -269,7 +276,16 @@ export function MapPane({ world, layer, cell, generation, structures, roads, too
               const drag = dragRef.current
               dragRef.current = null
               if (!drag || !world) return
-              if (toolRef.current === "cart-path") {
+              if (toolRef.current === "farmstead" && farmRef.current.mode === "rect") {
+                if (drag.moved) return
+                const picked = cellAt(event)
+                const current = worldRef.current
+                if (!picked || !current) return
+                const cells = farmRect(picked.x, picked.y, farmRef.current.north, farmRef.current.east, current.size)
+                if (cells) onBuild(cells, "stamp", drag.latch, true)
+                return
+              }
+              if (roadStroke(toolRef.current)) {
                 setPreview(null)
                 if (!drag.painting) {
                   if (drag.moved) return
@@ -342,16 +358,23 @@ function orthogonalLine(from: Cell, to: Cell): Cell[] {
   return cells
 }
 
+function roadStroke(tool: BuildTool | null): boolean {
+  return tool === "cart-path" || tool === "wooden-bridge"
+}
+
 function drawRoads(
   context: CanvasRenderingContext2D,
-  roads: readonly { index: number; done: boolean }[],
+  roads: readonly { index: number; done: boolean; bridge?: boolean }[],
   size: number,
   view: View,
 ) {
   for (const road of roads) {
     const x = road.index % size
     const y = (road.index - x) / size
-    paintRoadCell(context, x, y, view, road.done ? "rgba(214, 122, 42, 1)" : "rgba(255, 214, 96, 0.98)")
+    const fill = road.bridge
+      ? road.done ? "rgba(92, 64, 40, 1)" : "rgba(186, 148, 96, 0.98)"
+      : road.done ? "rgba(214, 122, 42, 1)" : "rgba(255, 214, 96, 0.98)"
+    paintRoadCell(context, x, y, view, fill)
   }
 }
 
@@ -361,17 +384,18 @@ function drawRoadPreview(
   structures: readonly Structure[],
   world: World,
   view: View,
+  bridge = false,
 ) {
   if (!cells) return
   for (const cell of cells) {
     const index = cell.y * world.size + cell.x
     const ground = world.terrain[index]
-    const illegal =
-      ground === Terrain.Sea ||
-      ground === Terrain.Fresh ||
-      ground === Terrain.Mountain ||
-      structures.some((structure) => structure.tiles.includes(index))
-    paintRoadCell(context, cell.x, cell.y, view, illegal ? "rgba(232, 72, 48, 0.95)" : "rgba(255, 214, 96, 0.72)")
+    const occupied = structures.some((structure) => structure.tiles.includes(index))
+    const illegal = bridge
+      ? occupied || !bridgeTileOpen(world.terrain, index, world.size)
+      : ground === Terrain.Sea || ground === Terrain.Fresh || ground === Terrain.Mountain || occupied
+    const legal = bridge ? "rgba(186, 148, 96, 0.72)" : "rgba(255, 214, 96, 0.72)"
+    paintRoadCell(context, cell.x, cell.y, view, illegal ? "rgba(232, 72, 48, 0.95)" : legal)
   }
 }
 
@@ -453,12 +477,26 @@ function drawGhost(
   context: CanvasRenderingContext2D,
   hover: Cell | null,
   tool: BuildTool | null,
+  farm: { mode: "draw" | "rect"; north: number; east: number },
   structures: readonly Structure[],
   roads: readonly { index: number }[],
   world: World,
   view: View,
 ) {
-  if (!hover || !isPlaced(tool)) return
+  if (!hover) return
+  if (tool === "farmstead" && farm.mode === "rect") {
+    if (farm.north < 1 || farm.east < 1 || farm.north * farm.east > FARMSTEAD_CAP) return
+    const columns = Math.min(farm.east, world.size - hover.x)
+    const rows = Math.min(farm.north, world.size - hover.y)
+    if (columns < 1 || rows < 1) return
+    context.save()
+    context.globalAlpha = 0.45
+    context.fillStyle = HOME_STYLE.fill
+    context.fillRect(view.x + hover.x * view.zoom, view.y + hover.y * view.zoom, columns * view.zoom, rows * view.zoom)
+    context.restore()
+    return
+  }
+  if (!isPlaced(tool)) return
   const paved = new Set(roads.map((road) => road.index))
   const taken = (index: number) => paved.has(index) || structures.some((structure) => structure.tiles.includes(index))
   if (tool === "shack") {

@@ -20,6 +20,7 @@ export const GOODS = [
   "fruit",
   "dried-fruit",
   "vegetables",
+  "spices",
   "dairy",
   "cheese",
   "meat",
@@ -59,6 +60,7 @@ export const GOOD_LABEL: Record<Good, string> = {
   fruit: "Fruit",
   "dried-fruit": "Dried fruit",
   vegetables: "Vegetables",
+  spices: "Spices",
   dairy: "Dairy",
   cheese: "Cheese",
   meat: "Meat",
@@ -98,6 +100,10 @@ export type FarmRecord = {
   uses: Crop[]
   /** Augusts since the fruit quarter was planted. −1 when the plan has no fruit. */
   fruitAge: number
+  /** Prairie tiles counted at settlement, then again each February after clearing. */
+  prairie: number
+  /** Average fertility of those prairie tiles. Absent until the first February. */
+  fertility?: number
   /** Hundredths of a ton sitting in the barn. */
   store: Record<Good, number>
   /** Dollars per ton the market paid for goods it is holding to resell. */
@@ -160,13 +166,14 @@ export const SHELF_TARGET: Partial<Record<Good, number>> = {
   "steel-tools": 50,
   leather: 50,
   textiles: 50,
+  spices: 50,
   meat: 300,
   fish: 500,
   grain: 500,
   dairy: 1000,
   fruit: 1000,
   vegetables: 1000,
-  coal: 1000,
+  coal: 500,
   wood: 5000,
   salt: 100,
 }
@@ -257,12 +264,37 @@ function improvesSoil(layout: Layout, uses: readonly Crop[]): boolean {
 }
 
 /**
- * Harvest this calendar month, then let a new owner or a finished orchard pick again.
+ * Harvest this calendar month. Prairie count, fertility, and crop choice are taken in February, after clearing.
+ * A farm settled later in the year has no crops until the next February.
  * Forest is cleared above 180 tiles and woodland above 360. Two cut-points are spent,
  * woodland first at one point and forest at two. One wetland tile is drained every year.
- * A farmstead's April fish haul stops at 15 tons.
+ * A farmstead's April fish haul stops at 15 tons. Salt is taken in that same month.
  */
 type Land = { feature: Uint8Array; fertility: Uint8Array; changed: boolean }
+
+/** A trading post left empty by a move into a caravan house. Its barn is added to that house. */
+function carriedPantry(
+  farms: Farms,
+  structures: readonly Structure[],
+  ownerOf: Map<number, number>,
+  idMap: Int32Array | null,
+): Map<number, Record<Good, number>> {
+  const kindOf = new Map(structures.map((structure) => [structure.id, structure.kind]))
+  const into = new Map<number, Record<Good, number>>()
+  for (const row of farms.rows) {
+    if (kindOf.get(row.structureId) !== "trading-post") continue
+    if ((ownerOf.get(row.structureId) ?? -1) >= 0) continue
+    let head = row.owner
+    if (idMap && head >= 0) head = head < idMap.length ? idMap[head] : -1
+    if (head < 0) continue
+    const house = structures.find((structure) => structure.kind === "caravan-house" && !structure.removing && (ownerOf.get(structure.id) ?? -1) === head)
+    if (!house) continue
+    const bag = into.get(house.id) ?? emptyStore()
+    for (const good of GOODS) bag[good] += row.store[good] ?? 0
+    into.set(house.id, bag)
+  }
+  return into
+}
 
 export function workFarms(
   farms: Farms,
@@ -281,8 +313,12 @@ export function workFarms(
   wealth: Int32Array | null = null,
   buildReserve: (structureId: number) => number = () => 0,
 ): { farms: Farms; feature: Uint8Array; fertility: Uint8Array; changedLand: boolean } {
-  const standing = structures.filter((structure) => !structure.pending && !structure.removing && (structure.kind === "farmstead" || structure.kind === "shack" || structure.kind === "construction-office" || isBusiness(structure.kind)))
   const ownerOf = new Map(owners.map((row) => [row.structureId, row.owner]))
+  const standing = structures.filter((structure) => {
+    if (structure.removing) return false
+    if (structure.pending) return structure.kind === "caravan-house" && (ownerOf.get(structure.id) ?? -1) >= 0
+    return structure.kind === "farmstead" || structure.kind === "shack" || structure.kind === "construction-office" || isBusiness(structure.kind)
+  })
   const land: Land = { feature: featureIn, fertility: fertilityIn, changed: false }
   const writeLand = () => {
     if (land.changed) return
@@ -291,6 +327,7 @@ export function workFarms(
     land.changed = true
   }
 
+  const carried = carriedPantry(farms, structures, ownerOf, idMap)
   const rows: FarmRecord[] = []
   for (const structure of standing) {
     const owner = ownerOf.get(structure.id) ?? -1
@@ -309,7 +346,6 @@ export function workFarms(
       } else if (record) rows.push(record)
       continue
     }
-    const planted = record !== null
     if (!record) record = structure.kind === "farmstead" ? rollRecord(structure, land, preset, owner, seed, year, month) : stockRecord(structure, owner, seed)
     if (structure.kind === "sawpit" && !record.specialty) record.specialty = "sawmill"
     if (structure.kind === "workshop" && !record.specialty) {
@@ -320,19 +356,14 @@ export function workFarms(
     }
     if (structure.kind !== "farmstead") {
       record.owner = owner
+      const brought = carried.get(structure.id)
+      if (brought) for (const good of GOODS) record.store[good] = (record.store[good] ?? 0) + brought[good]
       rows.push(record)
       continue
     }
+    record.owner = owner
     const harvest = monthWork(structure, record, terrain, land, preset, month, year, seed, writeLand, aridity)
-    record = harvest.record
-    const ownerChanged = planted && record.owner !== owner
-    if (ownerChanged || harvest.replant) {
-      const next = rollRecord(structure, land, preset, owner, seed, year, month)
-      next.store = record.store
-      next.trade = record.trade
-      record = next
-    }
-    rows.push(record)
+    rows.push(harvest.record)
   }
   return { farms: { rows }, feature: land.feature, fertility: land.fertility, changedLand: land.changed }
 }
@@ -340,22 +371,20 @@ export function workFarms(
 function rollRecord(
   structure: Structure,
   land: Land,
-  preset: PresetId,
+  _preset: PresetId,
   owner: number,
-  seed: string,
-  year: number,
-  month: number,
+  _seed: string,
+  _year: number,
+  _month: number,
 ): FarmRecord {
   const prairie = tilesWhere(structure.tiles, land.feature, Feature.Prairie)
-  const average = averageFertility(prairie, land.fertility)
-  const rng = mulberry32(hashSeed(`${seed}:crops:${structure.id}:${year}:${month}:${owner}`))
-  const chosen = chooseUses(prairie.length, average, preset, rng)
   return {
     structureId: structure.id,
     owner,
-    layout: chosen.layout,
-    uses: chosen.uses,
-    fruitAge: chosen.uses.includes("fruit") ? 0 : -1,
+    layout: "none",
+    uses: [],
+    fruitAge: -1,
+    prairie: prairie.length,
     store: openingStore(structure.kind),
   }
 }
@@ -367,6 +396,7 @@ function stockRecord(structure: Structure, owner: number, _seed: string): FarmRe
     layout: "none",
     uses: [],
     fruitAge: -1,
+    prairie: 0,
     store: openingStore(structure.kind),
   }
 }
@@ -457,18 +487,17 @@ function monthWork(
   seed: string,
   writeLand: () => void,
   aridity = 99,
-): { record: FarmRecord; replant: boolean } {
+): { record: FarmRecord } {
   const next = record
+  if (!Number.isFinite(next.prairie)) next.prairie = 0
   const feature = () => land.feature
-  const prairie = tilesWhere(structure.tiles, feature(), Feature.Prairie)
-  const average = averageFertility(prairie, land.fertility)
-  const blocks = assignBlocks(prairie, next.uses.length)
   const bucket = emptyStore()
-  let replant = false
 
   if (month === 0 && improvesSoil(next.layout, next.uses)) {
     writeLand()
-    for (const tile of prairie) if (land.fertility[tile] < 80) land.fertility[tile] += 1
+    for (const tile of tilesWhere(structure.tiles, feature(), Feature.Prairie)) {
+      if (land.fertility[tile] < 80) land.fertility[tile] += 1
+    }
   }
 
   if (month === FEBRUARY) {
@@ -494,28 +523,40 @@ function monthWork(
     for (const tile of cut) land.feature[tile] = Feature.Prairie
     if (wetland.length > 0) land.feature[wetland[0]] = Feature.Prairie
     if (next.fruitAge === 34) {
-      bucket.wood += (blocks[next.uses.indexOf("fruit")] ?? []).length * 200
-      replant = true
+      bucket.wood += cropShare(next.prairie, next.uses.length) * 200
+      next.fruitAge = 0
+    }
+    const prairie = tilesWhere(structure.tiles, feature(), Feature.Prairie)
+    next.prairie = prairie.length
+    next.fertility = averageFertility(prairie, land.fertility)
+    if (next.uses.length === 0) {
+      const rng = mulberry32(hashSeed(`${seed}:crops:${structure.id}:${year}:${month}:${next.owner}`))
+      const chosen = chooseUses(next.prairie, next.fertility, preset, rng)
+      next.layout = chosen.layout
+      next.uses = chosen.uses
+      next.fruitAge = chosen.uses.includes("fruit") ? 0 : -1
     }
   }
 
-  for (let slot = 0; slot < next.uses.length; slot++) {
-    const crop = next.uses[slot]
-    const count = blocks[slot]?.length ?? 0
-    if (count === 0) continue
-    if (crop === "grain" && month === OCTOBER) pile(bucket, "grain", count, 5, average, preset)
-    if (crop === "fiber" && month === OCTOBER) {
-      pile(bucket, "fiber", count, 2, average, preset)
-      pile(bucket, "grain", count, 1, average, preset)
-    }
-    if (crop === "vegetables" && month === JULY) pile(bucket, "vegetables", count, 30, average, preset)
-    if (crop === "dairy" && month === MAY) pile(bucket, "dairy", count, 10, average, preset)
-    if (crop === "meat" && month === NOVEMBER) {
-      pile(bucket, "meat", count, 1, average, preset)
-      pile(bucket, "hide", count, 0.2, average, preset)
-    }
-    if (crop === "fruit" && month === AUGUST && next.fruitAge >= 3 && next.fruitAge <= 33) {
-      pile(bucket, "fruit", count, 25, average, preset)
+  const average = next.fertility
+  const count = average === undefined ? 0 : cropShare(next.prairie, next.uses.length)
+  if (average !== undefined && count > 0) {
+    for (let slot = 0; slot < next.uses.length; slot++) {
+      const crop = next.uses[slot]
+      if (crop === "grain" && month === OCTOBER) pile(bucket, "grain", count, 5, average, preset)
+      if (crop === "fiber" && month === OCTOBER) {
+        pile(bucket, "fiber", count, 2, average, preset)
+        pile(bucket, "grain", count, 1, average, preset)
+      }
+      if (crop === "vegetables" && month === JULY) pile(bucket, "vegetables", count, 20, average, preset)
+      if (crop === "dairy" && month === MAY) pile(bucket, "dairy", count, 10, average, preset)
+      if (crop === "meat" && month === NOVEMBER) {
+        pile(bucket, "meat", count, 1, average, preset)
+        pile(bucket, "hide", count, 0.2, average, preset)
+      }
+      if (crop === "fruit" && month === AUGUST && next.fruitAge >= 3 && next.fruitAge <= 33) {
+        pile(bucket, "fruit", count, 20, average, preset)
+      }
     }
   }
 
@@ -541,17 +582,20 @@ function monthWork(
     for (const tile of structure.tiles) if (feature()[tile] === Feature.Wetland) bucket.fiber += 0.2
   }
   if (month === APRIL) {
+    let sea = false
     for (const tile of structure.tiles) {
-      if (terrain[tile] === Terrain.Sea) bucket.fish += 10
-      else if (terrain[tile] === Terrain.Fresh) bucket.fish += 5
+      if (terrain[tile] === Terrain.Sea) {
+        bucket.fish += 10
+        sea = true
+      } else if (terrain[tile] === Terrain.Fresh) bucket.fish += 5
     }
     if (bucket.fish > FISH_CAP) bucket.fish = FISH_CAP
+    if (sea) next.store.salt += saltFromAridity(aridity)
   }
 
   const rng = mulberry32(hashSeed(`${seed}:harvest:${structure.id}:${year}:${month}`))
   for (const good of GOODS) next.store[good] += keep(bucket[good], rng)
-  if (structure.tiles.some((tile) => terrain[tile] === Terrain.Sea)) next.store.salt += saltFromAridity(aridity)
-  return { record: next, replant }
+  return { record: next }
 }
 
 function pile(bucket: Record<Good, number>, good: Good, count: number, perTile: number, average: number, preset: PresetId) {
@@ -579,13 +623,10 @@ function averageFertility(tiles: readonly number[], fertility: Uint8Array): numb
   return sum / tiles.length
 }
 
-/** Each use gets an equal share. The leftover tiles stay fallow, at the southeast end of the list. */
-function assignBlocks(prairie: readonly number[], uses: number): number[][] {
-  if (uses === 0) return []
-  const share = Math.floor(prairie.length / (uses + 1))
-  const blocks: number[][] = []
-  for (let slot = 0; slot < uses; slot++) blocks.push(prairie.slice(slot * share, (slot + 1) * share))
-  return blocks
+/** Each crop's tile count. The leftover share stays fallow. */
+function cropShare(prairie: number, uses: number): number {
+  if (prairie <= 0 || uses <= 0) return 0
+  return Math.floor(prairie / (uses + 1))
 }
 
 export function productionLines(
@@ -600,6 +641,11 @@ export function productionLines(
   const lines: PropertyLine[] = []
   if (record.specialty) lines.push({ label: "Specialty", value: SHOP_LABEL[record.specialty] })
   if (structure.kind === "farmstead") {
+    lines.push({ label: "Prairie tiles", value: `${record.prairie ?? 0}` })
+    lines.push({
+      label: "Avg. fertility",
+      value: record.fertility === undefined ? "—" : record.fertility.toLocaleString("en-US", { maximumFractionDigits: 1 }),
+    })
     lines.push({ label: "Crops", value: record.uses.length > 0 ? [...record.uses.map((crop) => CROP_LABEL[crop]), "Fallow"].join(", ") : "No prairie crops" })
     if (record.fruitAge >= 0) lines.push({ label: "Orchard", value: record.fruitAge === 34 ? "Year 34, wood in February" : `Year ${record.fruitAge}` })
   }

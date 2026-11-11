@@ -21,6 +21,11 @@ const OFFICE_PANTRY: readonly { good: Good; hundredths: number }[] = [
   { good: "textiles", hundredths: 20 },
 ]
 
+const BRIDGE_HOURS = 300
+/** 5 t of lumber and 0.1 t of steel parts, in hundredths. */
+const BRIDGE_LUMBER = 500
+const BRIDGE_PARTS = 10
+
 export type RoadTile = {
   index: number
   projectId: number
@@ -30,7 +35,10 @@ export type RoadTile = {
   woodYield: number
   /** Hundredths of wood taken from the pantry when the tile is finished. */
   woodNeed: number
-  /** Woodland and forest become prairie. Scrub and wetland stay. */
+  /** Hundredths of lumber and steel parts taken from the pantry when a bridge tile is finished. */
+  lumberNeed: number
+  partsNeed: number
+  /** Woodland and forest become prairie. Scrub and wetland stay. A bridge leaves the water. */
   clear: boolean
 }
 
@@ -65,6 +73,7 @@ export function paintRoad(
   blocked: (index: number) => boolean,
   offices: readonly OfficeCrew[],
   structures: readonly Structure[],
+  kind: "path" | "bridge" = "path",
 ): RoadBook {
   let next = book
   let run: number[] = []
@@ -79,7 +88,7 @@ export function paintRoad(
         if (tile) touch.add(tile.projectId)
       }
     }
-    const absorbed = absorb(next, [...touch], run, terrain, feature, offices, structures)
+    const absorbed = absorb(next, [...touch], run, terrain, feature, offices, structures, kind)
     next = absorbed.book
     carry = absorbed.projectId
     run = []
@@ -97,7 +106,7 @@ export function paintRoad(
       carry = existing.projectId
       continue
     }
-    if (!openGround(terrain, index, blocked)) {
+    if (kind === "bridge" ? !bridgeTileOpen(terrain, index, size) || blocked(index) : !openGround(terrain, index, blocked)) {
       flush()
       carry = null
       continue
@@ -189,6 +198,7 @@ export function projectLines(
   wage: number,
   woodPrice: number,
   pantryWood: number,
+  bill: { lumber: number; parts: number; lumberPrice: number; partsPrice: number } = { lumber: 0, parts: 0, lumberPrice: 0, partsPrice: 0 },
 ): PropertyLine[] {
   const tiles = project.tiles.map((index) => tileAt(book, index)).filter((tile): tile is RoadTile => tile !== null)
   const total = tiles.reduce((sum, tile) => sum + tile.hours, 0)
@@ -196,23 +206,36 @@ export function projectLines(
   const spent = total - left
   const need = tiles.reduce((sum, tile) => sum + (tile.spent >= tile.hours ? 0 : tile.woodNeed), 0)
   const yieldWood = tiles.reduce((sum, tile) => sum + (tile.spent >= tile.hours ? 0 : tile.woodYield), 0)
+  const lumberNeed = tiles.reduce((sum, tile) => sum + (tile.spent >= tile.hours ? 0 : tile.lumberNeed), 0)
+  const partsNeed = tiles.reduce((sum, tile) => sum + (tile.spent >= tile.hours ? 0 : tile.partsNeed), 0)
   const buy = Math.max(0, need - yieldWood - Math.max(0, pantryWood))
+  const lumberBuy = Math.max(0, lumberNeed - Math.max(0, bill.lumber))
+  const partsBuy = Math.max(0, partsNeed - Math.max(0, bill.parts))
   const office = project.officeId === null ? null : offices.find((item) => item.structureId === project.officeId) ?? null
   const monthly = (office?.crew.length ?? 0) * MONTHLY_HOURS
   const status = left <= 0 ? "Finished" : spent > 0 ? "Building" : "Planned"
   const months = monthly > 0 ? Math.ceil(left / monthly) : 0
-  return [
-    { label: "Kind", value: "Cart Path" },
+  const bridge = tiles.some((tile) => tile.lumberNeed > 0)
+  const path = tiles.some((tile) => tile.lumberNeed === 0)
+  const kind = bridge && path ? "Cart Path and Bridge" : bridge ? "Wooden Bridge" : "Cart Path"
+  const lines: PropertyLine[] = [
+    { label: "Kind", value: kind },
     { label: "Status", value: status },
     { label: "Tiles", value: `${tiles.length}` },
     { label: "Man-hours", value: left === total ? `${total}` : `${left} left of ${total}` },
     { label: "Wood needed", value: need > 0 ? formatTons(need) : "None" },
     { label: "Wood from clearing", value: yieldWood > 0 ? formatTons(yieldWood) : "None" },
-    { label: "Resource cost", value: money(Math.round((woodPrice * buy) / 100)) },
+  ]
+  if (lumberNeed > 0) lines.push({ label: "Lumber needed", value: formatTons(lumberNeed) })
+  if (partsNeed > 0) lines.push({ label: "Steel parts needed", value: formatTons(partsNeed) })
+  const dollars = Math.round((woodPrice * buy) / 100) + Math.round((bill.lumberPrice * lumberBuy) / 100) + Math.round((bill.partsPrice * partsBuy) / 100)
+  lines.push(
+    { label: "Resource cost", value: money(dollars) },
     { label: "Labor cost", value: money(Math.round((Math.max(0, wage) / YEARLY_HOURS) * total)) },
     { label: "Time", value: left <= 0 ? "Finished" : monthly > 0 ? `${months} month${months === 1 ? "" : "s"}` : "No crew" },
     { label: "Office", value: project.officeId === null ? "None" : `Office ${project.officeId}` },
-  ]
+  )
+  return lines
 }
 
 /** What a staffed office still needs to reach its lumber, steel parts, and textiles. */
@@ -249,6 +272,14 @@ export function supplyOrders(book: RoadBook, farms: Farms, structures: readonly 
     const yieldWood = tiles.reduce((sum, tile) => sum + (tile.spent >= tile.hours ? 0 : tile.woodYield), 0)
     const short = need - yieldWood - (row.store.wood ?? 0)
     if (short > 0) orders.push({ structureId: structure.id, good: "wood", hundredths: short })
+    const unfinished = (pick: (tile: RoadTile) => number) =>
+      tiles.reduce((sum, tile) => sum + (tile.spent >= tile.hours ? 0 : pick(tile)), 0)
+    const lumberTarget = OFFICE_PANTRY.find((item) => item.good === "lumber")?.hundredths ?? 0
+    const partsTarget = OFFICE_PANTRY.find((item) => item.good === "steel-parts")?.hundredths ?? 0
+    const lumberShort = unfinished((tile) => tile.lumberNeed) - Math.max(row.store.lumber ?? 0, lumberTarget)
+    const partsShort = unfinished((tile) => tile.partsNeed) - Math.max(row.store["steel-parts"] ?? 0, partsTarget)
+    if (lumberShort > 0) orders.push({ structureId: structure.id, good: "lumber", hundredths: lumberShort })
+    if (partsShort > 0) orders.push({ structureId: structure.id, good: "steel-parts", hundredths: partsShort })
   }
   orders.push(...pantryOrders(farms, structures, staffed))
   return orders
@@ -310,6 +341,8 @@ export function runRoads(
         const tile = tileOf.get(index)
         if (!tile || tile.spent >= tile.hours) continue
         if (tile.woodNeed > (row?.store.wood ?? 0)) continue
+        if (tile.lumberNeed > (row?.store.lumber ?? 0)) continue
+        if (tile.partsNeed > (row?.store["steel-parts"] ?? 0)) continue
         const step = Math.min(budget, tile.hours - tile.spent)
         tile.spent += step
         budget -= step
@@ -318,6 +351,8 @@ export function runRoads(
         if (tile.spent < tile.hours) continue
         if (row) {
           row.store.wood = (row.store.wood ?? 0) + tile.woodYield - tile.woodNeed
+          if (tile.lumberNeed > 0) row.store.lumber = (row.store.lumber ?? 0) - tile.lumberNeed
+          if (tile.partsNeed > 0) row.store["steel-parts"] = (row.store["steel-parts"] ?? 0) - tile.partsNeed
         }
         if (tile.clear) {
           write()
@@ -364,8 +399,14 @@ export function runRoads(
   }
 }
 
-export function roadCells(book: RoadBook): { index: number; done: boolean }[] {
-  return book.tiles.map((tile) => ({ index: tile.index, done: tile.spent >= tile.hours }))
+export function roadCells(book: RoadBook): { index: number; done: boolean; bridge: boolean }[] {
+  return book.tiles.map((tile) => ({ index: tile.index, done: tile.spent >= tile.hours, bridge: tile.lumberNeed > 0 }))
+}
+
+/** Sea or fresh water with land on at least one side. A bridge tile does not count as that land. */
+export function bridgeTileOpen(terrain: Uint8Array, index: number, size: number): boolean {
+  if (!isChannel(terrain, index)) return false
+  return beside(index, size).some((neighbor) => !isChannel(terrain, neighbor))
 }
 
 /** A straight east, west, north, or south line from the first cell toward the second. */
@@ -392,12 +433,13 @@ function absorb(
   feature: Uint8Array,
   offices: readonly OfficeCrew[],
   structures: readonly Structure[],
+  kind: "path" | "bridge",
 ): { book: RoadBook; projectId: number } {
   const ids = [...new Set(projectIds)].filter((id) => book.projects.some((project) => project.id === id)).sort((a, b) => a - b)
   const additions = fresh.filter((index) => !tileAt(book, index))
   if (ids.length === 0) {
     const id = book.nextId
-    const tiles = additions.map((index) => makeTile(index, id, terrain, feature))
+    const tiles = additions.map((index) => makeTile(index, id, terrain, feature, kind))
     const project: RoadProject = { id, tiles: additions, officeId: null }
     return {
       book: { ...book, nextId: id + 1, projects: [...book.projects, project], tiles: [...book.tiles, ...tiles] },
@@ -419,7 +461,7 @@ function absorb(
   }
   for (const index of additions) push(index)
   const moved = book.tiles.map((tile) => (rest.has(tile.projectId) ? { ...tile, projectId: keep } : tile))
-  const created = additions.map((index) => makeTile(index, keep, terrain, feature))
+  const created = additions.map((index) => makeTile(index, keep, terrain, feature, kind))
   const held = new Map<number, RoadTile>()
   for (const tile of moved) if (tile.projectId === keep) held.set(tile.index, tile)
   for (const tile of created) held.set(tile.index, tile)
@@ -441,9 +483,12 @@ function absorb(
   return { book: { ...book, projects, tiles: [...moved, ...created] }, projectId: keep }
 }
 
-function makeTile(index: number, projectId: number, terrain: Uint8Array, feature: Uint8Array): RoadTile {
+function makeTile(index: number, projectId: number, terrain: Uint8Array, feature: Uint8Array, kind: "path" | "bridge"): RoadTile {
+  if (kind === "bridge") {
+    return { index, projectId, spent: 0, hours: BRIDGE_HOURS, woodYield: 0, woodNeed: 0, lumberNeed: BRIDGE_LUMBER, partsNeed: BRIDGE_PARTS, clear: false }
+  }
   const cost = cartCost(terrain[index], feature[index])
-  return { index, projectId, spent: 0, hours: cost.hours, woodYield: cost.woodYield, woodNeed: cost.woodNeed, clear: cost.clear }
+  return { index, projectId, spent: 0, hours: cost.hours, woodYield: cost.woodYield, woodNeed: cost.woodNeed, lumberNeed: 0, partsNeed: 0, clear: cost.clear }
 }
 
 /** Hill adds half the base. Scrub, woods, and wetland then add their own hours. */
@@ -466,6 +511,11 @@ function cartCost(ground: number, cover: number): { hours: number; woodYield: nu
     woodNeed = WETLAND_WOOD
   }
   return { hours, woodYield, woodNeed, clear }
+}
+
+function isChannel(terrain: Uint8Array, index: number): boolean {
+  const ground = terrain[index]
+  return ground === Terrain.Sea || ground === Terrain.Fresh
 }
 
 function openGround(terrain: Uint8Array, index: number, blocked: (index: number) => boolean): boolean {

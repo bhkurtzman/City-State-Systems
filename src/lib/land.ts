@@ -1,5 +1,5 @@
 import type { Structure } from "@/lib/buildings"
-import { noteOperatingIncome, openIncomeMonth, propertySeekers, type People } from "@/lib/people"
+import { noteOperatingIncome, occupantCount, openIncomeMonth, propertySeekers, type People } from "@/lib/people"
 import { Feature, Terrain } from "@/lib/types"
 
 /** A sale price is twenty yearly lease payments. */
@@ -99,7 +99,7 @@ export function settleHoldings(
   workshopsOpen = true,
   foundedYear = year,
   caravan: CaravanOffer | null = null,
-): { holdings: Holdings; people: People; toTreasury: number } {
+): { holdings: Holdings; people: People; toTreasury: number; vacated: number[] } {
   void seed
   const byId = new Map(structures.map((structure) => [structure.id, structure]))
   const rows = holdings.rows
@@ -143,15 +143,18 @@ export function settleHoldings(
 
   const unsold = rows.filter((row) => row.owner < 0)
   let opened = holdings.opened
+  let vacated: number[] = []
   if (unsold.length > 0) {
     const quotes = new Map(unsold.map((row) => [row.structureId, quoteFor(byId.get(row.structureId) as Structure, terrain, feature, size, schedule)]))
     const owned = new Set<number>()
     for (const row of rows) if (row.owner >= 0) owned.add(row.owner)
-    toTreasury += offerByWealth(unsold, quotes, byId, people, owned, wealth, income, incomeLog, month, adultCost, workshopsOpen, year, foundedYear, rows, caravan)
+    const offered = offerByWealth(unsold, quotes, byId, people, owned, wealth, income, incomeLog, month, adultCost, workshopsOpen, year, foundedYear, rows, caravan)
+    toTreasury += offered.paid
+    vacated = offered.vacated
     opened = true
   }
 
-  return { holdings: { opened, rows }, people: { ...openedBooks, wealth, income, incomeLog }, toTreasury }
+  return { holdings: { opened, rows }, people: { ...openedBooks, wealth, income, incomeLog }, toTreasury, vacated }
 }
 
 /** Extra inspector lines for the plot on this cell. */
@@ -167,11 +170,13 @@ export function propertyLines(
   if (structure.kind === "construction-office") return [{ label: "Owner", value: "State" }]
   if (structure.pending) return [{ label: "Offer", value: "Not for sale yet" }]
   const row = holdings.rows.find((item) => item.structureId === structure.id)
+  const living = householdLine(structure, holdings, people, row?.owner ?? -1)
   if (!row || row.owner < 0) {
     const quote = quoteFor(structure, terrain, feature, size, schedule)
     return [
       { label: "Offer", value: quote.tenure === "sale" ? "For sale" : "For lease" },
       { label: "Price", value: quote.tenure === "sale" ? dollars(quote.due) : `${dollars(quote.due)} a year` },
+      ...(living ? [living] : []),
     ]
   }
   const houseName = people.surnames[people.surname[row.owner]]
@@ -179,10 +184,20 @@ export function propertyLines(
     { label: "Owner", value: houseName || `Family ${row.owner}` },
     { label: "Purse", value: dollars(people.wealth[row.owner] ?? 0) },
   ]
+  if (living) lines.push(living)
   if (row.lease > 0) lines.push({ label: "Lease", value: `${dollars(row.lease)} a year` })
   if (row.paid > 0) lines.push({ label: "Paid", value: dollars(row.paid) })
   if (row.lease > 0 || row.paid > 0) lines.push({ label: "Upkeep", value: `${fineMoney(monthlyCapital(row))} a month` })
   return lines
+}
+
+const HOUSEHOLD_KIND = new Set<Structure["kind"]>(["farmstead", "shack", "market", "trading-post", "caravan-house", "workshop", "sawpit"])
+
+function householdLine(structure: Structure, holdings: Holdings, people: People, owner: number): PropertyLine | null {
+  if (!HOUSEHOLD_KIND.has(structure.kind)) return null
+  const owners = new Set<number>()
+  for (const row of holdings.rows) if (row.owner >= 0) owners.add(row.owner)
+  return { label: "Occupants", value: `${owner < 0 ? 0 : occupantCount(people, owner, owners)}` }
 }
 
 /** What the treasury pays to take this plot back. A lease is converted at twenty years. */
@@ -234,9 +249,10 @@ function offerByWealth(
   foundedYear: number,
   rows: Holding[],
   caravan: CaravanOffer | null,
-): number {
+): { paid: number; vacated: number[] } {
   let traders = caravanTraders(rows, byId, people)
   let seekers = propertySeekers(people, owned)
+  const vacated: number[] = []
   const open = [...unsold].sort((a, b) => {
     const left = byId.get(a.structureId) as Structure
     const right = byId.get(b.structureId) as Structure
@@ -267,12 +283,12 @@ function offerByWealth(
         noteOperatingIncome(income, incomeLog, pick, -labor, month)
         paid += labor
       }
-      if (structure.kind === "caravan-house") vacatePosts(rows, byId, pick)
+      if (structure.kind === "caravan-house") vacated.push(...vacatePosts(rows, byId, pick))
     }
     seekers = seekers.filter((id) => id !== pick)
     traders = traders.filter((id) => id !== pick)
   }
-  return paid
+  return { paid, vacated }
 }
 
 /** Heads who already run a trading post. They are offered a caravan house ahead of everyone else. */
@@ -288,14 +304,17 @@ function caravanTraders(rows: readonly Holding[], byId: Map<number, Structure>, 
   return ids
 }
 
-/** The trading post goes back to the state when its family takes a caravan house. */
-function vacatePosts(rows: Holding[], byId: Map<number, Structure>, head: number) {
+/** The family's posts are left empty. The caller removes the buildings after the pantry has moved. */
+function vacatePosts(rows: Holding[], byId: Map<number, Structure>, head: number): number[] {
+  const ids: number[] = []
   for (const row of rows) {
     if (row.owner !== head || byId.get(row.structureId)?.kind !== "trading-post") continue
+    ids.push(row.structureId)
     row.owner = -1
     row.lease = 0
     row.paid = 0
   }
+  return ids
 }
 
 function offerRank(structure: Structure): number {

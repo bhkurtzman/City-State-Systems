@@ -5,7 +5,7 @@ export const FARMSTEAD_CAP = 2000
 
 export type PlopKind = "trading-post" | "workshop" | "market" | "sawpit"
 export type StructureKind = "farmstead" | "shack" | "construction-office" | "caravan-house" | PlopKind
-export type BuildTool = StructureKind | "logging-camp" | "mining-camp" | "cart-path" | "delete"
+export type BuildTool = StructureKind | "logging-camp" | "mining-camp" | "cart-path" | "wooden-bridge" | "delete"
 
 /** Standing buildings of these kinds, not ones marked for removal. Deleting one frees the slot. */
 export const BUILD_CAP: Partial<Record<BuildTool, number>> = {
@@ -125,6 +125,31 @@ export function shackPreview(
 }
 
 export type OfficePreview = { tiles: number[]; open: boolean }
+
+/**
+ * On-map cells of a rectangle with the click as the northwest corner.
+ * North–south is the row count and east–west is the column count.
+ * Null when a side is below 1 or the full rectangle is over 2,000 tiles.
+ * Roads and buildings are not checked here.
+ */
+export function farmRect(
+  x: number,
+  y: number,
+  northSouth: number,
+  eastWest: number,
+  size: number,
+): { x: number; y: number }[] | null {
+  if (!Number.isInteger(northSouth) || !Number.isInteger(eastWest) || northSouth < 1 || eastWest < 1) return null
+  if (northSouth * eastWest > FARMSTEAD_CAP) return null
+  if (x < 0 || y < 0 || x >= size || y >= size) return null
+  const rows = Math.min(northSouth, size - y)
+  const columns = Math.min(eastWest, size - x)
+  const cells: { x: number; y: number }[] = []
+  for (let row = 0; row < rows; row++) {
+    for (let column = 0; column < columns; column++) cells.push({ x: x + column, y: y + row })
+  }
+  return cells
+}
 
 /** A 3×3 office with the click as the northwest corner. Null when the square leaves the map. */
 export function officePreview(
@@ -258,13 +283,14 @@ export function applyBuild(
   terrain: Uint8Array,
   feature: Uint8Array,
   size: number,
-  mode: "tap" | "stroke" | "place",
+  mode: "tap" | "stroke" | "place" | "stamp",
   latch: Set<number>,
   allowNew = false,
   roads: ReadonlySet<number> = new Set(),
 ): Settlement {
   if (cells.length === 0 || tool === null) return settlement
   if (tool === "farmstead") {
+    if (mode === "stamp") return stampRectangle(settlement, cells, size, terrain, feature, roads)
     return mode === "tap"
       ? tapFarm(settlement, pack(cells[0], size), size, terrain, feature, roads)
       : paintStroke(settlement, cells.map((cell) => pack(cell, size)), size, terrain, feature, allowNew, roads)
@@ -348,6 +374,79 @@ function paintStroke(
     if (next !== before) canCreate = false
   }
   if (next === settlement) return settlement
+  return closeFarms(next, size, terrain, feature, roads)
+}
+
+/**
+ * One planned farm from a rectangle. Road and building tiles are left out.
+ * Tiles separated from the rest by those gaps are dropped. A piece that touches
+ * an existing farm merges into it.
+ */
+function stampRectangle(
+  settlement: Settlement,
+  cells: readonly { x: number; y: number }[],
+  size: number,
+  terrain: Uint8Array,
+  feature: Uint8Array,
+  roads: ReadonlySet<number>,
+): Settlement {
+  const occupied = new Set<number>()
+  const farmAt = new Map<number, Structure>()
+  for (const structure of settlement.structures) {
+    for (const tile of structure.tiles) occupied.add(tile)
+    if (structure.kind === "farmstead" && !structure.removing) {
+      for (const tile of structure.tiles) farmAt.set(tile, structure)
+    }
+  }
+  const open = new Set<number>()
+  const order: number[] = []
+  for (const cell of cells) {
+    const index = pack(cell, size)
+    order.push(index)
+    if (roads.has(index) || occupied.has(index)) continue
+    open.add(index)
+  }
+  const start = order.find((index) => open.has(index))
+  if (start === undefined) return settlement
+  const keep: number[] = []
+  const stack = [start]
+  open.delete(start)
+  while (stack.length > 0) {
+    const index = stack.pop() as number
+    keep.push(index)
+    for (const neighbor of edgeNeighbors(index, size)) {
+      if (!open.has(neighbor)) continue
+      open.delete(neighbor)
+      stack.push(neighbor)
+    }
+  }
+  const near = new Map<number, Structure>()
+  for (const index of keep) {
+    for (const neighbor of edgeNeighbors(index, size)) {
+      const structure = farmAt.get(neighbor)
+      if (structure) near.set(structure.id, structure)
+    }
+  }
+  let next: Settlement
+  if (near.size === 0) {
+    const tiles = uniqueSorted(keep)
+    next = append(settlement, { kind: "farmstead", tiles, fresh: tiles, pending: true, removing: false, home: null })
+  } else {
+    const hosts = [...near.values()].sort((a, b) => a.id - b.id)
+    const host = hosts[0]
+    const others = hosts.slice(1)
+    const drop = new Set(others.map((structure) => structure.id))
+    const tiles = uniqueSorted([...keep, ...host.tiles, ...others.flatMap((structure) => structure.tiles)])
+    const pending = host.pending && others.every((structure) => structure.pending)
+    const fresh = pending
+      ? tiles
+      : uniqueSorted([...keep, ...host.fresh, ...others.flatMap((structure) => (structure.pending ? structure.tiles : structure.fresh))])
+    const merged = retile(host, tiles, fresh, pending, terrain, feature, size, false)
+    next = {
+      ...settlement,
+      structures: settlement.structures.filter((structure) => !drop.has(structure.id)).map((structure) => (structure.id === host.id ? merged : structure)),
+    }
+  }
   return closeFarms(next, size, terrain, feature, roads)
 }
 

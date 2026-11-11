@@ -95,7 +95,6 @@ function Legend({ layer }: { layer: LayerId }) {
 
 type BuildingInspectorProps = {
   structure: Structure | null
-  size: number
   chosen: boolean
   lines: readonly PropertyLine[]
   office: OfficeCrew | null
@@ -107,7 +106,7 @@ type BuildingInspectorProps = {
   onWorkers: (structureId: number, target: number) => void
 }
 
-export function BuildingInspector({ structure, size, chosen, lines, office, wage, road, open, onToggle, onWorkers }: BuildingInspectorProps) {
+export function BuildingInspector({ structure, chosen, lines, office, wage, road, open, onToggle, onWorkers }: BuildingInspectorProps) {
   if (!open) {
     return (
       <Button type="button" variant="outline" size="sm" onClick={onToggle}>
@@ -129,7 +128,7 @@ export function BuildingInspector({ structure, size, chosen, lines, office, wage
       </CardHeader>
       <CardContent>
         {structure ? (
-          <BuildingReadout structure={structure} size={size} lines={lines} office={office} wage={wage} onWorkers={onWorkers} />
+          <BuildingReadout structure={structure} lines={lines} office={office} wage={wage} onWorkers={onWorkers} />
         ) : road && road.length > 0 ? (
           <dl className="grid gap-2 text-sm">
             {road.map((line) => (
@@ -150,14 +149,12 @@ export function BuildingInspector({ structure, size, chosen, lines, office, wage
 
 function BuildingReadout({
   structure,
-  size,
   lines,
   office,
   wage,
   onWorkers,
 }: {
   structure: Structure
-  size: number
   lines: readonly PropertyLine[]
   office: OfficeCrew | null
   wage: number
@@ -174,10 +171,6 @@ function BuildingReadout({
       <Row label="Status" value={status} />
       <Row label="Tiles" value={`${structure.tiles.length}`} />
       <Row label="Area" value={`${(structure.tiles.length * CELL_M * CELL_M).toLocaleString("en-US")} m²`} />
-      <Row label="Extent" value={formatExtent(structure.tiles, size)} />
-      {structure.kind === "farmstead" || structure.kind === "shack" ? (
-        <Row label="House" value={structure.home ? `${formatCell(structure.home[0], size)} and ${formatCell(structure.home[1], size)}` : "None"} />
-      ) : null}
       {fresh > 0 ? <Row label="Planned tiles" value={`${fresh}`} /> : null}
       {lines.map((line) => (
         <Row key={line.label} label={line.label} value={line.value} />
@@ -210,29 +203,6 @@ function BuildingReadout({
       ) : null}
     </dl>
   )
-}
-
-function formatCell(index: number, size: number) {
-  const x = index % size
-  const y = (index - x) / size
-  return `${x}, ${y}`
-}
-
-function formatExtent(tiles: readonly number[], size: number) {
-  let minX = size
-  let minY = size
-  let maxX = 0
-  let maxY = 0
-  for (const index of tiles) {
-    const x = index % size
-    const y = (index - x) / size
-    if (x < minX) minX = x
-    if (y < minY) minY = y
-    if (x > maxX) maxX = x
-    if (y > maxY) maxY = y
-  }
-  if (minX === maxX && minY === maxY) return formatCell(minY * size + minX, size)
-  return `${minX}, ${minY} to ${maxX}, ${maxY}`
 }
 
 function Row({ label, value }: { label: string; value: string }) {

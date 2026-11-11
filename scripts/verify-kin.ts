@@ -1,5 +1,5 @@
 import { emptyHoldings, plotSalePrice, settleHoldings, type Holdings } from "../src/lib/land"
-import { advancePeople, classCensus, economyCensus, emptyEpidemic, propertySeekers, type People } from "../src/lib/people"
+import { advancePeople, classCensus, economyCensus, emptyEpidemic, grantBirthdaySeeds, propertySeekers, type People } from "../src/lib/people"
 import { defaultLandSchedule } from "../src/lib/land"
 import type { Structure } from "../src/lib/buildings"
 
@@ -105,9 +105,12 @@ const january = advancePeople(seeded, 3, 0, "kin-seed", emptyEpidemic(), undefin
   memberCost: 75,
   salePrice: () => 0,
 })
-assert("younger son receives the 20% seed", january.people.wealth[3] === 2000, String(january.people.wealth[3]))
-assert("heir is not seeded", january.people.wealth[2] === 0, String(january.people.wealth[2]))
-assert("father keeps the rest", january.people.wealth[0] === 8000, String(january.people.wealth[0]))
+assert("January does not seed a son", january.people.wealth[3] === 0, String(january.people.wealth[3]))
+const gifted = new Int32Array(january.people.wealth)
+grantBirthdaySeeds(gifted, january.people, [], 6, 100, 75)
+assert("younger son receives the 20% seed on the father's birthday", gifted[3] === 2000, String(gifted[3]))
+assert("heir is not seeded", gifted[2] === 0, String(gifted[2]))
+assert("father keeps the rest", gifted[0] === 8000, String(gifted[0]))
 
 const folded = people(4, (table, id) => {
   const rows = [
@@ -202,3 +205,26 @@ const blocked = settleHoldings(
   100,
 )
 assert("400 dollars cannot take a workshop", blocked.holdings.rows[0].owner === -1, String(blocked.holdings.rows[0].owner))
+
+const unseeded = new Int32Array(january.people.wealth)
+const marked = { ...january.people, starving: new Uint8Array(january.people.age.length) }
+marked.starving[0] = 1
+grantBirthdaySeeds(unseeded, marked, [], 6, 100, 75)
+assert("a starving father seeds no son", unseeded[3] === 0 && unseeded[0] === january.people.wealth[0], `${unseeded[0]},${unseeded[3]}`)
+
+let starved = false
+let spared = false
+for (let n = 0; n < 400 && (!starved || !spared); n++) {
+  const one = people(1, (table) => {
+    table.age[0] = 30
+    table.sex[0] = 1
+  })
+  one.starving = new Uint8Array([1])
+  one.starveRoll = new Uint8Array([1])
+  const step = advancePeople(one, 20, 4, `starve-${n}`, emptyEpidemic())
+  if (step.starvationDeaths === 1) starved = true
+  else if (step.people.alive[0] === 1 && step.people.starving?.[0] === 1 && step.people.starveRoll?.[0] === 0) spared = true
+}
+assert("a starvation roll can kill", starved, "")
+assert("a starvation roll can spare", spared, "")
+assert("a spared person stays starving", spared, "")

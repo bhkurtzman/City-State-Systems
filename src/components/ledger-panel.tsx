@@ -55,6 +55,8 @@ export function LedgerPanel({
   onWage,
   offices,
   structures,
+  wellbeing,
+  lastStarvationDeaths,
   onClose,
 }: {
   kind: LedgerId
@@ -84,6 +86,8 @@ export function LedgerPanel({
   onWage: (grade: keyof PublicWages, amount: number) => void
   offices: readonly OfficeCrew[]
   structures: readonly Structure[]
+  wellbeing: { households: number; adults: number; children: number } | null
+  lastStarvationDeaths: number | null
   onClose: () => void
 }) {
   const rows =
@@ -101,6 +105,15 @@ export function LedgerPanel({
   }
   if (kind === "economy") {
     return <EconomyPanel rows={rows} prices={prices} classes={classes} onClose={onClose} />
+  }
+  if (kind === "population") {
+    return (
+      <PopulationPanel
+        rows={rows}
+        wellbeing={wellbeingRows(wellbeing, lastStarvationDeaths)}
+        onClose={onClose}
+      />
+    )
   }
   if (kind === "government") {
     return (
@@ -143,6 +156,69 @@ export function LedgerPanel({
             </div>
           ))}
         </dl>
+      </CardContent>
+    </Card>
+  )
+}
+
+function wellbeingRows(
+  wellbeing: { households: number; adults: number; children: number } | null,
+  lastStarvationDeaths: number | null,
+): Row[] {
+  return [
+    {
+      label: "Households starving",
+      note: "A household that missed a food bid.",
+      value: countOf(wellbeing ? wellbeing.households : null),
+    },
+    { label: "Adults (18+)", value: countOf(wellbeing ? wellbeing.adults : null), detail: true },
+    { label: "Children (0–17)", value: countOf(wellbeing ? wellbeing.children : null), detail: true },
+    {
+      label: "Last year's deaths of starvation",
+      note: "Closed each January.",
+      value: lastStarvationDeaths === null ? BLANK : lastStarvationDeaths.toLocaleString("en-US"),
+    },
+  ]
+}
+
+function PopulationPanel({
+  rows,
+  wellbeing,
+  onClose,
+}: {
+  rows: Row[]
+  wellbeing: Row[]
+  onClose: () => void
+}) {
+  const [tab, setTab] = useState("overview")
+  return (
+    <Card className="w-full shadow-md">
+      <CardHeader>
+        <CardTitle>Population</CardTitle>
+        <CardAction>
+          <Button type="button" variant="outline" size="sm" aria-label="Close" onClick={onClose}>
+            X
+          </Button>
+        </CardAction>
+      </CardHeader>
+      <CardContent>
+        <Tabs
+          value={tab}
+          onValueChange={(value) => {
+            if (typeof value === "string") setTab(value)
+          }}
+        >
+          <TabsList className="h-auto w-full flex-wrap justify-start">
+            <TabsTrigger value="overview" className="px-1.5 text-xs">Overview</TabsTrigger>
+            <TabsTrigger value="wellbeing" className="px-1.5 text-xs">Wellbeing</TabsTrigger>
+          </TabsList>
+          <TabsContent value="overview">
+            <RowList rows={rows} />
+          </TabsContent>
+          <TabsContent value="wellbeing">
+            <RowList rows={wellbeing} />
+          </TabsContent>
+        </Tabs>
       </CardContent>
     </Card>
   )

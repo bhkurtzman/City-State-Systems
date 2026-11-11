@@ -122,6 +122,12 @@ export type People = {
   surname: Uint16Array
   /** Family names for this people. Founding writes one per family. */
   surnames: readonly string[]
+  /** 1 after a food bid failed. Every member of the household is marked. */
+  starving?: Uint8Array
+  /** Absolute month (`year * 12 + month`) of the next food retry. 0 means none. Kept on the head. */
+  starveDue?: Uint16Array
+  /** 1 when this person rolls for death at the start of the next month, before inheritance. */
+  starveRoll?: Uint8Array
 }
 
 /** Plots, prices, and the adult cost of living for one month of kinship. Founding passes null. */
@@ -133,6 +139,8 @@ export type KinBooks = {
   memberCost: number
   /** Dollars the treasury pays to take a plot back. */
   salePrice: (structureId: number) => number
+  /** Dollars a dowry must leave in the purse. The household cost is used when this is absent. */
+  keep?: (payer: number) => number
 }
 
 /** Stored in People.occupation. A person holds one of these at a time. */
@@ -440,7 +448,7 @@ export function householdHomes(
   for (const row of holdings) if (row.owner >= 0) ownerOf.set(row.structureId, row.owner)
   const homes: HouseholdHome[] = []
   for (const structure of structures) {
-    if (structure.pending || structure.removing) continue
+    if (structure.removing || (structure.pending && structure.kind !== "caravan-house")) continue
     if (
       structure.kind !== "farmstead" &&
       structure.kind !== "market" &&
@@ -536,6 +544,42 @@ export function residenceCensus(
     if (!owners.has(i)) homelessSingles += 1
   }
   return { homelessFamilies, homelessSingles }
+}
+
+/** Living people marked starving. A household is a starving head. */
+export function starvationCensus(
+  people: People,
+  homes: readonly HouseholdHome[],
+): { households: number; adults: number; children: number } {
+  const starving = people.starving
+  if (!starving) return { households: 0, adults: 0, children: 0 }
+  const headOf = residenceMap(people, ownersOf(homes))
+  let households = 0
+  let adults = 0
+  let children = 0
+  for (let id = 0; id < people.alive.length; id++) {
+    if (people.alive[id] === 0 || starving[id] === 0) continue
+    if ((people.age[id] ?? 0) >= MIN_ADULT_AGE) adults += 1
+    else children += 1
+    if (headOf[id] === id) households += 1
+  }
+  return { households, adults, children }
+}
+
+export type StarvationLedger = {
+  year: number
+  deaths: number
+  lastDeaths: number | null
+}
+
+export function beginStarvation(year: number): StarvationLedger {
+  return { year, deaths: 0, lastDeaths: null }
+}
+
+/** Fold in one month. A new calendar year closes the previous one first. */
+export function noteStarvation(ledger: StarvationLedger, year: number, deaths: number): StarvationLedger {
+  if (year === ledger.year) return { ...ledger, deaths: ledger.deaths + deaths }
+  return { year, deaths, lastDeaths: ledger.deaths }
 }
 
 export type ClassCensus = {
@@ -677,6 +721,17 @@ function ownersFromRows(rows: readonly Holding[]): Set<number> {
   const owners = new Set<number>()
   for (const row of rows) if (row.owner >= 0) owners.add(row.owner)
   return owners
+}
+
+/** Living people whose household head is this plot owner. */
+export function occupantCount(people: People, owner: number, plotOwners: ReadonlySet<number>): number {
+  if (owner < 0) return 0
+  const headOf = residenceMap(people, plotOwners)
+  let count = 0
+  for (let id = 0; id < people.age.length; id++) {
+    if (people.alive[id] !== 0 && headOf[id] === owner) count += 1
+  }
+  return count
 }
 
 /**
@@ -933,6 +988,8 @@ export type MonthStep = {
   idMap: Int32Array | null
   /** Plot book after succession and sales. Null when this month had no land to settle. */
   holdings: Holdings | null
+  /** Deaths from a starvation roll this month. Also included in `deaths`. */
+  starvationDeaths: number
 }
 
 /** A student finishing the school year, and that school's quality from 0 to 100. */
@@ -984,10 +1041,13 @@ export function schoolYearTenths(quality: number): number {
  * Plots move with the purse when a land book was passed in. The dead stay in the
  * table, so spouse and parent ids keep working.
  * In June, enrolled students bank one quality-weighted school credit, then ages 12, 17,
- * and 18 sit their exams. In January, working fathers seed landless younger sons.
- * An eldest son still at home, or a man who owns a plot, may marry. A bride's father
- * may pay a dowry. Living wives aged 18–45 may try for a child. A birth skips her for
- * the next 12 months. In January, a dead person whom no living spouse, child, or
+ * and 18 sit their exams. An eldest son still at home, or a man who owns a plot, may marry.
+ * A bride's father may pay a dowry, leaving this year's supply bill in the purse.
+ * Younger sons are seeded on the head's birthday, after the household has bought its supplies.
+ * Living wives aged 18–45 may try for a child. A birth skips her for
+ * the next 12 months. A person marked for a starvation roll is settled first,
+ * before marriage and inheritance. A starving person does not marry or have a child.
+ * In January, a dead person whom no living spouse, child, or
  * household still points at is removed and the remaining ids are rewritten.
  * A new epidemic may be declared for the following month.
  * The same people, seed, year, and month always rebuild the same result.
@@ -1024,6 +1084,12 @@ export function advancePeople(
   const retired = retiredColumn(people, count)
   const surname = new Uint16Array(people.surname)
   const surnames = people.surnames
+  const starving = new Uint8Array(count)
+  const starveDue = new Uint16Array(count)
+  const starveRoll = new Uint8Array(count)
+  if (people.starving) starving.set(people.starving.subarray(0, Math.min(count, people.starving.length)))
+  if (people.starveDue) starveDue.set(people.starveDue.subarray(0, Math.min(count, people.starveDue.length)))
+  if (people.starveRoll) starveRoll.set(people.starveRoll.subarray(0, Math.min(count, people.starveRoll.length)))
   const rows = kin ? kin.holdings.rows.map((row) => ({ ...row })) : null
   const wave = resolveEpidemic(epidemic, year, month, seed)
 
@@ -1052,6 +1118,21 @@ export function advancePeople(
     died.push(i)
   }
 
+  let starvationDeaths = 0
+  const starveRng = mulberry32(hashSeed(`${seed}|${year}|${month}|starve`))
+  for (let i = 0; i < count; i++) {
+    if (starveRoll[i] === 0) continue
+    starveRoll[i] = 0
+    if (alive[i] === 0) continue
+    const years = age[i]
+    const chance = years <= 5 ? 0.5 : years <= 12 ? 0.3 : years >= 65 ? 0.5 : 0.25
+    if (starveRng() >= chance) continue
+    alive[i] = 0
+    deaths += 1
+    starvationDeaths += 1
+    died.push(i)
+  }
+
   const books = settleKin(
     {
       wealth,
@@ -1069,6 +1150,7 @@ export function advancePeople(
       memberCost: kin?.memberCost ?? 0,
       salePrice: kin?.salePrice ?? (() => 0),
       toTreasury: 0,
+      keep: kin?.keep,
     },
     died,
   )
@@ -1090,16 +1172,14 @@ export function advancePeople(
     )
   }
 
-  if (kin && month === 0) seedSons(books)
-
   const marriages = mulberry32(hashSeed(`${seed}|${year}|${month}|marriages`))
   for (let i = 0; i < count; i++) {
-    if (alive[i] === 0 || sex[i] !== Sex.Male || spouse[i] >= 0) continue
+    if (alive[i] === 0 || sex[i] !== Sex.Male || spouse[i] >= 0 || starving[i] === 1) continue
     if (!maySeekWife(books, i)) continue
     const look = marriageLookChance(age[i])
     if (look === 0 || marriages() >= look) continue
     const wife = pickWife(i, age, sex, alive, spouse, retired, mother, father, marriages)
-    if (wife < 0) continue
+    if (wife < 0 || starving[wife] === 1) continue
     const accept = marriageAcceptChance(vigor[i], vigor[wife], education[i], education[wife])
     if (marriages() >= accept) continue
     spouse[i] = wife
@@ -1124,7 +1204,7 @@ export function advancePeople(
     }
     if (sex[i] !== Sex.Female || age[i] < MIN_ADULT_AGE || age[i] > 45) continue
     const fatherId = spouse[i]
-    if (fatherId < 0 || alive[fatherId] === 0) continue
+    if (fatherId < 0 || alive[fatherId] === 0 || starving[i] === 1 || starving[fatherId] === 1) continue
     if (rng() >= TRY_CHANCE) continue
     if (rng() >= motherFertility(age[i])) continue
     born.push({
@@ -1163,6 +1243,9 @@ export function advancePeople(
       retired,
       surname,
       surnames,
+      starving,
+      starveDue,
+      starveRoll,
     }
   } else {
     const grownCount = count + born.length
@@ -1189,6 +1272,9 @@ export function advancePeople(
       retired: new Uint8Array(grownCount),
       surname: new Uint16Array(grownCount),
       surnames,
+      starving: new Uint8Array(grownCount),
+      starveDue: new Uint16Array(grownCount),
+      starveRoll: new Uint8Array(grownCount),
     }
     grown.age.set(age)
     grown.sex.set(sex)
@@ -1212,6 +1298,9 @@ export function advancePeople(
     grown.livesWith.fill(-1, count)
     grown.retired.set(retired)
     grown.surname.set(surname)
+    grown.starving.set(starving)
+    grown.starveDue.set(starveDue)
+    grown.starveRoll.set(starveRoll)
     for (let i = 0; i < born.length; i++) {
       const at = count + i
       const child = born[i]
@@ -1244,7 +1333,7 @@ export function advancePeople(
     idMap = purged.idMap
   }
   const holdings = rows && kin ? { opened: kin.holdings.opened, rows } : null
-  return { people: next, deaths, epidemic: wave, toTreasury: books.toTreasury, idMap, holdings }
+  return { people: next, deaths, epidemic: wave, toTreasury: books.toTreasury, idMap, holdings, starvationDeaths }
 }
 
 /** A declared wave starts this month. A new roll, if it hits, waits until next month. */
@@ -1298,6 +1387,12 @@ type KinState = {
   memberCost: number
   salePrice: (structureId: number) => number
   toTreasury: number
+  keep?: (payer: number) => number
+  birthMonth?: Uint8Array
+  /** When set, only heads born in this month endow their sons. */
+  onlyMonth?: number
+  /** A starving head does not seed his sons. */
+  starving?: Uint8Array
 }
 
 /**
@@ -1593,16 +1688,49 @@ function clearPlot(row: Holding) {
   row.paid = 0
 }
 
+/** After a household's birthday purchases. Sons of 16 who hold no plot share up to 20% of what remains. */
+export function grantBirthdaySeeds(
+  wealth: Int32Array,
+  people: People,
+  rows: readonly Holding[],
+  month: number,
+  adultCost: number,
+  memberCost: number,
+) {
+  seedSons({
+    wealth,
+    alive: people.alive,
+    sex: people.sex,
+    age: people.age,
+    spouse: people.spouse,
+    mother: people.mother,
+    father: people.father,
+    livesWith: people.livesWith,
+    retired: people.retired,
+    income: people.income ?? new Int32Array(people.age.length),
+    rows: [...rows],
+    adultCost,
+    memberCost,
+    salePrice: () => 0,
+    toTreasury: 0,
+    birthMonth: people.birthMonth,
+    onlyMonth: month,
+    starving: people.starving,
+  })
+}
+
 function seedSons(state: KinState) {
   const homes = homesFromRows(state.rows ?? [])
   const owned = ownersFromRows(state.rows ?? [])
   for (const unit of households(kinView(state), homes)) {
     const head = unit.head
+    if (state.onlyMonth !== undefined && state.birthMonth?.[head] !== state.onlyMonth) continue
+    if (state.starving?.[head] === 1) continue
     if (state.alive[head] === 0 || state.sex[head] !== Sex.Male || state.retired[head] !== 0) continue
     const males = childrenOf(state, head).filter((id) => state.sex[id] === Sex.Male)
     if (males.length === 0) continue
     const heir = eldestSon(males, state)
-    const younger = males.filter((id) => id !== heir && state.age[id] >= ADOPT_AGE && !owned.has(id))
+    const younger = males.filter((id) => id !== heir && state.age[id] >= ADOPT_AGE && !owned.has(id) && (state.wealth[id] ?? 0) <= (state.wealth[head] ?? 0))
     if (younger.length === 0) continue
     const gift = purseGift(state, head, unit, SEED_SHARE)
     if (gift <= 0) continue
@@ -1645,7 +1773,8 @@ function purseGift(state: KinState, payer: number, unit: HouseholdRoll, share: n
   if (classify(unit.income, unit.wealth, cost) === "poor") return 0
   const purse = state.wealth[payer]
   const cap = Math.floor(purse * share)
-  const room = purse - cost
+  const hold = state.keep?.(payer) ?? cost
+  const room = purse - hold
   return Math.max(0, Math.min(cap, room))
 }
 
@@ -1864,6 +1993,9 @@ export function purgeUnlinkedDead(people: People): { people: People; idMap: Int3
   livesWith.fill(-1)
   const retired = new Uint8Array(kept)
   const surname = new Uint16Array(kept)
+  const starving = people.starving ? new Uint8Array(kept) : undefined
+  const starveDue = people.starveDue ? new Uint16Array(kept) : undefined
+  const starveRoll = people.starveRoll ? new Uint8Array(kept) : undefined
   for (let i = 0; i < count; i++) {
     const at = map[i]
     if (at < 0) continue
@@ -1889,6 +2021,9 @@ export function purgeUnlinkedDead(people: People): { people: People; idMap: Int3
     livesWith[at] = homeId < 0 ? -1 : map[homeId]
     retired[at] = people.retired?.[i] ?? 0
     surname[at] = people.surname[i]
+    if (starving) starving[at] = people.starving?.[i] ?? 0
+    if (starveDue) starveDue[at] = people.starveDue?.[i] ?? 0
+    if (starveRoll) starveRoll[at] = people.starveRoll?.[i] ?? 0
   }
   return {
     people: {
@@ -1914,6 +2049,9 @@ export function purgeUnlinkedDead(people: People): { people: People; idMap: Int3
       retired,
       surname,
       surnames: people.surnames,
+      starving,
+      starveDue,
+      starveRoll,
     },
     idMap: map,
   }
