@@ -191,7 +191,7 @@ export function propertyLines(
   return lines
 }
 
-const HOUSEHOLD_KIND = new Set<Structure["kind"]>(["farmstead", "shack", "market", "trading-post", "caravan-house", "workshop", "sawpit"])
+const HOUSEHOLD_KIND = new Set<Structure["kind"]>(["farmstead", "shack", "market", "trading-post", "caravan-house", "workshop", "sawpit", "shop"])
 
 function householdLine(structure: Structure, holdings: Holdings, people: People, owner: number): PropertyLine | null {
   if (!HOUSEHOLD_KIND.has(structure.kind)) return null
@@ -265,9 +265,10 @@ function offerByWealth(
     if (row.owner >= 0) continue
     const structure = byId.get(row.structureId) as Structure
     if (structure.kind === "workshop" && !workshopsOpen) continue
+    if (structure.kind === "shop" && !Number.isFinite(caravan?.extra(structure) ?? Number.POSITIVE_INFINITY)) continue
     if (structure.kind === "caravan-house" && !caravan?.linked(structure)) continue
     const quote = quotes.get(row.structureId) as Quote
-    const builds = structure.kind === "caravan-house" || structure.kind === "workshop"
+    const builds = structure.kind === "caravan-house" || structure.kind === "workshop" || structure.kind === "shop"
     const extra = builds ? caravan?.extra(structure) ?? (structure.kind === "caravan-house" ? Number.POSITIVE_INFINITY : 0) : 0
     const pool = structure.kind === "caravan-house" ? [...new Set([...traders, ...seekers])] : seekers
     const choices = pool
@@ -276,7 +277,7 @@ function offerByWealth(
     const pick = choices[0]
     if (pick === undefined) continue
     paid += assign(row, quote, pick, wealth, income, incomeLog, month)
-    if ((structure.kind === "caravan-house" || structure.kind === "workshop") && caravan) {
+    if ((structure.kind === "caravan-house" || structure.kind === "workshop" || structure.kind === "shop") && caravan) {
       const labor = caravan.labor(structure)
       if (labor > 0 && pick < wealth.length) {
         wealth[pick] -= labor
@@ -321,14 +322,14 @@ function offerRank(structure: Structure): number {
   if (structure.kind === "caravan-house") return -1
   if (structure.kind === "trading-post") return 0
   if (structure.kind === "market") return 1
-  if (structure.kind === "workshop") return 2
+  if (structure.kind === "workshop" || structure.kind === "shop") return 2
   if (structure.kind === "farmstead" && structure.tiles.length > LARGE_FARM) return 3
   if (structure.kind === "farmstead") return 4
   return 5
 }
 
 function needsPurse(structure: Structure): boolean {
-  if (structure.kind === "trading-post" || structure.kind === "market" || structure.kind === "workshop") return true
+  if (structure.kind === "trading-post" || structure.kind === "market" || structure.kind === "workshop" || structure.kind === "shop") return true
   return structure.kind === "farmstead" && structure.tiles.length > LARGE_FARM
 }
 
@@ -362,6 +363,7 @@ function openingPurse(structure: Structure): number {
 
 function canBuy(wealth: number, quote: Quote, structure: Structure, adultCost: number, year: number, foundedYear: number, extra = 0): boolean {
   if (structure.kind === "caravan-house") return wealth >= quote.due + extra
+  if (structure.kind === "shop") return Number.isFinite(extra) && wealth >= quote.due + extra + Math.max(0, Math.floor(adultCost))
   if (structure.kind === "workshop") {
     const opening = openingPurse(structure)
     const keep = year < foundedYear + OPENING_YEARS ? opening : Math.max(opening, WEALTH_YEARS * Math.max(0, Math.floor(adultCost)))

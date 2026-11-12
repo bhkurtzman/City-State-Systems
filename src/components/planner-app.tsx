@@ -58,6 +58,7 @@ import { applyBuild, canBuild, commitSettlement, emptySettlement, structureAt, s
 import { LINEAGES, type Lineage } from "@/lib/surname-banks"
 import { applyBought, caravanLines, emptyCaravans, isOpen, laborBill, materialOrders, moveInCash, openCaps, roadLinked, staffCaravans, teamsterIds, wayTons, workCaravans, type CaravanHouse } from "@/lib/caravan"
 import { applyWorkshopBought, closedWorkshops, emptyWorkshops, materialReserve, trackWorkshops, workshopCash, workshopLabor, workshopLines, workshopOrders, type WorkshopSite } from "@/lib/workshop"
+import { cheapestShopFill, shopCash, shopLabor, shopLines, trackShops } from "@/lib/shop"
 import { defaultLandSchedule, emptyHoldings, plotSalePrice, propertyLines, settleHoldings, yearlyUrbanTile, type Holding, type LandSchedule } from "@/lib/land"
 import { emptyFarms, productionLines, workFarms } from "@/lib/produce"
 import { assignOffices, emptyRoads, eraseRoad, idleOffices, paintRoad, projectAt, projectLines, projectOfOffice, roadCells, runRoads, supplyOrders, type RoadBook } from "@/lib/roads"
@@ -249,6 +250,7 @@ export function PlannerApp() {
   const [offices, setOffices] = useState<OfficeCrew[]>(emptyOffices)
   const [caravans, setCaravans] = useState<CaravanHouse[]>(emptyCaravans)
   const [workshops, setWorkshops] = useState<WorkshopSite[]>(emptyWorkshops)
+  const [shops, setShops] = useState<WorkshopSite[]>([])
   const activeTool = canBuild(settlement.structures, tool) ? tool : null
   useEffect(() => {
     if (tool && tool !== activeTool) setTool(null)
@@ -277,7 +279,7 @@ export function PlannerApp() {
   const costs = useMemo(() => {
     if (!world) return { full: 0, member: 0, keep: 0, supplies: 0, tile: 0 }
     const shelves = settlement.structures
-      .filter((structure) => structure.kind === "market" && !structure.pending && !structure.removing)
+      .filter((structure) => (structure.kind === "market" || structure.kind === "shop") && !structure.pending && !structure.removing)
       .filter((structure) => holdings.rows.some((row) => row.structureId === structure.id && row.owner >= 0))
       .map((structure) => structure.id)
     const lows = world.months.map((item) => item.low)
@@ -345,6 +347,7 @@ export function PlannerApp() {
       setOffices(emptyOffices())
       setCaravans(emptyCaravans())
       setWorkshops(emptyWorkshops())
+      setShops([])
       setWages(DEFAULT_WAGES)
       setFarms(emptyFarms())
       setTown(emptyTown())
@@ -380,6 +383,7 @@ export function PlannerApp() {
     const officeJob = selected?.kind === "construction-office" ? projectOfOffice(roads, selected.id) : null
     const caravan = selected?.kind === "caravan-house" ? caravans.find((house) => house.structureId === selected.id) ?? null : null
     const workshop = selected?.kind === "workshop" ? workshops.find((site) => site.structureId === selected.id) ?? null : null
+    const shop = selected?.kind === "shop" ? shops.find((site) => site.structureId === selected.id) ?? null : null
     const caravanLink = selected?.kind === "caravan-house" ? roadLinked(selected, roads, world.size) : false
     const caravanRow = caravan ? holdings.rows.find((row) => row.structureId === caravan.structureId && row.owner >= 0) : undefined
     const feeBill = tradingBill(town, world.months.map((item) => item.low), yearlyUrbanTile(landSchedule), wages.e1)
@@ -391,6 +395,7 @@ export function PlannerApp() {
       ...supplyOrders(roads, farms, settlement.structures, calendarMonth, new Set(offices.filter((office) => office.crew.length > 0).map((office) => office.structureId))),
       ...materialOrders(caravans, holdings.rows),
       ...workshopOrders(workshops, holdings.rows),
+      ...workshopOrders(shops, holdings.rows),
     ]
     const property =
       selected && people
@@ -399,6 +404,7 @@ export function PlannerApp() {
             ...productionLines(selected, farms, people),
             ...(selected.kind === "caravan-house" ? caravanLines(selected, caravan, caravanLink, wages.e1, town.prices, world.feature) : []),
             ...(selected.kind === "workshop" ? workshopLines(selected, workshop, wages.e1, town.prices, world.feature) : []),
+            ...(selected.kind === "shop" ? shopLines(selected, shop, wages.e1, town.prices, world.feature) : []),
             ...tradeLines(selected, holdings, town, caravanQuote, feeBill.allowance, feeBill.supplies, feeBill.tile, calendarYear, foundedYear),
             ...marketLines(selected, farms),
             ...(officeJob ? [{ label: "Project", value: `Cart path ${officeJob.id}` }] : []),
@@ -588,7 +594,7 @@ export function PlannerApp() {
                   lastRate={fertility?.lastRate ?? null}
                   schooling={schooling}
                   economy={economy}
-                  prices={townPriceRows(town, farms, settlement.structures, holdings, people, world.months[calendarMonth].low, world.terrain, world.feature, world.months.map((item) => item.low), seed.trim() || "0", calendarYear, yearlyUrbanTile(landSchedule), shipHouses, closedWorkshops(workshops), buildNeeds, foundedYear)}
+                  prices={townPriceRows(town, farms, settlement.structures, holdings, people, world.months[calendarMonth].low, world.terrain, world.feature, world.months.map((item) => item.low), seed.trim() || "0", calendarYear, yearlyUrbanTile(landSchedule), shipHouses, new Set([...closedWorkshops(workshops), ...closedWorkshops(shops)]), buildNeeds, foundedYear)}
                   living={costs.full}
                   classes={classes}
                   homelessFamilies={residence?.homelessFamilies ?? null}
@@ -728,6 +734,7 @@ export function PlannerApp() {
                 ...supplyOrders(roads, farms, committed.structures, nextMonth, new Set(offices.filter((office) => office.crew.length > 0).map((office) => office.structureId))),
                 ...materialOrders(caravans, holdings.rows),
                 ...workshopOrders(workshops, holdings.rows),
+                ...workshopOrders(shops, holdings.rows),
               ]
               const openingHouses = shipHousesNow(caravans, committed.structures, (step.holdings ?? holdings).rows, roads, world.size, feeBillNow.wage, feeBillNow.allowance, feeBillNow.supplies, feeBillNow.tile)
               const opening = workshopOpening(
@@ -767,12 +774,28 @@ export function PlannerApp() {
                   extra: (structure) => {
                     if (structure.kind === "caravan-house") return moveInCash(town.prices, wages.e1, world.feature, structure.tiles)
                     if (structure.kind === "workshop") return workshopCash(town.prices, wages.e1, workshops.find((site) => site.structureId === structure.id) ?? null, world.feature, structure.tiles)
+                    if (structure.kind === "shop") {
+                      const fill = cheapestShopFill({
+                        monthly: town.use ?? {},
+                        prices: town.prices,
+                        retail: town.retail,
+                        farms,
+                        structures: committed.structures,
+                        footprint: structure.tiles,
+                        size: world.size,
+                        stock: town.stock,
+                        prior: {},
+                      })
+                      if (!Number.isFinite(fill)) return Number.POSITIVE_INFINITY
+                      return shopCash(town.prices, wages.e1, shops.find((site) => site.structureId === structure.id) ?? null, world.feature, structure.tiles) + fill
+                    }
                     return 0
                   },
                   linked: (structure) => roadLinked(structure, roads, world.size),
                   labor: (structure) => {
                     if (structure.kind === "caravan-house") return laborBill(wages.e1, world.feature, structure.tiles)
                     if (structure.kind === "workshop" && !workshops.some((site) => site.structureId === structure.id)) return workshopLabor(wages.e1, world.feature, structure.tiles)
+                    if (structure.kind === "shop" && !shops.some((site) => site.structureId === structure.id)) return shopLabor(wages.e1, world.feature, structure.tiles)
                     return 0
                   },
                 },
@@ -780,6 +803,7 @@ export function PlannerApp() {
               const vacated = new Set(landStep.vacated)
               const placed = vacated.size === 0 ? committed : { ...committed, structures: committed.structures.map((structure) => vacated.has(structure.id) ? { ...structure, removing: true } : structure) }
               const tracked = trackWorkshops(workshops, placed.structures, landStep.holdings.rows, world.feature)
+              const trackedShops = trackShops(shops, placed.structures, landStep.holdings.rows, world.feature)
               setCalendarMonth(nextMonth)
               setCalendarYear(nextYear)
               setEpidemic(step.epidemic)
@@ -804,7 +828,7 @@ export function PlannerApp() {
                 monthAridity(world.latitude, world.months, nextMonth),
                 opening,
                 crewed.people.wealth,
-                (structureId) => materialReserve(tracked.find((site) => site.structureId === structureId) ?? null, town.prices),
+                (structureId) => materialReserve(tracked.find((site) => site.structureId === structureId) ?? trackedShops.find((site) => site.structureId === structureId) ?? null, town.prices),
               )
               const claimed = assignOffices(roads, staffed.offices, placed.structures)
               const caps = shipHousesNow(crewed.houses, placed.structures, landStep.holdings.rows, roads, world.size, feeBillNow.wage, feeBillNow.allowance, feeBillNow.supplies, feeBillNow.tile)
@@ -827,17 +851,18 @@ export function PlannerApp() {
                 supplyOrders(claimed, worked.farms, placed.structures, nextMonth, new Set(staffed.offices.filter((office) => office.crew.length > 0).map((office) => office.structureId))),
                 idleOffices(claimed, worked.farms),
                 caps,
-                [...materialOrders(crewed.houses, landStep.holdings.rows), ...workshopOrders(tracked, landStep.holdings.rows)],
-                closedWorkshops(tracked),
+                [...materialOrders(crewed.houses, landStep.holdings.rows), ...workshopOrders(tracked, landStep.holdings.rows), ...workshopOrders(trackedShops, landStep.holdings.rows)],
+                new Set([...closedWorkshops(tracked), ...closedWorkshops(trackedShops)]),
                 new Set(staffed.offices.filter((office) => office.crew.length > 0).map((office) => office.structureId)),
                 roads,
                 foundedYear,
               )
               const ground = worked.changedLand ? worked.feature : world.feature
               const built = runRoads(claimed, traded.farms, ground, staffed.offices, placed.structures, nextMonth, nextYear, gameSeed)
-              const raised = workCaravans(applyBought(crewed.houses, traded.bought), placed.structures, staffed.offices, claimed, traded.town.shipments, new Set(caps.map((cap) => cap.structureId)), world.size, applyWorkshopBought(tracked, traded.bought), built.farms, built.changedLand ? built.feature : ground)
+              const raised = workCaravans(applyBought(crewed.houses, traded.bought), placed.structures, staffed.offices, claimed, traded.town.shipments, new Set(caps.map((cap) => cap.structureId)), world.size, applyWorkshopBought([...tracked, ...trackedShops], traded.bought), built.farms, built.changedLand ? built.feature : ground)
               setCaravans(raised.houses)
-              setWorkshops(raised.sites)
+              setWorkshops(raised.sites.filter((site) => site.role !== "shop"))
+              setShops(raised.sites.filter((site) => site.role === "shop"))
               setPeople(assignOccupations(traded.people, householdHomes(placed.structures, landStep.holdings.rows), undefined, laborerIds(staffed.offices), teamsterIds(raised.houses)))
               setHoldings(landStep.holdings)
               setFarms(raised.farms)

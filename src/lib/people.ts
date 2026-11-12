@@ -174,7 +174,7 @@ export const OCCUPATION_LABEL = [
 export type HouseholdHome = {
   id: number
   owner: number
-  kind: "farmstead" | "market" | "trading-post" | "workshop" | "shack" | "caravan-house" | "sawpit"
+  kind: "farmstead" | "market" | "trading-post" | "workshop" | "shack" | "caravan-house" | "sawpit" | "shop"
 }
 
 const HOME_JOB: Record<HouseholdHome["kind"], number> = {
@@ -184,6 +184,7 @@ const HOME_JOB: Record<HouseholdHome["kind"], number> = {
   workshop: OCCUPATION.craftsman,
   sawpit: OCCUPATION.craftsman,
   market: OCCUPATION.shopkeeper,
+  shop: OCCUPATION.shopkeeper,
   shack: OCCUPATION.unemployed,
 }
 
@@ -456,7 +457,8 @@ export function householdHomes(
       structure.kind !== "caravan-house" &&
       structure.kind !== "workshop" &&
       structure.kind !== "sawpit" &&
-      structure.kind !== "shack"
+      structure.kind !== "shack" &&
+      structure.kind !== "shop"
     ) {
       continue
     }

@@ -323,7 +323,7 @@ export function workCaravans(
         cleared: house.cleared ?? clearHours === 0,
       }
     })
-  const shopStanding = new Map(structures.filter((structure) => structure.kind === "workshop" && !structure.pending && !structure.removing).map((structure) => [structure.id, structure]))
+  const shopStanding = new Map(structures.filter((structure) => (structure.kind === "workshop" || structure.kind === "shop") && !structure.pending && !structure.removing).map((structure) => [structure.id, structure]))
   const shops = sites
     .filter((site) => shopStanding.has(site.structureId))
     .map((site) => {
@@ -332,7 +332,7 @@ export function workCaravans(
     })
   const jobs: { kind: "caravan" | "workshop"; structureId: number; spent: number; goal: number; officeId: number | null }[] = [
     ...next.map((house) => ({ kind: "caravan" as const, structureId: house.structureId, spent: house.spent, goal: caravanGoal(house), officeId: house.officeId })),
-    ...shops.map((site) => ({ kind: "workshop" as const, structureId: site.structureId, spent: site.spent, goal: WORKSHOP_HOURS + (site.clearHours ?? 0), officeId: site.officeId })),
+    ...shops.map((site) => ({ kind: "workshop" as const, structureId: site.structureId, spent: site.spent, goal: (site.hours ?? WORKSHOP_HOURS) + (site.clearHours ?? 0), officeId: site.officeId })),
   ]
   const busy = new Set(offices.map((office) => office.structureId).filter((id) => projectOfOffice(book, id) !== null))
   const ready = offices.filter((office) => office.crew.length > 0 && !busy.has(office.structureId) && structures.some((structure) => structure.id === office.structureId && structure.kind === "construction-office" && !structure.pending && !structure.removing))

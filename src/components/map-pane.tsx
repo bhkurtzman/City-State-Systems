@@ -2,7 +2,7 @@
 
 import { useEffect, useImperativeHandle, useRef, useState, type PointerEvent as ReactPointerEvent, type Ref } from "react"
 import { Card, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
-import { CARAVAN_STYLE, caravanPreview, FARMSTEAD_CAP, farmRect, HOME_STYLE, isPlaced, isWater, OFFICE_STYLE, officePreview, PLOP_STYLE, raisedGround, SHACK_STYLE, shackPreview, type BuildTool, type Structure } from "@/lib/buildings"
+import { CARAVAN_STYLE, caravanPreview, FARMSTEAD_CAP, farmRect, HOME_STYLE, isPlaced, isWater, OFFICE_STYLE, officePreview, PLOP_STYLE, raisedGround, SHACK_STYLE, shackPreview, shopPreview, type BuildTool, type Structure } from "@/lib/buildings"
 import { paintLayer } from "@/lib/colors"
 import { bridgeTileOpen, cardinalLine } from "@/lib/roads"
 import { Terrain, type LayerId, type World } from "@/lib/types"
@@ -503,6 +503,12 @@ function drawGhost(
     const preview = shackPreview(hover.x, hover.y, world.size, world.terrain, world.feature, taken)
     if (!preview) return
     drawLabelBox(context, preview.tiles, world.size, view, preview.open ? SHACK_STYLE.fill : "rgba(168, 48, 36, 0.9)", SHACK_STYLE.label, 0.45)
+    return
+  }
+  if (tool === "shop") {
+    const preview = shopPreview(hover.x, hover.y, world.size, world.terrain, world.feature, taken)
+    if (!preview) return
+    drawLabelBox(context, preview.tiles, world.size, view, preview.open ? PLOP_STYLE.shop.fill : "rgba(168, 48, 36, 0.9)", PLOP_STYLE.shop.label, 0.45)
     return
   }
   if (tool === "construction-office") {

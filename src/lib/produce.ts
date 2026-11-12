@@ -112,6 +112,12 @@ export type FarmRecord = {
   trade?: Partial<Record<Good, number>>
   /** Set once, the first month a workshop has an owner. */
   specialty?: ShopSpecialty
+  /** Set once, the first month an open shop can afford a specialty. */
+  retail?: "baker" | "grocer" | "butcher" | "hardware" | "draper"
+  /** Large refill still short of half the shelf. A split delivery adds to `got` and scores once. */
+  shelfEpisode?: Partial<Record<Good, { got: number; scored: boolean; debut: boolean }>>
+  /** This good has already been lifted above half, so a later large refill can score. */
+  shelfReady?: Partial<Record<Good, true>>
 }
 
 export type Farms = { rows: FarmRecord[] }
@@ -160,35 +166,48 @@ const BUSINESS_YEAR: Partial<Record<Good, number>> = {
   "steel-tools": 3,
 }
 
-/** Hundredths a market tries to keep on the shelf. It refills after the pile falls under half. */
+/** Hundredths a market keeps on the shelf. One refill a month, in whole tons. */
 export const SHELF_TARGET: Partial<Record<Good, number>> = {
-  clothing: 50,
-  "steel-tools": 50,
-  leather: 50,
-  textiles: 50,
-  spices: 50,
-  meat: 300,
-  fish: 500,
-  grain: 500,
-  dairy: 1000,
-  fruit: 1000,
-  vegetables: 1000,
-  coal: 500,
-  wood: 5000,
+  grain: 400,
+  fruit: 500,
+  vegetables: 500,
+  meat: 200,
+  fish: 200,
+  dairy: 400,
+  clothing: 100,
+  leather: 100,
+  "steel-tools": 100,
   salt: 100,
+  "steel-parts": 100,
+  textiles: 100,
 }
 
-/** Half a shelf target, rounded to the nearest tenth of a ton. */
-function halfShelf(target: number): number {
-  return Math.round(target / 20) * 10
+/**
+ * Dollars per ton the opening shelf is treated as having cost.
+ * Foreign list price, with no trading fee. Fruit and vegetables have no list price.
+ * Meat, fish, and dairy use the same local caps as the town quote.
+ */
+const SHELF_OPEN_COST: Partial<Record<Good, number>> = {
+  grain: 180,
+  fruit: 45,
+  vegetables: 40,
+  meat: 200,
+  fish: 100,
+  dairy: 30,
+  clothing: 700,
+  leather: 900,
+  "steel-tools": 850,
+  salt: 90,
+  "steel-parts": 1500,
+  textiles: 550,
 }
 
 function isHousehold(kind: Structure["kind"]): boolean {
-  return kind === "farmstead" || kind === "shack" || kind === "market" || kind === "trading-post" || kind === "caravan-house" || kind === "workshop" || kind === "sawpit"
+  return kind === "farmstead" || kind === "shack" || kind === "market" || kind === "trading-post" || kind === "caravan-house" || kind === "workshop" || kind === "sawpit" || kind === "shop"
 }
 
 function isBusiness(kind: Structure["kind"]): boolean {
-  return kind === "market" || kind === "workshop" || kind === "trading-post" || kind === "caravan-house" || kind === "sawpit"
+  return kind === "market" || kind === "workshop" || kind === "trading-post" || kind === "caravan-house" || kind === "sawpit" || kind === "shop"
 }
 
 function emptyStore(): Record<Good, number> {
@@ -398,6 +417,7 @@ function stockRecord(structure: Structure, owner: number, _seed: string): FarmRe
     fruitAge: -1,
     prairie: 0,
     store: openingStore(structure.kind),
+    cost: structure.kind === "market" ? { ...SHELF_OPEN_COST } : undefined,
   }
 }
 
@@ -449,7 +469,7 @@ function saltFromAridity(aridity: number): number {
 
 function openingStore(kind: Structure["kind"]): Record<Good, number> {
   const store = emptyStore()
-  if (isHousehold(kind) && kind !== "workshop") {
+  if (isHousehold(kind) && kind !== "workshop" && kind !== "shop") {
     for (const good of GOODS) store[good] += HOUSEHOLD_START[good] ?? 0
   }
   if (kind === "trading-post") {
@@ -470,7 +490,7 @@ function openingStore(kind: Structure["kind"]): Record<Good, number> {
   if (kind === "market") {
     for (const good of GOODS) {
       const target = SHELF_TARGET[good]
-      if (target) store[good] = Math.max(store[good], halfShelf(target))
+      if (target) store[good] = Math.max(store[good], target)
     }
   }
   return store

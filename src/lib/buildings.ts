@@ -3,7 +3,7 @@ import { Feature, Terrain } from "@/lib/types"
 /** A settled farmstead stays within this many tiles. A larger draft is outlined and dropped. */
 export const FARMSTEAD_CAP = 2000
 
-export type PlopKind = "trading-post" | "workshop" | "market" | "sawpit"
+export type PlopKind = "trading-post" | "workshop" | "market" | "sawpit" | "shop"
 export type StructureKind = "farmstead" | "shack" | "construction-office" | "caravan-house" | PlopKind
 export type BuildTool = StructureKind | "logging-camp" | "mining-camp" | "cart-path" | "wooden-bridge" | "delete"
 
@@ -38,6 +38,7 @@ export const PLOP_STYLE: Record<PlopKind, { fill: string; label: string }> = {
   workshop: { fill: "#e07a1a", label: "WS" },
   market: { fill: "#2c6cb5", label: "M" },
   sawpit: { fill: "#a56b2f", label: "SP" },
+  shop: { fill: "#2c6cb5", label: "Sh" },
 }
 
 export const HOME_STYLE = { fill: "#2f8a3e", label: "H" }
@@ -57,6 +58,7 @@ const STRUCTURE_NAME: Record<StructureKind, string> = {
   workshop: "Workshop",
   market: "Market",
   sawpit: "Sawpit",
+  shop: "Shop",
 }
 
 export type Structure = {
@@ -82,7 +84,7 @@ export function emptySettlement(): Settlement {
 }
 
 export function isPlop(tool: BuildTool | null): tool is PlopKind {
-  return tool === "trading-post" || tool === "workshop" || tool === "market" || tool === "sawpit"
+  return tool === "trading-post" || tool === "workshop" || tool === "market" || tool === "sawpit" || tool === "shop"
 }
 
 /** A building dropped by one click: a 2×2 shop, a 1×2 shack, or a 3×3 office. */
@@ -117,6 +119,27 @@ export function shackPreview(
   const east = x + 1 < size ? ([origin, origin + 1] as [number, number]) : null
   const south = y + 1 < size ? ([origin, origin + size] as [number, number]) : null
   const open = (pair: [number, number]) => pair.every((index) => shackGround(terrain, feature, index) && !blocked(index))
+  if (east && open(east)) return { tiles: east, open: true }
+  if (south && open(south)) return { tiles: south, open: true }
+  if (east) return { tiles: east, open: false }
+  if (south) return { tiles: south, open: false }
+  return null
+}
+
+/** A 1×2 shop. East of the click when that pair is open, otherwise south. Wetland and mountain are refused. */
+export function shopPreview(
+  x: number,
+  y: number,
+  size: number,
+  terrain: Uint8Array,
+  feature: Uint8Array,
+  blocked: (index: number) => boolean,
+): ShackPreview | null {
+  if (x < 0 || y < 0 || x >= size || y >= size) return null
+  const origin = y * size + x
+  const east = x + 1 < size ? ([origin, origin + 1] as [number, number]) : null
+  const south = y + 1 < size ? ([origin, origin + size] as [number, number]) : null
+  const open = (pair: [number, number]) => pair.every((index) => raisedGround(terrain, feature, index) && !blocked(index))
   if (east && open(east)) return { tiles: east, open: true }
   if (south && open(south)) return { tiles: south, open: true }
   if (east) return { tiles: east, open: false }
@@ -308,6 +331,9 @@ export function applyBuild(
   }
   if (mode === "place" && tool === "shack") {
     return placeShack(settlement, cells[0].x, cells[0].y, size, terrain, feature, roads)
+  }
+  if (mode === "place" && tool === "shop") {
+    return placeShop(settlement, cells[0].x, cells[0].y, size, terrain, feature, roads)
   }
   if (mode === "place" && tool === "construction-office") {
     if (!canBuild(settlement.structures, tool)) return settlement
@@ -579,6 +605,27 @@ function placeShack(
   if (!preview?.open) return settlement
   return append(settlement, {
     kind: "shack",
+    tiles: [...preview.tiles],
+    fresh: [...preview.tiles],
+    pending: true,
+    removing: false,
+    home: preview.tiles,
+  })
+}
+
+function placeShop(
+  settlement: Settlement,
+  x: number,
+  y: number,
+  size: number,
+  terrain: Uint8Array,
+  feature: Uint8Array,
+  roads: ReadonlySet<number>,
+): Settlement {
+  const preview = shopPreview(x, y, size, terrain, feature, (index) => roads.has(index) || findStructure(settlement, index) !== undefined)
+  if (!preview?.open) return settlement
+  return append(settlement, {
+    kind: "shop",
     tiles: [...preview.tiles],
     fresh: [...preview.tiles],
     pending: true,

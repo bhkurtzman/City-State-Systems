@@ -44,13 +44,17 @@ const BUILD_INFO: Partial<Record<BuildTool, { name: string; detail: string }>> =
     name: "Workshop",
     detail: "800 man-hours, 20 t of lumber, and 0.3 t of steel parts. Woods add clearing time. Sawmill, blacksmith, smokehouse, creamery, or cooper.",
   },
+  shop: {
+    name: "Shop",
+    detail: "500 man-hours, 12 t of lumber, and 0.1 t of steel parts. Woods add clearing time. Baker, grocer, butcher, hardware, or draper.",
+  },
   "caravan-house": {
     name: "Caravan House",
     detail: "A 2×3 house. 1,500 man-hours, 40 t of lumber, 0.4 t of steel parts, and 0.1 t of textiles. Hauls goods once a finished road reaches the map edge.",
   },
 }
 
-export type BuildCategory = "basic" | "infrastructure" | "production"
+export type BuildCategory = "basic" | "infrastructure" | "production" | "residential"
 
 const INFRASTRUCTURE: readonly { id: BuildTool; label: string; enabled: boolean }[] = [
   { id: "cart-path", label: "Cart Path", enabled: true },
@@ -60,6 +64,10 @@ const INFRASTRUCTURE: readonly { id: BuildTool; label: string; enabled: boolean 
 const PRODUCTION: readonly { id: BuildTool; label: string; enabled: boolean }[] = [
   { id: "workshop", label: "Workshop", enabled: true },
   { id: "caravan-house", label: "Caravan House", enabled: true },
+]
+
+const RESIDENTIAL: readonly { id: BuildTool; label: string; enabled: boolean }[] = [
+  { id: "shop", label: "Shop", enabled: true },
 ]
 
 export function BuildInfoBar({
@@ -172,6 +180,15 @@ export function CategoryBar({
       <Button
         type="button"
         size="sm"
+        variant={category === "residential" ? "secondary" : "outline"}
+        aria-pressed={category === "residential"}
+        onClick={() => onCategory("residential")}
+      >
+        Residential/Shops
+      </Button>
+      <Button
+        type="button"
+        size="sm"
         variant={tool === "delete" ? "secondary" : "outline"}
         aria-pressed={tool === "delete"}
         className="ml-auto"
@@ -194,7 +211,7 @@ export function BuildingMenu({
   structures: readonly Structure[]
   onTool: (tool: BuildTool) => void
 }) {
-  const buildings = category === "infrastructure" ? INFRASTRUCTURE : category === "production" ? PRODUCTION : BASIC_BUILDINGS
+  const buildings = category === "infrastructure" ? INFRASTRUCTURE : category === "production" ? PRODUCTION : category === "residential" ? RESIDENTIAL : BASIC_BUILDINGS
   return (
     <div className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto">
       {buildings.map((building) => {

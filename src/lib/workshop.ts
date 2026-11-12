@@ -23,6 +23,10 @@ export type WorkshopSite = {
   /** Hundredths of a ton of wood the pantry receives when those hours are done. */
   clearWood: number
   cleared: boolean
+  /** Build hours before clearing. A shop sets this; a workshop leaves it empty. */
+  hours?: number
+  /** Set on a shop so its site is not stored with the workshops. */
+  role?: "shop"
 }
 
 export function emptyWorkshops(): WorkshopSite[] {
@@ -52,7 +56,7 @@ export function materialReserve(site: WorkshopSite | null, prices: Partial<Recor
 }
 
 export function workshopGoal(site: WorkshopSite): number {
-  return WORKSHOP_HOURS + (site.clearHours ?? 0)
+  return (site.hours ?? WORKSHOP_HOURS) + (site.clearHours ?? 0)
 }
 
 export function isWorkshopOpen(site: WorkshopSite): boolean {
