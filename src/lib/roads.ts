@@ -18,7 +18,6 @@ const SUPPLY_LOT = 10
 const OFFICE_PANTRY: readonly { good: Good; hundredths: number }[] = [
   { good: "lumber", hundredths: 5000 },
   { good: "steel-parts", hundredths: 50 },
-  { good: "textiles", hundredths: 20 },
 ]
 
 const BRIDGE_HOURS = 300
@@ -238,7 +237,7 @@ export function projectLines(
   return lines
 }
 
-/** What a staffed office still needs to reach its lumber, steel parts, and textiles. */
+/** What a staffed office still needs to reach its lumber and steel parts. */
 export function pantryOrders(farms: Farms, structures: readonly Structure[], staffed: ReadonlySet<number>): StateNeed[] {
   const orders: StateNeed[] = []
   for (const structure of structures) {

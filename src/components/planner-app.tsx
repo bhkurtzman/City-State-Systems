@@ -60,9 +60,9 @@ import { applyBought, caravanLines, emptyCaravans, isOpen, laborBill, materialOr
 import { applyWorkshopBought, closedWorkshops, emptyWorkshops, materialReserve, trackWorkshops, workshopCash, workshopLabor, workshopLines, workshopOrders, type WorkshopSite } from "@/lib/workshop"
 import { cheapestShopFill, shopCash, shopLabor, shopLines, trackShops } from "@/lib/shop"
 import { defaultLandSchedule, emptyHoldings, plotSalePrice, propertyLines, settleHoldings, yearlyUrbanTile, type Holding, type LandSchedule } from "@/lib/land"
-import { emptyFarms, productionLines, workFarms } from "@/lib/produce"
+import { emptyFarms, productionLines, workFarms, type Good } from "@/lib/produce"
 import { assignOffices, emptyRoads, eraseRoad, idleOffices, paintRoad, projectAt, projectLines, projectOfOffice, roadCells, runRoads, supplyOrders, type RoadBook } from "@/lib/roads"
-import { caravanFee, emptyTown, familyAllowance, householdSupplyBill, livingCosts, marketLines, marketSale, operatingSupplies, rollTradingFee, townPriceRows, tradeLines, tradeMonth, tradingBill, workshopOpening, type ShipHouse } from "@/lib/trade"
+import { caravanFee, caravanSupplies, emptyTown, familyAllowance, householdSupplyBill, livingCosts, marketLines, marketSale, operatingSupplies, rollTradingFee, townPriceRows, tradeLines, tradeMonth, tradingBill, workshopOpening, type ShipHouse } from "@/lib/trade"
 import { runGeneration } from "@/lib/run-generation"
 import { monthWeather } from "@/lib/weather"
 import { LAYERS, type Coast, type LayerId, type MapSize, type MonthClimate, type World } from "@/lib/types"
@@ -388,9 +388,9 @@ export function PlannerApp() {
     const caravanRow = caravan ? holdings.rows.find((row) => row.structureId === caravan.structureId && row.owner >= 0) : undefined
     const feeBill = tradingBill(town, world.months.map((item) => item.low), yearlyUrbanTile(landSchedule), wages.e1)
     const caravanQuote = caravan && caravanRow && isOpen(caravan)
-      ? caravanFee(caravan.crew.length, wayTons(caravan.crew.length, caravanLink), feeBill.wage, feeBill.allowance, feeBill.supplies * 2, feeBill.tile)
+      ? caravanFee(caravan.crew.length, wayTons(caravan.crew.length, caravanLink), feeBill.wage, feeBill.allowance, caravanSupplies(town.feePrices ?? town.prices, caravan.crew.length, {}, true), feeBill.tile)
       : undefined
-    const shipHouses = shipHousesNow(caravans, settlement.structures, holdings.rows, roads, world.size, feeBill.wage, feeBill.allowance, feeBill.supplies, feeBill.tile)
+    const shipHouses = shipHousesNow(caravans, settlement.structures, holdings.rows, roads, world.size, feeBill.wage, feeBill.allowance, town.feePrices ?? town.prices, feeBill.tile)
     const buildNeeds = [
       ...supplyOrders(roads, farms, settlement.structures, calendarMonth, new Set(offices.filter((office) => office.crew.length > 0).map((office) => office.structureId))),
       ...materialOrders(caravans, holdings.rows),
@@ -736,7 +736,7 @@ export function PlannerApp() {
                 ...workshopOrders(workshops, holdings.rows),
                 ...workshopOrders(shops, holdings.rows),
               ]
-              const openingHouses = shipHousesNow(caravans, committed.structures, (step.holdings ?? holdings).rows, roads, world.size, feeBillNow.wage, feeBillNow.allowance, feeBillNow.supplies, feeBillNow.tile)
+              const openingHouses = shipHousesNow(caravans, committed.structures, (step.holdings ?? holdings).rows, roads, world.size, feeBillNow.wage, feeBillNow.allowance, feeTown.feePrices ?? feeTown.prices, feeBillNow.tile)
               const opening = workshopOpening(
                 feeTown,
                 farms,
@@ -831,7 +831,7 @@ export function PlannerApp() {
                 (structureId) => materialReserve(tracked.find((site) => site.structureId === structureId) ?? trackedShops.find((site) => site.structureId === structureId) ?? null, town.prices),
               )
               const claimed = assignOffices(roads, staffed.offices, placed.structures)
-              const caps = shipHousesNow(crewed.houses, placed.structures, landStep.holdings.rows, roads, world.size, feeBillNow.wage, feeBillNow.allowance, feeBillNow.supplies, feeBillNow.tile)
+              const caps = shipHousesNow(crewed.houses, placed.structures, landStep.holdings.rows, roads, world.size, feeBillNow.wage, feeBillNow.allowance, feeTown.feePrices ?? feeTown.prices, feeBillNow.tile)
               const traded = tradeMonth(
                 crewed.people,
                 worked.farms,
@@ -1139,12 +1139,12 @@ function shipHousesNow(
   size: number,
   wage: number,
   allowance: number,
-  supplies: number,
+  prices: Record<Good, number>,
   urbanTile: number,
 ): ShipHouse[] {
   return openCaps(houses, structures, book, size).flatMap((cap) => {
     const row = rows.find((item) => item.structureId === cap.structureId && item.owner >= 0)
     if (!row) return []
-    return [{ structureId: cap.structureId, out: cap.eachWay, in: cap.eachWay, fee: caravanFee(cap.staff, cap.eachWay, wage, allowance, supplies * 2, urbanTile) }]
+    return [{ structureId: cap.structureId, out: cap.eachWay, in: cap.eachWay, staff: cap.staff, fee: caravanFee(cap.staff, cap.eachWay, wage, allowance, caravanSupplies(prices, cap.staff, {}, true), urbanTile) }]
   })
 }

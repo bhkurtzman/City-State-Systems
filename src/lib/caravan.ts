@@ -11,21 +11,23 @@ import { WORKSHOP_HOURS, type WorkshopSite } from "@/lib/workshop"
 export const CARAVAN_HOURS = 1500
 const YEARLY_HOURS = 1200
 const HIRE_MIN_AGE = 18
-const OUT_ONE = 40
-const OUT_TWO = 60
+const OUT_ONE = 20
+const OUT_TWO = 40
 
 const BUILD: readonly { good: Good; hundredths: number }[] = [
   { good: "lumber", hundredths: 4000 },
   { good: "steel-parts", hundredths: 40 },
-  { good: "textiles", hundredths: 10 },
+  { good: "wagon-parts", hundredths: 100 },
 ]
 
-/** Double a trading post's operating year, after leather was cut in half. Family food is not included. */
+/** One operating year with no teamsters yet: 5 t of grain, 0.01 t of leather, 0.01 t of tools, 0.1 t of wagon parts, 1 t of barrels, and 3 t of livestock. The livestock is bought, not granted. Family food is not included. */
 const OPERATING: readonly { good: Good; hundredths: number }[] = [
-  { good: "grain", hundredths: 200 },
-  { good: "leather", hundredths: 6 },
-  { good: "textiles", hundredths: 10 },
-  { good: "steel-tools", hundredths: 6 },
+  { good: "grain", hundredths: 500 },
+  { good: "leather", hundredths: 1 },
+  { good: "steel-tools", hundredths: 1 },
+  { good: "wagon-parts", hundredths: 10 },
+  { good: "barrels", hundredths: 100 },
+  { good: "livestock", hundredths: 300 },
 ]
 
 export type CaravanNeed = { good: Good; hundredths: number }
@@ -73,10 +75,10 @@ export function caravanGoal(house: CaravanHouse): number {
   return CARAVAN_HOURS + (house.clearHours ?? 0)
 }
 
-/** Tons each way. A broken road is 1 t, plus 1 t for each man on the crew. */
+/** Tons each way. A sound road is 2 t, plus 2 t for each man. A broken road is 1 t, plus 1 t for each man. */
 export function wayTons(staff: number, linked: boolean): number {
   const hands = Math.max(0, Math.min(2, staff))
-  return linked ? 4 + 2 * hands : 1 + hands
+  return linked ? 2 + 2 * hands : 1 + hands
 }
 
 export function isOpen(house: CaravanHouse): boolean {
@@ -197,8 +199,8 @@ export function openCaps(
 
 /**
  * Keep men who still have no house job. In December the owner pays each man
- * the E1 wage. In January, a full year on a sound road sets the seats: 40 t
- * outbound hires the first, 60 t the second, and a quieter year drops the newest.
+ * the E1 wage. In January, a full year on a sound road sets the seats: 20 t
+ * outbound hires the first, 40 t the second, and a quieter year drops the newest.
  * Open seats are filled every month.
  */
 export function staffCaravans(

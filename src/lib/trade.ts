@@ -2,7 +2,7 @@ import { DEFAULT_WAGES } from "@/lib/construction"
 import { monthlyCapital, type Holding, type Holdings } from "@/lib/land"
 import { hashSeed, mulberry32 } from "@/lib/noise"
 import { copyIncomeLog, grantBirthdaySeeds, householdHomes, householdRanks, noteOperatingIncome, type People, type SocialClass } from "@/lib/people"
-import { familyPortions, GOOD_LABEL, GOODS, SHELF_TARGET, type FarmRecord, type Farms, type Good, type ShopSpecialty } from "@/lib/produce"
+import { familyPortions, FARM_STORE_CAP, GOOD_LABEL, GOODS, SHELF_TARGET, type FarmRecord, type Farms, type Good, type ShopSpecialty } from "@/lib/produce"
 import type { PropertyLine } from "@/lib/land"
 import { isWater, type Structure } from "@/lib/buildings"
 import { emptyRoads, pantryOrders, type RoadBook } from "@/lib/roads"
@@ -262,11 +262,13 @@ type UseContext = {
   /** Class of each household head. Clothing and leather follow it. */
   rank?: Map<number, SocialClass>
   /** One walk of the population. Prices reuse it instead of scanning again. */
-  census?: { portionSum: number; clothYear: number; leatherYear: number; spiceYear: number; protein: Partial<Record<Good, number>> }
+  census?: { portionSum: number; clothYear: number; leatherYear: number; spiceYear: number; beerYear: number; protein: Partial<Record<Good, number>> }
   /** Workshops still under construction. They do not draw inputs or set a price. */
   closedShops?: ReadonlySet<number>
   /** Hundredths a construction site or office still wants. Spread across three months of use. */
   buildNeeds?: readonly { good: Good; hundredths: number }[]
+  /** Teamsters on each caravan house that is shipping. A house left out counts as none. */
+  caravanStaff?: ReadonlyMap<number, number>
 }
 const PRICE_FLOOR = 1
 
@@ -308,8 +310,11 @@ export const WEST_EUROPE: Record<Good, Quote | null> = {
   spices: { price: 500, export: true },
   dairy: null,
   cheese: { price: 350, export: true, import: false },
+  beer: { price: 100, export: false, import: false },
   meat: null,
+  livestock: { price: 300, export: false, import: false },
   hide: null,
+  lime: { price: 40, export: false },
   wood: { price: 15, export: true },
   lumber: { price: 40, export: true },
   barrels: { price: 400, export: true, import: false },
@@ -324,6 +329,7 @@ export const WEST_EUROPE: Record<Good, Quote | null> = {
   steel: { price: 1200, export: true },
   "steel-parts": { price: 1500, export: true },
   "steel-tools": { price: 850, export: true },
+  "wagon-parts": { price: 300, export: false },
 }
 
 /** Post fee for the current trade month. Set at the start of tradeMonth. */
@@ -382,11 +388,17 @@ const CARAVAN_MARKUP = 1.2
 const POST_LAND = 4
 const CARAVAN_LAND = 6
 
-/** A post's year of grain, leather, textiles, and tools. A market ask is used when the shelf has the good. The yearly fee passes town prices ahead of the foreign list. */
+/** A post's year: 3 t of grain, a 5% chance of 0.1 t of leather and of tools, and a 15% chance of 1 t of livestock. A market ask is used when the shelf has the good. The yearly fee passes town prices ahead of the foreign list. */
 export function operatingSupplies(prices: Record<Good, number>, asking: Partial<Record<Good, number>> = {}, scale = 1, townFirst = false): number {
   const quote = (good: Good) => asking[good] ?? (townFirst ? prices[good] : undefined) ?? WEST_EUROPE[good]?.price ?? prices[good] ?? PRICE_FLOOR
-  const year = quote("grain") + quote("leather") * 0.025 + quote("textiles") * 0.05 + quote("steel-tools") * 0.025
+  const year = quote("grain") * 3 + quote("leather") * 0.005 + quote("steel-tools") * 0.005 + quote("livestock") * 0.15
   return year * scale
+}
+
+/** A caravan house's year: 5 t of grain plus 1 t for each teamster, a 10% chance of 0.1 t of leather and of tools, 0.1 t of wagon parts, a 5% chance of 1 t of barrels, and a 15% chance of 1 t of livestock. */
+export function caravanSupplies(prices: Record<Good, number>, staff = 0, asking: Partial<Record<Good, number>> = {}, townFirst = false): number {
+  const quote = (good: Good) => asking[good] ?? (townFirst ? prices[good] : undefined) ?? WEST_EUROPE[good]?.price ?? prices[good] ?? PRICE_FLOOR
+  return quote("grain") * (5 + Math.max(0, staff)) + quote("leather") * 0.01 + quote("steel-tools") * 0.01 + quote("wagon-parts") * 0.1 + quote("barrels") * 0.05 + quote("livestock") * 0.15
 }
 
 const POST_BASE = 25
@@ -410,7 +422,7 @@ export function postFee(allowance: number, supplies: number, urbanTile: number, 
   return pricedFee(allowance + supplies + urbanTile * POST_LAND, 1, POST_MARKUP, POST_BASE)
 }
 
-/** Dollars per ton. Double supplies, wages, and six tiles, plus 20%, over two thirds of a year of one-way tons, plus $15, and capped at $200. */
+/** Dollars per ton. The caravan's own supplies, wages, and six tiles, plus 20%, over two thirds of a year of one-way tons, plus $15, and capped at $200. */
 export function caravanFee(staff: number, eachWay: number, yearlyWage: number, allowance: number, supplies: number, urbanTile: number): number {
   const wages = Math.max(0, staff) * Math.max(0, yearlyWage)
   return pricedFee(allowance + supplies + wages + urbanTile * CARAVAN_LAND, eachWay, CARAVAN_MARKUP, CARAVAN_BASE)
@@ -455,7 +467,7 @@ export function rememberFeePrices(town: TownTrade): TownTrade {
   return { ...town, priceSum: sum, priceMonths: (town.priceMonths ?? 0) + 1 }
 }
 
-export type ShipHouse = { structureId: number; out: number; in: number; fee: number }
+export type ShipHouse = { structureId: number; out: number; in: number; fee: number; staff: number }
 
 /** Fees for caravan houses shipping this month. Empty outside tradeMonth. */
 let houseFees = new Map<number, number>()
@@ -660,6 +672,7 @@ export function townPriceRows(
       marks,
       closedShops,
       buildNeeds,
+      caravanStaff: new Map(shipHouses.map((house) => [house.structureId, house.staff])),
     })
   const quote = quotedPrices(forSaleStock(farms, town.stock, targets), town.prices, fee, postCount, measure)
   const selling = marketSale(farms, marketIds)
@@ -833,6 +846,7 @@ export function tradeMonth(
     cost: row.cost ? { ...row.cost } : undefined,
     shelfEpisode: copyShelfEpisode(row.shelfEpisode),
     shelfReady: row.shelfReady ? { ...row.shelfReady } : undefined,
+    surplus: row.surplus ? { ...row.surplus } : undefined,
   }))
   for (const row of rows) for (const good of GOODS) if (!Number.isFinite(row.store[good])) row.store[good] = 0
   const nextFarms: Farms = { rows }
@@ -909,6 +923,7 @@ export function tradeMonth(
     census,
     closedShops,
     buildNeeds: [...stateNeeds, ...familyNeeds],
+    caravanStaff: new Map(shipHouses.map((house) => [house.structureId, house.staff])),
   })
   const use = monthlyUse(structures, people, low, ownedIds, terrain, feature, tradeContext())
   assignShops(
@@ -940,6 +955,7 @@ export function tradeMonth(
     }
   }
   const short = settleHouseholdNeeds(nextFarms, stock, stockOwner, stockAsk, wealth, town.prices, targets, posts, foodNeeds, funders)
+  buyBirthdayBeer(people, nextFarms, wealth, town.prices, census, month, year, seed, closedShops)
   if (year >= foundedYear + 5) markHunger(fed.attempted, short, farmHeads, census, starving, starveDue, starveRoll, year, month)
   const hungry = new Set<number>()
   for (let id = 0; id < starving.length; id++) if (starving[id] === 1 && homeHead(protein.headOf, id) === id) hungry.add(id)
@@ -947,13 +963,25 @@ export function tradeMonth(
   const living = livingCosts(town.prices, yearLows, urbanTile, marketSale(nextFarms, retailShelves(structures, owned)))
   grantBirthdaySeeds(wealth, { ...people, starving }, holdings.rows, month, living.full, living.member)
   if (month === 10) {
-    for (const post of posts) feedPostGrain(post, nextFarms, stock, stockOwner, stockAsk, wealth, town.prices, targets, marketIds, feeFor(post), houseFees.has(post.structureId) ? 2 : 1)
+    for (const post of posts) {
+      const staff = shipping.get(post.structureId)?.staff
+      feedPostGrain(post, nextFarms, stock, stockOwner, stockAsk, wealth, town.prices, targets, marketIds, feeFor(post), staff == null ? 3 : 5 + staff)
+    }
   }
   if (month === 0) {
-    for (const post of posts) feedPost(post, nextFarms, stock, stockOwner, year, seed, houseFees.has(post.structureId) ? 2 : 1)
+    for (const post of posts) {
+      const house = shipping.get(post.structureId)
+      feedPost(post, nextFarms, stock, stockOwner, year, seed, house ? 0.1 : 0.05, house != null)
+    }
     feedFarms(structures, owned, nextFarms, stock, stockOwner, stockAsk, wealth, town.prices, targets, marketIds, posts, terrain, feature, year, seed)
     feedShops(structures, owned, nextFarms, stock, stockOwner, stockAsk, wealth, town.prices, targets, marketIds, posts, year, seed, closedShops)
   }
+  for (const post of posts) {
+    if (!shipping.has(post.structureId)) continue
+    feedCaravanBarrels(post, nextFarms, stock, stockOwner, stockAsk, wealth, town.prices, targets, marketIds, feeFor(post), year, month, seed)
+  }
+  feedBrewerBarrels(structures, owned, nextFarms, stock, stockOwner, stockAsk, wealth, town.prices, targets, marketIds, posts, year, month, seed, closedShops)
+  feedTraderLivestock(structures, owned, nextFarms, stock, stockOwner, stockAsk, wealth, { ...town.prices, livestock: livestockPrice(town.prices) }, targets, marketIds, posts, year, month, seed)
   const prices = { ...town.prices }
   for (const good of GOODS) if (prices[good] == null) prices[good] = WEST_EUROPE[good]?.price ?? PRICE_FLOOR
   const feeNow = posts.length > 0 ? feeFor(posts[0]) : 0
@@ -1040,6 +1068,7 @@ export function tradeMonth(
 
   const desired = quotedPrices(forSaleStock(nextFarms, stock, targets), prices, feeNow, slots, measure)
   for (const good of GOODS) prices[good] = glidePrice(prices[good], desired[good])
+  prices.livestock = livestockPrice(prices)
 
   const resourceSpent = stateSpent
   const resourceReceived = stateTill
@@ -1098,6 +1127,14 @@ function tradeSlots(structures: readonly Structure[], owned: Map<number, Holding
 function glidePrice(price: number, desired: number): number {
   const next = Math.round(price + 0.1 * (desired - price))
   return Math.min(PRICE_CEILING, Math.max(PRICE_FLOOR, next))
+}
+
+/** One ton of livestock is worth 0.8 t of meat, 0.1 t of hide, and 10 t of dairy, at those town prices. */
+function livestockPrice(prices: Record<Good, number>): number {
+  const meat = prices.meat ?? PRICE_FLOOR
+  const hide = prices.hide ?? PRICE_FLOOR
+  const dairy = prices.dairy ?? PRICE_FLOOR
+  return Math.min(PRICE_CEILING, Math.max(PRICE_FLOOR, Math.round(meat * 0.8 + hide * 0.1 + dairy * 10)))
 }
 
 /** Months of stock. Null when the good is neither used nor stored. */
@@ -1367,6 +1404,8 @@ type Census = {
   leatherYear: number
   /** Tons of spices upper and wealthy households expect to use in a year. */
   spiceYear: number
+  /** Tons of beer households expect to drink in a year. Half of them buy 0.6 t. */
+  beerYear: number
   protein: Partial<Record<Good, number>>
 }
 
@@ -1383,6 +1422,7 @@ function buildCensus(people: People, headOf: Int32Array, rank: Map<number, Socia
   let clothYear = 0
   let leatherYear = 0
   let spiceYear = 0
+  let beerHeads = 0
   const protein: Partial<Record<Good, number>> = {}
   for (let id = 0; id < people.age.length; id++) {
     if (people.alive[id] === 0) continue
@@ -1402,6 +1442,7 @@ function buildCensus(people: People, headOf: Int32Array, rank: Map<number, Socia
     if (pick) protein[pick] = (protein[pick] ?? 0) + (portion * proteinTons(pick)) / 12
     if (id === head) {
       birthHeads[people.birthMonth[id] ?? 0].push(id)
+      beerHeads += 1
       const standing = rank.get(head) ?? "poor"
       if (standing === "upper" || standing === "wealthy") spiceYear += 0.003
     }
@@ -1426,7 +1467,7 @@ function buildCensus(people: People, headOf: Int32Array, rank: Map<number, Socia
     }
   }
   for (const list of birthHeads) list.sort((a, b) => a - b)
-  return { headOf, rank, scale, members, birthHeads, portionSum, clothYear, leatherYear, spiceYear, protein }
+  return { headOf, rank, scale, members, birthHeads, portionSum, clothYear, leatherYear, spiceYear, beerYear: beerHeads * 0.3, protein }
 }
 
 /**
@@ -1507,8 +1548,10 @@ function feedHouseholds(
         bag.produced.add("fruit")
         bag.fruit = true
       }
-      if (uses.includes("dairy")) bag.produced.add("dairy")
-      if (uses.includes("meat")) bag.produced.add("meat")
+      if (uses.includes("livestock")) {
+        bag.produced.add("dairy")
+        bag.produced.add("meat")
+      }
       let woods = 0
       for (const tile of structure.tiles) {
         const ground = terrain[tile]
@@ -1568,6 +1611,18 @@ function feedHouseholds(
         if (sellsRetail(row.structureId) !== market || homeHead(headOf, row.owner) !== head) continue
         const take = Math.min(row.store[good] ?? 0, left)
         row.store[good] -= take
+        const spare = row.surplus?.[good] ?? 0
+        if (spare > 0 && take > 0) {
+          const refund = Math.min(take, spare)
+          row.store[good] += refund
+          const rest = spare - refund
+          if (rest > 0) row.surplus = { ...(row.surplus ?? {}), [good]: rest }
+          else if (row.surplus) {
+            const leftOver = { ...row.surplus }
+            delete leftOver[good]
+            row.surplus = leftOver
+          }
+        }
         left -= take
       }
     }
@@ -1707,7 +1762,7 @@ function feedHouseholds(
   return { needs, attempted }
 }
 
-/** November, the month after the grain harvest. */
+/** November, the month after the grain harvest. `tons` is the whole year. */
 function feedPostGrain(
   post: Holding,
   farms: Farms,
@@ -1719,18 +1774,169 @@ function feedPostGrain(
   targets: Map<number, Record<Good, number>>,
   marketIds: number[],
   fee: number,
-  scale = 1,
+  tons = 1,
 ) {
-  const want = scale * TON
+  const want = tons * TON
   const grain = want - takeOwned(farms, stock, stockOwner, post.owner, "grain", want)
   if (grain > 0) buyGoods(farms, stock, stockOwner, stockAsk, wealth, post.owner, "grain", grain, prices, targets, marketIds, fee, buyerDeal(farms, post.owner))
 }
 
-function feedPost(post: Holding, farms: Farms, stock: Record<Good, number>, stockOwner: Partial<Record<Good, number>>, year: number, seed: string, scale = 1) {
+const BEER_LOT = 60
+
+/** After food, on the head's birthday. A 50% roll buys 0.6 t from a brewer, or drinks it from the household's own brewery. A short pile or a short purse skips the drink. */
+function buyBirthdayBeer(
+  people: People,
+  farms: Farms,
+  wealth: Int32Array,
+  prices: Record<Good, number>,
+  census: Census,
+  month: number,
+  year: number,
+  seed: string,
+  closedShops: ReadonlySet<number>,
+) {
+  const sellers = farms.rows
+    .filter((row) => row.specialty === "brewer" && !closedShops.has(row.structureId) && (row.store.beer ?? 0) >= BEER_LOT)
+    .sort((a, b) => a.structureId - b.structureId)
+  for (const head of census.birthHeads[month] ?? []) {
+    if (people.alive[head] === 0 || homeHead(census.headOf, head) !== head) continue
+    if (mulberry32(hashSeed(`${seed}:beer:${year}:${head}`))() >= 0.5) continue
+    const own = sellers.find((row) => row.owner === head && (row.store.beer ?? 0) >= BEER_LOT)
+    if (own) {
+      own.store.beer = (own.store.beer ?? 0) - BEER_LOT
+      continue
+    }
+    const price = offerPrice("beer", prices, 0)
+    const cost = Math.round((price * BEER_LOT) / TON)
+    if (head >= wealth.length || (wealth[head] ?? 0) < cost) continue
+    const seller = sellers.find((row) => row.owner !== head && (row.store.beer ?? 0) >= BEER_LOT)
+    if (!seller) continue
+    seller.store.beer = (seller.store.beer ?? 0) - BEER_LOT
+    payFor(wealth, head, seller.owner, price, BEER_LOT)
+  }
+}
+
+/** January uses 1 t of barrels on a 5% roll. Any month the pantry is empty, the brewer buys one whole ton and does not top up a partial pile. */
+function feedBrewerBarrels(
+  structures: readonly Structure[],
+  owned: Map<number, Holding>,
+  farms: Farms,
+  stock: Record<Good, number>,
+  stockOwner: Partial<Record<Good, number>>,
+  stockAsk: Partial<Record<Good, number>>,
+  wealth: Int32Array,
+  prices: Record<Good, number>,
+  targets: Map<number, Record<Good, number>>,
+  marketIds: number[],
+  posts: Holding[],
+  year: number,
+  month: number,
+  seed: string,
+  closedShops: ReadonlySet<number>,
+) {
+  const fee = posts.length > 0 ? feeFor(posts[0]) : 0
+  for (const structure of structures) {
+    if (structure.kind !== "workshop" || structure.pending || structure.removing || closedShops.has(structure.id)) continue
+    const row = farms.rows.find((item) => item.structureId === structure.id)
+    const holding = owned.get(structure.id)
+    if (!row || row.specialty !== "brewer" || !holding) continue
+    if (month === 0 && mulberry32(hashSeed(`${seed}:brew-barrels:${structure.id}:${year}`))() < 0.05) {
+      const held = row.store.barrels ?? 0
+      const taken = Math.min(held, TON)
+      row.store.barrels = held - taken
+    }
+    if ((row.store.barrels ?? 0) > 0) continue
+    const bought = buyGoods(farms, stock, stockOwner, stockAsk, wealth, holding.owner, "barrels", TON, prices, targets, marketIds, fee, buyerDeal(farms, holding.owner), "ton")
+    if (bought.taken > 0) row.store.barrels = (row.store.barrels ?? 0) + bought.taken
+  }
+}
+
+/** July uses 1 t of livestock on a 15% roll. Any month the pantry is under 3 t, the trader buys whole tons until it holds 3 t. */
+function feedTraderLivestock(
+  structures: readonly Structure[],
+  owned: Map<number, Holding>,
+  farms: Farms,
+  stock: Record<Good, number>,
+  stockOwner: Partial<Record<Good, number>>,
+  stockAsk: Partial<Record<Good, number>>,
+  wealth: Int32Array,
+  prices: Record<Good, number>,
+  targets: Map<number, Record<Good, number>>,
+  marketIds: number[],
+  posts: Holding[],
+  year: number,
+  month: number,
+  seed: string,
+) {
+  const fee = posts.length > 0 ? feeFor(posts[0]) : 0
+  const keep = 3 * TON
+  for (const structure of structures) {
+    if ((structure.kind !== "trading-post" && structure.kind !== "caravan-house") || structure.pending || structure.removing) continue
+    const row = farms.rows.find((item) => item.structureId === structure.id)
+    const holding = owned.get(structure.id)
+    if (!row || !holding) continue
+    if (month === 6 && mulberry32(hashSeed(`${seed}:herd:${structure.id}:${year}`))() < 0.15) {
+      const held = row.store.livestock ?? 0
+      row.store.livestock = held - Math.min(held, TON)
+    }
+    while ((row.store.livestock ?? 0) < keep) {
+      const own = takeOwnHerd(farms, holding.owner, structure.id)
+      if (own > 0) {
+        row.store.livestock = (row.store.livestock ?? 0) + own
+        continue
+      }
+      const bought = buyGoods(farms, stock, stockOwner, stockAsk, wealth, holding.owner, "livestock", TON, prices, targets, marketIds, fee, buyerDeal(farms, holding.owner), "ton")
+      if (bought.taken <= 0) break
+      row.store.livestock = (row.store.livestock ?? 0) + bought.taken
+    }
+  }
+}
+
+/** One whole ton from the owner's own farm, leaving that farm its last ton. */
+function takeOwnHerd(farms: Farms, owner: number, traderId: number): number {
+  const rows = farms.rows.filter((row) => row.owner === owner && row.structureId !== traderId && routes.farmIds.has(row.structureId)).sort((a, b) => a.structureId - b.structureId)
+  for (const row of rows) {
+    if ((row.store.livestock ?? 0) < TON * 2) continue
+    row.store.livestock = (row.store.livestock ?? 0) - TON
+    return TON
+  }
+  return 0
+}
+
+/** January uses 1 t of barrels on a 5% roll. Any month the pantry is empty, the house buys one whole ton and does not top up a partial pile. */
+function feedCaravanBarrels(
+  post: Holding,
+  farms: Farms,
+  stock: Record<Good, number>,
+  stockOwner: Partial<Record<Good, number>>,
+  stockAsk: Partial<Record<Good, number>>,
+  wealth: Int32Array,
+  prices: Record<Good, number>,
+  targets: Map<number, Record<Good, number>>,
+  marketIds: number[],
+  fee: number,
+  year: number,
+  month: number,
+  seed: string,
+) {
+  const row = farms.rows.find((item) => item.structureId === post.structureId)
+  if (!row) return
+  if (month === 0 && mulberry32(hashSeed(`${seed}:barrels:${post.structureId}:${year}`))() < 0.05) {
+    const held = row.store.barrels ?? 0
+    const taken = Math.min(held, TON)
+    row.store.barrels = held - taken
+  }
+  if ((row.store.barrels ?? 0) > 0) return
+  const bought = buyGoods(farms, stock, stockOwner, stockAsk, wealth, post.owner, "barrels", TON, prices, targets, marketIds, fee, buyerDeal(farms, post.owner), "ton")
+  if (bought.taken > 0) row.store.barrels = (row.store.barrels ?? 0) + bought.taken
+}
+
+/** January. A post has a 5% chance to use 0.1 t of leather and of tools. A caravan house has a 10% chance, and also uses 0.1 t of wagon parts. */
+function feedPost(post: Holding, farms: Farms, stock: Record<Good, number>, stockOwner: Partial<Record<Good, number>>, year: number, seed: string, chance: number, wagon: boolean) {
   const rng = mulberry32(hashSeed(`${seed}:supply:${post.structureId}:${year}`))
-  if (rng() < 0.5) takeOwned(farms, stock, stockOwner, post.owner, "leather", 5 * scale)
-  if (rng() < 0.5) takeOwned(farms, stock, stockOwner, post.owner, "textiles", 10 * scale)
-  if (rng() < 0.25) takeOwned(farms, stock, stockOwner, post.owner, "steel-tools", 10 * scale)
+  if (rng() < chance) takeOwned(farms, stock, stockOwner, post.owner, "leather", 10)
+  if (rng() < chance) takeOwned(farms, stock, stockOwner, post.owner, "steel-tools", 10)
+  if (wagon) takeOwned(farms, stock, stockOwner, post.owner, "wagon-parts", 10)
 }
 
 function buyNeed(
@@ -1868,8 +2074,10 @@ function producedOn(
     const row = farms.rows.find((item) => item.structureId === structure.id)
     if (!row) continue
     const made = new Set<Good>()
-    if (row.uses.includes("dairy")) made.add("dairy")
-    if (row.uses.includes("meat")) made.add("meat")
+    if (row.uses.includes("livestock")) {
+      made.add("dairy")
+      made.add("meat")
+    }
     for (const tile of structure.tiles) {
       const ground = terrain[tile]
       if (ground === Terrain.Sea || ground === Terrain.Fresh) made.add("fish")
@@ -2022,7 +2230,7 @@ function proteinForSale(
 /** Two years of operating supplies, plus 0.1 t of the tools and fiber each farm or workshop keeps. Household fuel, food, and clothing are not stocked here. */
 /** Recipe inputs a producer is keeping one batch of. Set by stockTargets. */
 let inputNeeds = new Map<number, Set<Good>>()
-const SUPPLY_GOODS = new Set<Good>(["steel-tools", "fiber", "leather", "textiles", "salt"])
+const SUPPLY_GOODS = new Set<Good>(["steel-tools", "fiber", "leather", "textiles", "salt", "wagon-parts"])
 
 function produces(farms: Farms, buyer: number): boolean {
   return farms.rows.some((row) => row.owner === buyer && (routes.farmIds.has(row.structureId) || routes.workshopIds.has(row.structureId)))
@@ -2042,7 +2250,9 @@ function stockTargets(
 ): Map<number, Record<Good, number>> {
   inputNeeds = new Map()
   const shops = new Map<number, number>()
-  const stocked = new Map<number, number>()
+  const markets = new Map<number, number>()
+  const posts = new Map<number, number>()
+  const caravans = new Map<number, number>()
   const kept = new Map<number, { tools: number; leather: number; textiles: number; salt: number }>()
   const inputHold = new Map<number, Record<Good, number>>()
   const hold = (owner: number) => {
@@ -2053,10 +2263,10 @@ function stockTargets(
   for (const structure of structures) {
     const row = owned.get(structure.id)
     if (!row || structure.pending || structure.removing) continue
-    if (structure.kind === "market" || structure.kind === "trading-post") {
-      shops.set(row.owner, (shops.get(row.owner) ?? 0) + 1)
-      stocked.set(row.owner, (stocked.get(row.owner) ?? 0) + 1)
-    }
+    if (structure.kind === "market" || structure.kind === "trading-post") shops.set(row.owner, (shops.get(row.owner) ?? 0) + 1)
+    if (structure.kind === "market") markets.set(row.owner, (markets.get(row.owner) ?? 0) + 1)
+    if (structure.kind === "trading-post") posts.set(row.owner, (posts.get(row.owner) ?? 0) + 1)
+    if (structure.kind === "caravan-house") caravans.set(row.owner, (caravans.get(row.owner) ?? 0) + 1)
     if ((structure.kind === "workshop" || structure.kind === "sawpit") && !closedShops.has(structure.id)) {
       const bag = hold(row.owner)
       bag.tools += 1
@@ -2079,12 +2289,15 @@ function stockTargets(
     }
   }
   const targets = new Map<number, Record<Good, number>>()
-  for (const owner of new Set([...shops.keys(), ...kept.keys()])) {
+  for (const owner of new Set([...shops.keys(), ...kept.keys(), ...caravans.keys()])) {
     const tons = emptyGoods()
-    const supplied = stocked.get(owner) ?? 0
-    tons.leather += supplied * 0.05
-    tons.textiles += supplied * 0.05
-    tons["steel-tools"] += supplied * 0.025
+    const marketCount = markets.get(owner) ?? 0
+    const postCount = posts.get(owner) ?? 0
+    const caravanCount = caravans.get(owner) ?? 0
+    tons.leather += marketCount * 0.05 + postCount * 0.005 + caravanCount * 0.01
+    tons.textiles += marketCount * 0.05
+    tons["steel-tools"] += marketCount * 0.025 + postCount * 0.005 + caravanCount * 0.01
+    tons["wagon-parts"] += caravanCount * 0.1
     const hundredths = emptyGoods()
     for (const good of GOODS) hundredths[good] = Math.ceil(tons[good] * STOCK_YEARS * TON - 1e-6)
     const pile = kept.get(owner)
@@ -2167,13 +2380,15 @@ function foldBin(row: { store: Record<Good, number>; trade?: Partial<Record<Good
 
 function spareAt(
   farms: Farms,
-  row: { owner: number; store: Record<Good, number> },
+  row: { owner: number; store: Record<Good, number>; structureId?: number },
   good: Good,
   targets: Map<number, Record<Good, number>>,
   budget: Map<number, number>,
 ): number {
   if (!budget.has(row.owner)) budget.set(row.owner, Math.max(0, barnHeld(farms, row.owner, good) - heldBack(targets, row.owner, good)))
-  return Math.max(0, Math.min(row.store[good] ?? 0, budget.get(row.owner) ?? 0))
+  let pile = row.store[good] ?? 0
+  if (good === "livestock" && row.structureId !== undefined && routes.farmIds.has(row.structureId)) pile = Math.max(0, pile - TON)
+  return Math.max(0, Math.min(pile, budget.get(row.owner) ?? 0))
 }
 
 /** Largest multiple of step that room can fill. */
@@ -2713,7 +2928,7 @@ function buyGoods(
   _marketIds: number[],
   fee: number,
   deal: Deal,
-  prefer?: "input" | "supply",
+  prefer?: "input" | "supply" | "ton",
 ): { taken: number; spent: number } {
   let left = hundredths
   let spent = 0
@@ -2791,7 +3006,7 @@ function buyGoods(
         pull: (qty) => payImport(wealth, buyer, offer, good, qty),
       })
     }
-    const passes = prefer === "input" ? [tons, retail] : [retail, tons]
+    const passes = prefer === "ton" ? [tons] : prefer === "input" ? [tons, retail] : [retail, tons]
     let taken = 0
     for (const pass of passes) {
       if (left <= 0) break
@@ -3128,6 +3343,12 @@ function monthlyUse(
   const use = emptyGoods()
   let fuel = 0
   let posts = 0
+  let caravanGrain = 0
+  let caravanLeather = 0
+  let caravanTools = 0
+  let caravanWagons = 0
+  let caravanBarrels = 0
+  let traderHerds = 0
   let farmSteel = 0
   let farmLeather = 0
   let farmTextiles = 0
@@ -3135,7 +3356,15 @@ function monthlyUse(
     if (!ownedIds.has(structure.id)) continue
     if (context ? heatsHouse(structure, context.farms) : isHouse(structure) && structure.kind !== "workshop" && structure.kind !== "sawpit") fuel += 1
     if (structure.kind === "trading-post") posts += 1
-    if (structure.kind === "caravan-house") posts += 2
+    if (!structure.pending && !structure.removing && (structure.kind === "trading-post" || structure.kind === "caravan-house")) traderHerds += 1
+    if (structure.kind === "caravan-house" && context?.caravanStaff?.has(structure.id)) {
+      const staff = context.caravanStaff.get(structure.id) ?? 0
+      caravanGrain += 5 + staff
+      caravanLeather += 0.01
+      caravanTools += 0.01
+      caravanWagons += 0.1
+      caravanBarrels += 0.05
+    }
     const scale = dryFarmScale(structure, terrain, feature)
     farmSteel += FARM_STEEL_PER_THOUSAND * scale
     farmLeather += FARM_LEATHER_PER_THOUSAND * scale
@@ -3145,10 +3374,13 @@ function monthlyUse(
   const asking = context ? marketSale(context.farms, fuelMarkets(structures)) : {}
   if (!context || preferWood(context.prices, asking)) use.wood += fuel * woodMonth
   else use.coal += fuel * (woodMonth / 4)
-  use.grain += posts / 12
-  use.leather += (posts * 0.025) / 12 + farmLeather / 12
-  use.textiles += (posts * 0.05) / 12 + farmTextiles / 12
-  use["steel-tools"] += (posts * 0.025) / 12 + farmSteel / 12
+  use.grain += (posts * 3) / 12 + caravanGrain / 12
+  use.leather += (posts * 0.005 + caravanLeather) / 12 + farmLeather / 12
+  use.textiles += farmTextiles / 12
+  use["steel-tools"] += (posts * 0.005 + caravanTools) / 12 + farmSteel / 12
+  use["wagon-parts"] += caravanWagons / 12
+  use.barrels += caravanBarrels / 12
+  use.livestock += (traderHerds * 0.15) / 12
   if (context) addShopUse(use, structures, ownedIds, context)
   if (!people) return use
   if (context?.census) {
@@ -3160,6 +3392,7 @@ function monthlyUse(
     use.clothing += census.clothYear / 12
     use.leather += census.leatherYear / 12
     use.spices += census.spiceYear / 12
+    use.beer += census.beerYear / 12
     for (const need of context.buildNeeds ?? []) {
       if (need.hundredths > 0) use[need.good] += need.hundredths / TON / TARGET_MONTHS
     }
@@ -3181,6 +3414,7 @@ function monthlyUse(
       leatherYear += clothing * 0.05
     } else clothYear += clothing * 0.05
     if (headOf && homeHead(headOf, id) === id) {
+      use.beer += 0.3 / 12
       const standing = context?.rank?.get(id) ?? "poor"
       if (standing === "upper" || standing === "wealthy") spiceYear += 0.003
     }
@@ -3283,8 +3517,10 @@ function fuelMarkets(structures: readonly Structure[], owned?: ReadonlyMap<numbe
 type RecipeInput = { good: Good; hundredths: number }
 type Batch = { output: Good; out: number; inputs: RecipeInput[]; cap: number }
 
-/** Caps are five years of that workshop's own output, in hundredths of a ton. */
-const SAWMILL_BATCH: Batch = { output: "lumber", out: 6 * TON, inputs: [{ good: "wood", hundredths: 9 * TON }], cap: 360 * TON }
+/** Storage ceiling, in hundredths. A batch is not started when the output would pass it. */
+const PILE = 30 * TON
+const SAW_PILE = 100 * TON
+const SAWMILL_BATCH: Batch = { output: "lumber", out: 6 * TON, inputs: [{ good: "wood", hundredths: 9 * TON }], cap: SAW_PILE }
 const PARTS_BATCH: Batch = {
   output: "steel-parts",
   out: TON,
@@ -3292,7 +3528,7 @@ const PARTS_BATCH: Batch = {
     { good: "coal", hundredths: 2 * TON },
     { good: "steel", hundredths: TON },
   ],
-  cap: 15 * TON,
+  cap: PILE,
 }
 const TOOLS_BATCH: Batch = {
   output: "steel-tools",
@@ -3301,7 +3537,7 @@ const TOOLS_BATCH: Batch = {
     { good: "steel-parts", hundredths: TON / 2 },
     { good: "lumber", hundredths: TON / 2 },
   ],
-  cap: 30 * TON,
+  cap: PILE,
 }
 const FISH_BATCH: Batch = {
   output: "cured-fish",
@@ -3312,7 +3548,7 @@ const FISH_BATCH: Batch = {
     { good: "salt", hundredths: 10 },
     { good: "barrels", hundredths: 20 },
   ],
-  cap: 60 * TON,
+  cap: PILE,
 }
 const MEAT_BATCH: Batch = {
   output: "cured-meat",
@@ -3323,10 +3559,10 @@ const MEAT_BATCH: Batch = {
     { good: "salt", hundredths: 10 },
     { good: "barrels", hundredths: 20 },
   ],
-  cap: 60 * TON,
+  cap: PILE,
 }
-/** March, April, May, September, October, and November. Five years of that output. */
-const CHEESE_CAP = 30 * TON
+/** March, April, May, September, October, and November. */
+const CHEESE_CAP = PILE
 const CHEESE_WOOD: Batch = {
   output: "cheese",
   out: TON,
@@ -3354,35 +3590,86 @@ const BARREL_BATCH: Batch = {
     { good: "wood", hundredths: 2 * TON },
     { good: "steel-parts", hundredths: TON / 5 },
   ],
-  cap: 60 * TON,
+  cap: PILE,
 }
+/** January, May, and September. Three tons of hides and a tenth of lime make one ton of leather. */
+const TANNER_BATCH: Batch = {
+  output: "leather",
+  out: TON,
+  inputs: [
+    { good: "hide", hundredths: 3 * TON },
+    { good: "lime", hundredths: 10 },
+  ],
+  cap: PILE,
+}
+const TANNER_MONTHS = new Set([0, 4, 8])
 const CHEESE_MONTHS = new Set([2, 3, 4, 8, 9, 10])
+/** Every month. One ton of grain and two tons of wood, or half a ton of coal, make three tons of beer. */
+const BEER_CAP = PILE
+const BEER_WOOD: Batch = {
+  output: "beer",
+  out: 3 * TON,
+  inputs: [
+    { good: "grain", hundredths: TON },
+    { good: "wood", hundredths: 2 * TON },
+  ],
+  cap: BEER_CAP,
+}
+const BEER_COAL: Batch = {
+  output: "beer",
+  out: 3 * TON,
+  inputs: [
+    { good: "grain", hundredths: TON },
+    { good: "coal", hundredths: TON / 2 },
+  ],
+  cap: BEER_CAP,
+}
 
 function holdShopInputs(extra: Record<Good, number>, specialty: ShopSpecialty | undefined, store: Record<Good, number> | undefined) {
   const held = (good: Good) => store?.[good] ?? 0
   const open = (batch: Batch) => held(batch.output) + batch.out <= batch.cap
-  if (specialty === "sawmill" && open(SAWMILL_BATCH)) addInputs(extra, SAWMILL_BATCH)
+  const add = (good: Good, hundredths: number) => {
+    const cap = inputCap(specialty, good)
+    if (cap === null) {
+      extra[good] += hundredths
+      return
+    }
+    const have = held(good) + (extra[good] ?? 0)
+    extra[good] += Math.min(hundredths, Math.max(0, cap - have))
+  }
+  const addBatch = (batch: Batch) => {
+    if (!open(batch)) return
+    for (const input of batch.inputs) add(input.good, input.hundredths)
+  }
+  if (specialty === "sawmill") addBatch(SAWMILL_BATCH)
   if (specialty === "blacksmith") {
-    if (open(PARTS_BATCH)) addInputs(extra, PARTS_BATCH)
-    if (open(TOOLS_BATCH)) addInputs(extra, TOOLS_BATCH)
+    addBatch(PARTS_BATCH)
+    addBatch(TOOLS_BATCH)
   }
   if (specialty === "smokehouse") {
     const fishOpen = open(FISH_BATCH)
     const meatOpen = open(MEAT_BATCH)
-    if (fishOpen) extra.fish += 2 * TON
-    if (meatOpen) extra.meat += 2 * TON
+    if (fishOpen) add("fish", 2 * TON)
+    if (meatOpen) add("meat", 2 * TON)
     if (fishOpen || meatOpen) {
-      extra.wood += 2 * TON
-      extra.salt += 10
-      extra.barrels += 20
+      add("wood", 2 * TON)
+      add("salt", 10)
+      add("barrels", 20)
     }
   }
-  if (specialty === "creamery" && open(CHEESE_WOOD)) addInputs(extra, CHEESE_WOOD)
-  if (specialty === "cooper" && open(BARREL_BATCH)) addInputs(extra, BARREL_BATCH)
+  if (specialty === "creamery") addBatch(CHEESE_WOOD)
+  if (specialty === "brewer") addBatch(BEER_WOOD)
+  if (specialty === "cooper") addBatch(BARREL_BATCH)
+  if (specialty === "tanner") addBatch(TANNER_BATCH)
 }
 
-function addInputs(extra: Record<Good, number>, batch: Batch) {
-  for (const input of batch.inputs) extra[input.good] += input.hundredths
+/** A sawmill holds 100 t of wood and lumber. Every other recipe pile holds 30 t. */
+function inputCap(specialty: ShopSpecialty | undefined, good: Good): number | null {
+  if (!specialty) return null
+  if (specialty === "sawmill" && (good === "wood" || good === "lumber")) return SAW_PILE
+  const batches = SHOP_BATCHES[specialty]
+  const used = batches.some((batch) => batch.output === good || batch.inputs.some((input) => input.good === good))
+  return used ? PILE : null
 }
 
 const SHOP_BATCHES: Record<ShopSpecialty, Batch[]> = {
@@ -3390,7 +3677,9 @@ const SHOP_BATCHES: Record<ShopSpecialty, Batch[]> = {
   blacksmith: [PARTS_BATCH, TOOLS_BATCH],
   smokehouse: [FISH_BATCH, MEAT_BATCH],
   creamery: [CHEESE_WOOD, CHEESE_COAL],
+  brewer: [BEER_WOOD, BEER_COAL],
   cooper: [BARREL_BATCH],
+  tanner: [TANNER_BATCH],
 }
 
 /** Dollars of expected margin for one batch. Null when an input cannot be had. */
@@ -3405,9 +3694,9 @@ function batchQuote(batch: Batch, marks: Record<Good, number>, stock: Record<Goo
   return revenue - cost
 }
 
-/** Best batch of each specialty that still earns money, highest monthly margin first. A blacksmith runs three months a year, a creamery six. */
+/** Best batch of each specialty that still earns money, highest monthly margin first. A blacksmith or tannery runs three months a year, a creamery six. */
 function rankedSpecialties(marks: Record<Good, number>, stock: Record<Good, number>, fee: number): ShopSpecialty[] {
-  const order: ShopSpecialty[] = ["sawmill", "blacksmith", "smokehouse", "creamery", "cooper"]
+  const order: ShopSpecialty[] = ["sawmill", "blacksmith", "smokehouse", "creamery", "brewer", "cooper", "tanner"]
   const scored: { specialty: ShopSpecialty; margin: number }[] = []
   for (const specialty of order) {
     let top: number | null = null
@@ -3417,7 +3706,7 @@ function rankedSpecialties(marks: Record<Good, number>, stock: Record<Good, numb
       if (top === null || margin > top) top = margin
     }
     if (top === null) continue
-    const months = specialty === "blacksmith" ? 3 / 12 : specialty === "creamery" ? 6 / 12 : 1
+    const months = specialty === "blacksmith" || specialty === "tanner" ? 3 / 12 : specialty === "creamery" ? 6 / 12 : 1
     scored.push({ specialty, margin: top * months })
   }
   scored.sort((a, b) => b.margin - a.margin || order.indexOf(a.specialty) - order.indexOf(b.specialty))
@@ -3474,6 +3763,7 @@ export function workshopOpening(
       marks,
       closedShops,
       buildNeeds,
+      caravanStaff: new Map(shipHouses.map((house) => [house.structureId, house.staff])),
     })
   const marks = quotedPrices(forSaleStock(farms, town.stock, targets), town.prices, fee, posts, measure)
   const ranked = rankedSpecialties(marks, pool, fee)
@@ -3497,7 +3787,12 @@ function optionsFor(specialty: ShopSpecialty, month: number, producing: boolean)
     if (producing && !CHEESE_MONTHS.has(month)) return []
     return [CHEESE_WOOD, CHEESE_COAL]
   }
+  if (specialty === "brewer") return [BEER_WOOD, BEER_COAL]
   if (specialty === "cooper") return [BARREL_BATCH]
+  if (specialty === "tanner") {
+    if (producing && !TANNER_MONTHS.has(month)) return []
+    return [TANNER_BATCH]
+  }
   return [FISH_BATCH, MEAT_BATCH]
 }
 
@@ -3526,6 +3821,8 @@ function makeCoal(
     if (woods / structure.tiles.length < 0.25) continue
     if ((row.store.wood ?? 0) < woodIn) continue
     if (barnHeld(farms, row.owner, "wood") - woodIn < (woodKeep.get(row.owner) ?? 0)) continue
+    const coalRoom = Math.max(0, (FARM_STORE_CAP.coal ?? 0) - (row.store.coal ?? 0))
+    if (coalRoom < 10 * TON) continue
     row.store.wood -= woodIn
     row.store.coal += 10 * TON
     made.add(row.owner)
@@ -3652,6 +3949,7 @@ function addShopUse(use: Record<Good, number>, structures: readonly Structure[],
     if (!row || !specialty) continue
     use["steel-tools"] += 0.005 / 12
     if (specialty === "creamery") use.textiles += 0.005 / 12
+    if (specialty === "brewer") use.barrels += 0.05 / 12
     if (specialty === "cooper") use.fiber += 0.2 / 12
     const batch = chooseBatch(
       optionsFor(specialty, 0, false),
@@ -3669,7 +3967,7 @@ function addShopUse(use: Record<Good, number>, structures: readonly Structure[],
       context.marks,
     )
     if (!batch) continue
-    const scale = specialty === "blacksmith" ? 3 / 12 : specialty === "creamery" ? 6 / 12 : 1
+    const scale = specialty === "blacksmith" || specialty === "tanner" ? 3 / 12 : specialty === "creamery" ? 6 / 12 : 1
     for (const input of batch.inputs) use[input.good] += (input.hundredths / TON) * scale
   }
 }
@@ -3863,7 +4161,12 @@ function applyInputs(
       const keep = take - used
       if (keep > 0) {
         const barn = farms.rows.find((item) => item.owner === buyer && routes.workshopIds.has(item.structureId)) ?? farms.rows.find((item) => item.owner === buyer)
-        if (barn) barn.store[input.good] = (barn.store[input.good] ?? 0) + keep
+        if (barn) {
+          const cap = inputCap(barn.specialty, input.good)
+          const room = cap === null ? keep : Math.max(0, cap - (barn.store[input.good] ?? 0))
+          const stored = Math.min(keep, room)
+          if (stored > 0) barn.store[input.good] = (barn.store[input.good] ?? 0) + stored
+        }
       }
       left -= used
     }

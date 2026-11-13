@@ -10,8 +10,23 @@ import { Feature, Terrain, type FeatureId } from "@/lib/types"
  * and anything under a tenth of a ton is one roll for that tenth.
  */
 const TENTH = 10
+const TON = 100
 
-export const CROPS = ["grain", "fiber", "fruit", "vegetables", "dairy", "meat"] as const
+/** Hundredths a farmstead will keep. A harvest past this is not stored. Salt and spices are not limited. */
+export const FARM_STORE_CAP: Partial<Record<Good, number>> = {
+  grain: 40 * TON,
+  fiber: 20 * TON,
+  meat: 15 * TON,
+  fish: 15 * TON,
+  dairy: 60 * TON,
+  fruit: 20 * TON,
+  vegetables: 20 * TON,
+  coal: 100 * TON,
+  wood: 2000 * TON,
+  hide: 5 * TON,
+}
+
+export const CROPS = ["grain", "fiber", "fruit", "vegetables", "livestock"] as const
 export type Crop = (typeof CROPS)[number]
 
 export const GOODS = [
@@ -23,8 +38,11 @@ export const GOODS = [
   "spices",
   "dairy",
   "cheese",
+  "beer",
   "meat",
+  "livestock",
   "hide",
+  "lime",
   "wood",
   "lumber",
   "barrels",
@@ -39,19 +57,19 @@ export const GOODS = [
   "steel",
   "steel-parts",
   "steel-tools",
+  "wagon-parts",
 ] as const
 export type Good = (typeof GOODS)[number]
 
 /** One craft, rolled when a workshop is first owned and then kept. */
-export type ShopSpecialty = "sawmill" | "blacksmith" | "smokehouse" | "creamery" | "cooper"
+export type ShopSpecialty = "sawmill" | "blacksmith" | "smokehouse" | "creamery" | "brewer" | "cooper" | "tanner"
 
 const CROP_LABEL: Record<Crop, string> = {
   grain: "Grain",
   fiber: "Fiber",
   fruit: "Fruit",
   vegetables: "Vegetables",
-  dairy: "Dairy",
-  meat: "Meat",
+  livestock: "Livestock",
 }
 
 export const GOOD_LABEL: Record<Good, string> = {
@@ -63,8 +81,11 @@ export const GOOD_LABEL: Record<Good, string> = {
   spices: "Spices",
   dairy: "Dairy",
   cheese: "Cheese",
+  beer: "Beer",
   meat: "Meat",
+  livestock: "Livestock",
   hide: "Hides",
+  lime: "Lime",
   wood: "Wood",
   lumber: "Lumber",
   barrels: "Barrels",
@@ -79,6 +100,7 @@ export const GOOD_LABEL: Record<Good, string> = {
   steel: "Steel",
   "steel-parts": "Steel parts",
   "steel-tools": "Steel tools",
+  "wagon-parts": "Wagon parts",
 }
 
 const SHOP_LABEL: Record<ShopSpecialty, string> = {
@@ -86,7 +108,9 @@ const SHOP_LABEL: Record<ShopSpecialty, string> = {
   blacksmith: "Blacksmith",
   smokehouse: "Smokehouse",
   creamery: "Creamery",
+  brewer: "Brewer",
   cooper: "Cooper",
+  tanner: "Tanner",
 }
 
 /** How many equal shares the prairie is split into, including the fallow share. */
@@ -118,6 +142,8 @@ export type FarmRecord = {
   shelfEpisode?: Partial<Record<Good, { got: number; scored: boolean; debut: boolean }>>
   /** This good has already been lifted above half, so a later large refill can score. */
   shelfReady?: Partial<Record<Good, true>>
+  /** This month's harvest that did not fit. The household can eat it without lowering the pile. */
+  surplus?: Partial<Record<Good, number>>
 }
 
 export type Farms = { rows: FarmRecord[] }
@@ -139,7 +165,7 @@ const FISH_CAP = 1500
 
 const FIELD_CROPS: Crop[] = ["grain", "fiber", "fruit", "vegetables"]
 const GARDEN_CROPS: Crop[] = ["fiber", "fruit", "vegetables"]
-const PASTURES: Crop[] = ["dairy", "meat"]
+const PASTURES: Crop[] = ["livestock"]
 
 export function emptyFarms(): Farms {
   return { rows: [] }
@@ -155,15 +181,15 @@ const HOUSEHOLD_START: Partial<Record<Good, number>> = {
 }
 
 /**
- * Hundredths. A trading post opens with one year of supplies: 1 t grain,
- * 0.03 t leather, 0.05 t textiles, and 0.03 t steel tools.
- * Leather use is half of the old 0.05 t, rounded up to a hundredth.
+ * Hundredths. A trading post opens with one year of supplies: 3 t grain,
+ * 0.01 t leather, and 0.01 t steel tools. Each tool and leather use is a 5% chance of 0.1 t,
+ * and a year under a hundredth is rounded up to one. The post also opens with 3 t of livestock.
  */
 const BUSINESS_YEAR: Partial<Record<Good, number>> = {
-  grain: 100,
-  leather: 3,
-  textiles: 5,
-  "steel-tools": 3,
+  grain: 300,
+  leather: 1,
+  "steel-tools": 1,
+  livestock: 300,
 }
 
 /** Hundredths a market keeps on the shelf. One refill a month, in whole tons. */
@@ -216,7 +242,7 @@ function emptyStore(): Record<Good, number> {
   return store
 }
 
-/** Climate specialty weighs twice as much as each other legal crop. Dairy weighs twice meat. Neither changes the soil. */
+/** Climate specialty weighs twice as much as each other legal crop. Livestock does not change the soil any less than the old pastures. */
 export function chooseUses(
   prairieCount: number,
   average: number,
@@ -239,7 +265,7 @@ export function chooseUses(
 
 function specialty(preset: PresetId): ReadonlySet<Crop> {
   if (preset === "mediterranean") return new Set(["fruit"])
-  if (preset === "marine-west-coast") return new Set(["dairy", "meat"])
+  if (preset === "marine-west-coast") return new Set(["livestock"])
   if (preset === "humid-continental") return new Set(["grain"])
   if (preset === "tropical-savanna") return new Set(["fiber"])
   if (preset === "humid-subtropical") return new Set(["grain", "fiber"])
@@ -249,7 +275,7 @@ function specialty(preset: PresetId): ReadonlySet<Crop> {
 /** Added to the fertility reading for this product only. 50 fertility and +20 pay at 0.70, and the sum may pass 100. */
 function climateBonus(preset: PresetId, good: Good): number {
   if (preset === "mediterranean" && good === "fruit") return 20
-  if (preset === "marine-west-coast" && (good === "meat" || good === "dairy" || good === "hide")) return 20
+  if (preset === "marine-west-coast" && (good === "livestock" || good === "dairy")) return 20
   if (preset === "humid-continental" && good === "grain") return 20
   if (preset === "tropical-savanna" && good === "fiber") return 20
   if (preset === "humid-subtropical" && (good === "grain" || good === "fiber")) return 10
@@ -262,7 +288,7 @@ function pick(options: readonly Crop[], preset: PresetId, rng: () => number, tak
   const favored = specialty(preset)
   const open = options.filter((crop) => !taken.includes(crop))
   const garden = open.every((crop) => crop === "fiber" || crop === "fruit" || crop === "vegetables")
-  const weights = open.map((crop) => (garden ? (GARDEN_WEIGHT[crop] ?? 0) + (favored.has(crop) ? 20 : 0) : (crop === "dairy" ? 2 : 1) * (favored.has(crop) ? 2 : 1)))
+  const weights = open.map((crop) => (garden ? (GARDEN_WEIGHT[crop] ?? 0) + (favored.has(crop) ? 20 : 0) : favored.has(crop) ? 2 : 1))
   const total = weights.reduce((sum, weight) => sum + weight, 0)
   let roll = rng() * total
   for (let i = 0; i < open.length; i++) {
@@ -279,7 +305,7 @@ function pickTwo(options: readonly Crop[], preset: PresetId, rng: () => number):
 
 function improvesSoil(layout: Layout, uses: readonly Crop[]): boolean {
   if (layout === "quarters") return true
-  return layout === "thirds" && uses.some((crop) => crop === "dairy" || crop === "meat")
+  return layout === "thirds" && uses.some((crop) => crop === "livestock")
 }
 
 /**
@@ -421,7 +447,7 @@ function stockRecord(structure: Structure, owner: number, _seed: string): FarmRe
   }
 }
 
-/** 70% the best monthly margin, 20% the second, 10% another profitable specialty. */
+/** 45% the best monthly margin, 25% the second, 15% the third, and the rest split across whatever is left. Fewer than four drop the empty slots and rescale. */
 export function pickShopSpecialty(
   ranked: readonly ShopSpecialty[],
   structureId: number,
@@ -430,14 +456,19 @@ export function pickShopSpecialty(
   month: number,
 ): ShopSpecialty | null {
   if (ranked.length === 0) return null
-  if (ranked.length === 1) return ranked[0]
   const rng = mulberry32(hashSeed(`${seed}:shop:${structureId}:${year}:${month}`))
   const roll = rng()
-  if (roll < 0.7) return ranked[0]
-  if (roll < 0.9) return ranked[1]
-  const rest = ranked.slice(2)
-  if (rest.length === 0) return ranked[0]
-  return rest[Math.min(rest.length - 1, Math.floor(rng() * rest.length))]
+  const raw = ranked.map((_, index) => {
+    if (ranked.length >= 4 && index >= 3) return 0.15 / (ranked.length - 3)
+    return [0.45, 0.25, 0.15, 0.15][index] ?? 0
+  })
+  const total = raw.reduce((sum, weight) => sum + weight, 0)
+  let cursor = 0
+  for (let index = 0; index < ranked.length; index++) {
+    cursor += raw[index] / total
+    if (roll < cursor) return ranked[index]
+  }
+  return ranked[ranked.length - 1]
 }
 
 const SHOP_PURSE: Record<ShopSpecialty, number> = {
@@ -445,7 +476,9 @@ const SHOP_PURSE: Record<ShopSpecialty, number> = {
   blacksmith: 5000,
   smokehouse: 1000,
   creamery: 1000,
+  brewer: 1000,
   cooper: 1000,
+  tanner: 1000,
 }
 
 function canFoundShop(specialty: ShopSpecialty, cash: number): boolean {
@@ -453,7 +486,7 @@ function canFoundShop(specialty: ShopSpecialty, cash: number): boolean {
 }
 
 function rollSpecialty(id: number, seed: string, cash: number): ShopSpecialty | null {
-  const kinds = (["sawmill", "blacksmith", "smokehouse", "creamery", "cooper"] as const).filter((kind) => canFoundShop(kind, cash))
+  const kinds = (["sawmill", "blacksmith", "smokehouse", "creamery", "brewer", "cooper", "tanner"] as const).filter((kind) => canFoundShop(kind, cash))
   if (kinds.length === 0) return null
   const roll = mulberry32(hashSeed(`${seed}:shop:${id}`))()
   return kinds[Math.min(kinds.length - 1, Math.floor(roll * kinds.length))]
@@ -476,10 +509,11 @@ function openingStore(kind: Structure["kind"]): Record<Good, number> {
     for (const good of GOODS) store[good] += BUSINESS_YEAR[good] ?? 0
   }
   if (kind === "caravan-house") {
-    store.grain += 200
-    store.leather += 6
-    store.textiles += 10
-    store["steel-tools"] += 6
+    store.grain += 500
+    store.leather += 1
+    store["steel-tools"] += 1
+    store["wagon-parts"] += 10
+    store.barrels += 100
   }
   if (kind === "farmstead") {
     store.leather += 10
@@ -510,6 +544,7 @@ function monthWork(
 ): { record: FarmRecord } {
   const next = record
   if (!Number.isFinite(next.prairie)) next.prairie = 0
+  next.uses = withLivestock(next.uses)
   const feature = () => land.feature
   const bucket = emptyStore()
 
@@ -569,16 +604,12 @@ function monthWork(
         pile(bucket, "grain", count, 1, average, preset)
       }
       if (crop === "vegetables" && month === JULY) pile(bucket, "vegetables", count, 20, average, preset)
-      if (crop === "dairy" && month === MAY) pile(bucket, "dairy", count, 10, average, preset)
-      if (crop === "meat" && month === NOVEMBER) {
-        pile(bucket, "meat", count, 1, average, preset)
-        pile(bucket, "hide", count, 0.2, average, preset)
-      }
       if (crop === "fruit" && month === AUGUST && next.fruitAge >= 3 && next.fruitAge <= 33) {
         pile(bucket, "fruit", count, 20, average, preset)
       }
     }
   }
+  if (average !== undefined) tendHerd(next, bucket, count, average, preset, month)
 
   if (month === AUGUST) {
     for (const tile of structure.tiles) if (feature()[tile] === Feature.Woodland) bucket.fruit += 0.5
@@ -614,8 +645,54 @@ function monthWork(
   }
 
   const rng = mulberry32(hashSeed(`${seed}:harvest:${structure.id}:${year}:${month}`))
-  for (const good of GOODS) next.store[good] += keep(bucket[good], rng)
+  const surplus: Partial<Record<Good, number>> = {}
+  for (const good of GOODS) {
+    const gained = keep(bucket[good], rng)
+    if (gained <= 0) continue
+    const cap = FARM_STORE_CAP[good]
+    if (cap === undefined) {
+      next.store[good] += gained
+      continue
+    }
+    const room = Math.max(0, cap - (next.store[good] ?? 0))
+    const kept = Math.min(gained, room)
+    next.store[good] += kept
+    if (gained > kept) surplus[good] = gained - kept
+  }
+  next.surplus = surplus
   return { record: next }
+}
+
+/** A saved meat or dairy plan is one livestock share. */
+function withLivestock(uses: readonly string[]): Crop[] {
+  const kept: Crop[] = []
+  let herd = false
+  for (const crop of uses) {
+    if (crop === "dairy" || crop === "meat" || crop === "livestock") {
+      herd = true
+      continue
+    }
+    if ((CROPS as readonly string[]).includes(crop) && !kept.includes(crop as Crop)) kept.push(crop as Crop)
+  }
+  if (herd) kept.push("livestock")
+  return kept
+}
+
+/** May milks the herd already on hand. November adds births and slaughters only what does not fit. */
+function tendHerd(record: FarmRecord, bucket: Record<Good, number>, tiles: number, average: number, preset: PresetId, month: number) {
+  if (!record.uses.includes("livestock")) return
+  const areas = Math.round(tiles / 40)
+  const factor = (good: Good) => (average + climateBonus(preset, good)) / 100
+  if (month === MAY) bucket.dairy += (record.store.livestock ?? 0) * 5 * factor("dairy")
+  if (month !== NOVEMBER || tiles <= 0) return
+  const born = areas * 0.5 * factor("livestock") * TON
+  const cap = (1 + areas) * TON
+  const room = Math.max(0, cap - (record.store.livestock ?? 0))
+  const kept = Math.min(born, room)
+  record.store.livestock = (record.store.livestock ?? 0) + kept
+  const slaughtered = born - kept
+  bucket.meat += slaughtered * 0.8
+  bucket.hide += slaughtered * 0.1
 }
 
 function pile(bucket: Record<Good, number>, good: Good, count: number, perTile: number, average: number, preset: PresetId) {

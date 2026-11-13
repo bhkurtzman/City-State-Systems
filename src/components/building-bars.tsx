@@ -18,11 +18,11 @@ const BUILD_INFO: Partial<Record<BuildTool, { name: string; detail: string }>> =
   },
   "construction-office": {
     name: "Construction Office",
-    detail: "A 3×3 state building on dry ground. One per town. Each laborer gives 100 man-hours a month. A staffed office keeps lumber, steel parts, and textiles.",
+    detail: "A 3×3 state building on dry ground. One per town. Each laborer gives 100 man-hours a month. A staffed office keeps lumber and steel parts.",
   },
   "trading-post": {
     name: "Trading Post",
-    detail: "A 2×2 post. Up to three. Moves 1 t each way per month. Takes 1 t of grain in November and may use leather, textiles, and steel tools in January.",
+    detail: "A 2×2 post. Up to three. Moves 1 t each way per month. Takes 3 t of grain in November. In January, a 5% chance to use 0.1 t of leather and a 5% chance to use 0.1 t of steel tools. Keeps 3 t of livestock and, in July, has a 15% chance to use 1 t.",
   },
   market: {
     name: "Market",
@@ -42,7 +42,7 @@ const BUILD_INFO: Partial<Record<BuildTool, { name: string; detail: string }>> =
   },
   workshop: {
     name: "Workshop",
-    detail: "800 man-hours, 20 t of lumber, and 0.3 t of steel parts. Woods add clearing time. Sawmill, blacksmith, smokehouse, creamery, or cooper.",
+    detail: "800 man-hours, 20 t of lumber, and 0.3 t of steel parts. Woods add clearing time. Sawmill, blacksmith, smokehouse, creamery, brewer, cooper, or tanner.",
   },
   shop: {
     name: "Shop",
@@ -50,7 +50,7 @@ const BUILD_INFO: Partial<Record<BuildTool, { name: string; detail: string }>> =
   },
   "caravan-house": {
     name: "Caravan House",
-    detail: "A 2×3 house. 1,500 man-hours, 40 t of lumber, 0.4 t of steel parts, and 0.1 t of textiles. Hauls goods once a finished road reaches the map edge.",
+    detail: "A 2×3 house. 1,500 man-hours, 40 t of lumber, 0.4 t of steel parts, and 1 t of wagon parts. Hauls goods once a finished road reaches the map edge. Buys 3 t of livestock and, in July, has a 15% chance to use 1 t.",
   },
 }
 
