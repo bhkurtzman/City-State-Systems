@@ -26,7 +26,7 @@ const BUILD_INFO: Partial<Record<BuildTool, { name: string; detail: string }>> =
   },
   market: {
     name: "Market",
-    detail: "A 2×2 shop. One per town. Sells from a shelf at 10% over cost. The family lives in the market.",
+    detail: "A 2×2 shop. One per town. Sells from a shelf at 20% over cost. The family lives in the market.",
   },
   sawpit: {
     name: "Sawpit",

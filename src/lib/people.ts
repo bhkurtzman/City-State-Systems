@@ -594,6 +594,8 @@ export type ClassCensus = {
   middle: number
   upper: number
   wealthy: number
+  /** Median of income plus a thirtieth of wealth, from the poorest band to the richest. */
+  incomeBands: (number | null)[]
 }
 
 /**
@@ -602,10 +604,13 @@ export type ClassCensus = {
  * Poor is whatever is left.
  */
 export function classCensus(people: People, adultCost: number, memberCost: number, homes: readonly HouseholdHome[] = []): ClassCensus {
+  const units = households(people, homes)
   const incomes: number[] = []
   const counts = { poor: 0, working: 0, middle: 0, upper: 0, wealthy: 0 }
-  for (const unit of households(people, homes)) {
+  const scores: number[] = []
+  for (const unit of units) {
     incomes.push(unit.income)
+    scores.push(unit.income + unit.wealth / 30)
     counts[classify(unit.income, unit.wealth, householdCost(adultCost, memberCost, unit.size))] += 1
   }
   return {
@@ -613,11 +618,33 @@ export function classCensus(people: People, adultCost: number, memberCost: numbe
     incomeAverage: average(incomes),
     incomeMedian: median(incomes),
     ...counts,
+    incomeBands: incomeBands(scores),
   }
 }
 
 function householdCost(full: number, member: number, size: number): number {
   return Math.round(full + member * Math.max(0, size - 1))
+}
+
+/** Bottom 2%, 3–20%, 21–50%, 51–79%, 80–98%, and the top 2%. An empty slice is null. */
+const INCOME_BANDS: readonly [number, number][] = [
+  [0, 0.02],
+  [0.02, 0.2],
+  [0.2, 0.5],
+  [0.5, 0.79],
+  [0.79, 0.98],
+  [0.98, 1],
+]
+
+function incomeBands(scores: readonly number[]): (number | null)[] {
+  const sorted = [...scores].sort((a, b) => a - b)
+  return INCOME_BANDS.map(([low, high]) => {
+    const start = Math.floor(sorted.length * low)
+    const end = high === 1 ? sorted.length : Math.floor(sorted.length * high)
+    const slice = sorted.slice(start, end)
+    const mid = median(slice)
+    return mid === null ? null : Math.round(mid)
+  })
 }
 
 /** Class of each household head, and the head every living person follows. */
@@ -652,6 +679,30 @@ type HouseholdRoll = {
   income: number
   wealth: number
   size: number
+}
+
+/** Average household income for farmers, traders, and workshop owners. A workshop is counted by the specialty it owns, not by the craftsman job. */
+export function sectorIncomes(
+  people: People,
+  homes: readonly HouseholdHome[],
+  craftOwners: ReadonlyMap<string, ReadonlySet<number>>,
+): { households: number; farmer: number | null; trader: number | null; craft: Map<string, number | null> } {
+  const units = households(people, homes)
+  const farmer: number[] = []
+  const trader: number[] = []
+  const craft = new Map<string, number[]>([...craftOwners.keys()].map((key) => [key, []]))
+  for (const unit of units) {
+    const job = people.occupation?.[unit.head] ?? OCCUPATION.unemployed
+    if (job === OCCUPATION.farmer) farmer.push(unit.income)
+    if (job === OCCUPATION.trader) trader.push(unit.income)
+    const mate = people.spouse[unit.head]
+    const heads = isAlive(people, mate) ? [unit.head, mate] : [unit.head]
+    for (const [key, owners] of craftOwners) {
+      if (heads.some((id) => owners.has(id))) craft.get(key)?.push(unit.income)
+    }
+  }
+  const mean = (values: number[]) => (values.length === 0 ? null : Math.round(values.reduce((sum, value) => sum + value, 0) / values.length))
+  return { households: units.length, farmer: mean(farmer), trader: mean(trader), craft: new Map([...craft].map(([key, values]) => [key, mean(values)])) }
 }
 
 function households(people: People, homes: readonly HouseholdHome[]): HouseholdRoll[] {
@@ -2449,7 +2500,7 @@ export function openIncomeMonth(people: People, month: number): People {
   return { ...people, income, incomeLog }
 }
 
-/** Add a sale, fee, goods purchase, or lease payment to the open month. */
+/** Add a sale, fee, wage, or business purchase to the open month. Household food, clothing, and fuel are left out. */
 export function noteOperatingIncome(income: Int32Array, log: Int32Array, id: number, dollars: number, month: number) {
   if (!Number.isFinite(dollars) || dollars === 0) return
   if (id < 0 || id >= income.length) return

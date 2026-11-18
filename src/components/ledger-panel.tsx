@@ -11,7 +11,14 @@ import { LAND_LABEL, LAND_TYPES, type LandRate, type LandSchedule, type LandType
 import type { CitizenCensus, ClassCensus, EconomyCensus, EducationCensus } from "@/lib/people"
 import { cn } from "@/lib/utils"
 
-export type LedgerId = "population" | "treasury" | "education" | "economy" | "government"
+export type LedgerId = "population" | "treasury" | "education" | "economy" | "government" | "demand"
+
+export type DemandSector = {
+  name: string
+  profit: string
+  firms: string
+  saturation: string | null
+}
 
 const BLANK = "—"
 
@@ -21,6 +28,7 @@ const TITLES: Record<LedgerId, string> = {
   treasury: "Treasury",
   economy: "Economy",
   government: "Government",
+  demand: "Demand",
 }
 
 type Row = {
@@ -57,6 +65,7 @@ export function LedgerPanel({
   structures,
   wellbeing,
   lastStarvationDeaths,
+  demand,
   onClose,
 }: {
   kind: LedgerId
@@ -88,6 +97,7 @@ export function LedgerPanel({
   structures: readonly Structure[]
   wellbeing: { households: number; adults: number; children: number } | null
   lastStarvationDeaths: number | null
+  demand: DemandSector[]
   onClose: () => void
 }) {
   const rows =
@@ -105,6 +115,9 @@ export function LedgerPanel({
   }
   if (kind === "economy") {
     return <EconomyPanel rows={rows} prices={prices} classes={classes} onClose={onClose} />
+  }
+  if (kind === "demand") {
+    return <DemandPanel sectors={demand} onClose={onClose} />
   }
   if (kind === "population") {
     return (
@@ -305,7 +318,7 @@ function economyRows(economy: EconomyCensus | null, living: number | null, class
     { label: "Median", value: money(economy?.singleMedian ?? null), detail: true },
     {
       label: "Avg. Income",
-      note: "Trailing year for each family and each single adult. Sales and fees, minus goods bought and leases. The first year is the year so far.",
+      note: "Household income minus business expenses.",
       value: money(classes?.incomeAverage ?? null),
     },
     { label: "Median", value: money(classes?.incomeMedian ?? null), detail: true },
@@ -419,6 +432,52 @@ function treasuryRows(cash: string, ongoingExpenses: number | null, capitalExpen
   ]
 }
 
+function DemandPanel({ sectors, onClose }: { sectors: DemandSector[]; onClose: () => void }) {
+  const [tab, setTab] = useState("overview")
+  return (
+    <Card className="w-full shadow-md">
+      <CardHeader>
+        <CardTitle>Demand</CardTitle>
+        <CardAction>
+          <Button type="button" variant="outline" size="sm" aria-label="Close" onClick={onClose}>
+            X
+          </Button>
+        </CardAction>
+      </CardHeader>
+      <CardContent>
+        <Tabs
+          value={tab}
+          onValueChange={(value) => {
+            if (typeof value === "string") setTab(value)
+          }}
+        >
+          <TabsList className="h-auto w-full flex-wrap justify-start">
+            <TabsTrigger value="overview" className="px-1.5 text-xs">Overview</TabsTrigger>
+            <TabsTrigger value="sectors" className="px-1.5 text-xs">Sectors</TabsTrigger>
+          </TabsList>
+          <TabsContent value="overview" />
+          <TabsContent value="sectors">
+            {sectors.map((sector) => (
+              <section key={sector.name} className="mt-4 first:mt-0">
+                <h3 className="text-sm font-medium">{sector.name}</h3>
+                <div className="mt-2">
+                  <RowList
+                    rows={[
+                      { label: "Avg. Profit", value: sector.profit },
+                      { label: "No. Firms", value: sector.firms },
+                      ...(sector.saturation === null ? [] : [{ label: "Market Saturation", value: sector.saturation }]),
+                    ]}
+                  />
+                </div>
+              </section>
+            ))}
+          </TabsContent>
+        </Tabs>
+      </CardContent>
+    </Card>
+  )
+}
+
 function EconomyPanel({
   rows,
   prices,
@@ -465,6 +524,11 @@ function EconomyPanel({
             <p className="mt-3 text-xs leading-relaxed text-muted-foreground">
               Each household pays the full cost once. Every other person adds food, clothing, and leather at three quarters of the adult rate. A higher band wins when income or wealth reaches it. Savings alone can hold the working class.
             </p>
+            <h3 className="mt-5 text-sm font-medium">Income Percentiles</h3>
+            <p className="mt-1 text-xs leading-relaxed text-muted-foreground">Median Personal Income and 1/30th of Wealth</p>
+            <div className="mt-3">
+              <RowList rows={percentileRows(classes)} />
+            </div>
           </TabsContent>
         </Tabs>
       </CardContent>
@@ -481,6 +545,15 @@ function classRows(classes: ClassCensus | null): Row[] {
     { label: "Upper-middle class", note: "Income is over 3 times the cost, or wealth is at least 15 times.", value: band(classes?.upper, total) },
     { label: "Wealthy", note: "Income is over 20 times the cost, or wealth is over 100 times.", value: band(classes?.wealthy, total) },
   ]
+}
+
+const PERCENTILE_LABELS = ["Bottom 2%", "3–20%", "21–50%", "51–79%", "80–98%", "Top 2%"]
+
+function percentileRows(classes: ClassCensus | null): Row[] {
+  return PERCENTILE_LABELS.map((label, index) => ({
+    label,
+    value: money(classes?.incomeBands?.[index] ?? null, true),
+  }))
 }
 
 function TreasuryPanel({

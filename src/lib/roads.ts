@@ -284,7 +284,7 @@ export function supplyOrders(book: RoadBook, farms: Farms, structures: readonly 
   return orders
 }
 
-/** Offices with wood and no unfinished path. A workshop or market may buy that wood. */
+/** Offices with wood and no unfinished path. That wood sells by the ton at the town price. */
 export function idleOffices(book: RoadBook, farms: Farms): number[] {
   const busy = new Set(book.projects.filter((project) => project.officeId !== null && remaining(book, project) > 0).map((project) => project.officeId as number))
   const ids: number[] = []

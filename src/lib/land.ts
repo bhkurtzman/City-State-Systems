@@ -137,7 +137,8 @@ export function settleHoldings(
     if (row.lease <= 0 || row.leaseMonth !== month || row.owner < 0) continue
     if (wealth[row.owner] < row.lease) continue
     wealth[row.owner] -= row.lease
-    noteOperatingIncome(income, incomeLog, row.owner, -row.lease, month)
+    const business = row.lease - homeLease(byId.get(row.structureId), row.lease)
+    if (business > 0) noteOperatingIncome(income, incomeLog, row.owner, -business, month)
     toTreasury += row.lease
   }
 
@@ -276,7 +277,7 @@ function offerByWealth(
       .sort((a, b) => Number(traders.includes(b)) - Number(traders.includes(a)) || (wealth[b] ?? 0) - (wealth[a] ?? 0) || a - b)
     const pick = choices[0]
     if (pick === undefined) continue
-    paid += assign(row, quote, pick, wealth, income, incomeLog, month)
+    paid += assign(row, structure, quote, pick, wealth, income, incomeLog, month)
     if ((structure.kind === "caravan-house" || structure.kind === "workshop" || structure.kind === "shop") && caravan) {
       const labor = caravan.labor(structure)
       if (labor > 0 && pick < wealth.length) {
@@ -333,8 +334,21 @@ function needsPurse(structure: Structure): boolean {
   return structure.kind === "farmstead" && structure.tiles.length > LARGE_FARM
 }
 
+/** The home's share of a lease. A farmstead's land is all business. A shop's land is all personal. A post, caravan house, workshop, market, or sawpit keeps two tiles personal. */
+function homeLease(structure: Structure | undefined, lease: number): number {
+  if (!structure || lease <= 0) return 0
+  const tiles = structure.tiles.length
+  if (structure.kind === "farmstead") return 0
+  if (structure.kind === "trading-post" || structure.kind === "caravan-house" || structure.kind === "workshop" || structure.kind === "market" || structure.kind === "sawpit") {
+    if (tiles <= 0) return 0
+    return Math.round((lease * Math.min(2, tiles)) / tiles)
+  }
+  return lease
+}
+
 function assign(
   row: Holding,
+  structure: Structure,
   quote: Quote,
   head: number,
   wealth: Int32Array,
@@ -343,7 +357,10 @@ function assign(
   month: number,
 ): number {
   wealth[head] -= quote.due
-  if (quote.tenure === "lease") noteOperatingIncome(income, incomeLog, head, -quote.due, month)
+  if (quote.tenure === "lease") {
+    const business = quote.due - homeLease(structure, quote.due)
+    if (business > 0) noteOperatingIncome(income, incomeLog, head, -business, month)
+  }
   row.owner = head
   row.lease = quote.tenure === "lease" ? quote.lease : 0
   row.paid = quote.tenure === "sale" ? quote.due : 0

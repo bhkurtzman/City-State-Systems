@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from "react"
 import { BuildInfoBar, BuildingMenu, CategoryBar, type BuildCategory, type FarmDraw } from "@/components/building-bars"
 import { BuildingInspector, InspectorPanel } from "@/components/inspector-panel"
-import { LedgerPanel, type LedgerId } from "@/components/ledger-panel"
+import { LedgerPanel, type DemandSector, type LedgerId } from "@/components/ledger-panel"
 import { MapPane, type MapPaneHandle } from "@/components/map-pane"
 import { SetupPanel } from "@/components/setup-panel"
 import { WeatherIcon } from "@/components/weather-icon"
@@ -39,6 +39,7 @@ import {
   educationCensus,
   householdHomes,
   residenceCensus,
+  sectorIncomes,
   DIFFICULTIES,
   emptyEpidemic,
   epidemicNotice,
@@ -62,7 +63,7 @@ import { cheapestShopFill, shopCash, shopLabor, shopLines, trackShops } from "@/
 import { defaultLandSchedule, emptyHoldings, plotSalePrice, propertyLines, settleHoldings, yearlyUrbanTile, type Holding, type LandSchedule } from "@/lib/land"
 import { emptyFarms, productionLines, workFarms, type Good } from "@/lib/produce"
 import { assignOffices, emptyRoads, eraseRoad, idleOffices, paintRoad, projectAt, projectLines, projectOfOffice, roadCells, runRoads, supplyOrders, type RoadBook } from "@/lib/roads"
-import { caravanFee, caravanSupplies, emptyTown, familyAllowance, householdSupplyBill, livingCosts, marketLines, marketSale, operatingSupplies, rollTradingFee, townPriceRows, tradeLines, tradeMonth, tradingBill, workshopOpening, type ShipHouse } from "@/lib/trade"
+import { beerSoldYear, caravanFee, caravanSupplies, emptyTown, familyAllowance, householdSupplyBill, livingCosts, marketLines, marketSale, operatingSupplies, rollTradingFee, townPriceRows, tradeLines, tradeMonth, tradingBill, workshopOpening, type ShipHouse } from "@/lib/trade"
 import { runGeneration } from "@/lib/run-generation"
 import { monthWeather } from "@/lib/weather"
 import { LAYERS, type Coast, type LayerId, type MapSize, type MonthClimate, type World } from "@/lib/types"
@@ -462,6 +463,12 @@ export function PlannerApp() {
                 pressed={ledger === "government"}
                 onClick={() => setLedger((current) => (current === "government" ? null : "government"))}
               />
+              <BarStat
+                label="Demand"
+                value="—"
+                pressed={ledger === "demand"}
+                onClick={() => setLedger((current) => (current === "demand" ? null : "demand"))}
+              />
             </div>
             <div className="flex items-center gap-1">
               <Button type="button" variant="outline" size="sm" onClick={() => mapRef.current?.zoomBy(1 / 1.2)}>
@@ -594,7 +601,7 @@ export function PlannerApp() {
                   lastRate={fertility?.lastRate ?? null}
                   schooling={schooling}
                   economy={economy}
-                  prices={townPriceRows(town, farms, settlement.structures, holdings, people, world.months[calendarMonth].low, world.terrain, world.feature, world.months.map((item) => item.low), seed.trim() || "0", calendarYear, yearlyUrbanTile(landSchedule), shipHouses, new Set([...closedWorkshops(workshops), ...closedWorkshops(shops)]), buildNeeds, foundedYear)}
+                  prices={townPriceRows(town, farms, settlement.structures, holdings, people, world.months[calendarMonth].low, world.terrain, world.feature, world.months.map((item) => item.low), seed.trim() || "0", calendarYear, yearlyUrbanTile(landSchedule), shipHouses, new Set([...closedWorkshops(workshops), ...closedWorkshops(shops)]), buildNeeds, foundedYear, calendarMonth)}
                   living={costs.full}
                   classes={classes}
                   homelessFamilies={residence?.homelessFamilies ?? null}
@@ -612,6 +619,7 @@ export function PlannerApp() {
                   structures={settlement.structures}
                   wellbeing={wellbeing}
                   lastStarvationDeaths={starvation.lastDeaths}
+                  demand={demandRows(people, settlement.structures, holdings.rows, farms, town, caravans, shipHouses)}
                   onClose={() => setLedger(null)}
                 />
               </div>
@@ -754,6 +762,7 @@ export function PlannerApp() {
                 closedWorkshops(workshops),
                 openingNeeds,
                 foundedYear,
+                nextMonth,
               )
               const landStep = settleHoldings(
                 step.holdings ?? holdings,
@@ -1129,6 +1138,58 @@ export function PlannerApp() {
       </footer>
     </div>
   )
+}
+
+function demandRows(
+  people: People | null,
+  structures: readonly Structure[],
+  rows: readonly Holding[],
+  farms: { rows: { structureId: number; specialty?: string }[] },
+  town: Parameters<typeof beerSoldYear>[0],
+  caravans: readonly CaravanHouse[],
+  ships: readonly ShipHouse[],
+): DemandSector[] {
+  if (!people) return []
+  const owned = new Set(rows.filter((row) => row.owner >= 0).map((row) => row.structureId))
+  const standing = (kind: Structure["kind"]) => structures.filter((structure) => structure.kind === kind && !structure.pending && !structure.removing && owned.has(structure.id))
+  const crafts: { id: string; name: string; firms: Structure[] }[] = [
+    { id: "sawmill", name: "Sawmill", firms: [...standing("workshop").filter((structure) => farms.rows.some((row) => row.structureId === structure.id && row.specialty === "sawmill")), ...standing("sawpit")] },
+    { id: "blacksmith", name: "Blacksmith", firms: standing("workshop").filter((structure) => farms.rows.some((row) => row.structureId === structure.id && row.specialty === "blacksmith")) },
+    { id: "smokehouse", name: "Smokehouse", firms: standing("workshop").filter((structure) => farms.rows.some((row) => row.structureId === structure.id && row.specialty === "smokehouse")) },
+    { id: "creamery", name: "Creamery", firms: standing("workshop").filter((structure) => farms.rows.some((row) => row.structureId === structure.id && row.specialty === "creamery")) },
+    { id: "brewer", name: "Brewing", firms: standing("workshop").filter((structure) => farms.rows.some((row) => row.structureId === structure.id && row.specialty === "brewer")) },
+    { id: "cooper", name: "Cooper", firms: standing("workshop").filter((structure) => farms.rows.some((row) => row.structureId === structure.id && row.specialty === "cooper")) },
+    { id: "tanner", name: "Tanner", firms: standing("workshop").filter((structure) => farms.rows.some((row) => row.structureId === structure.id && row.specialty === "tanner")) },
+  ]
+  const craftOwners = new Map(crafts.map((craft) => [craft.id, new Set(craft.firms.flatMap((structure) => {
+    const owner = rows.find((row) => row.structureId === structure.id)?.owner
+    return owner !== undefined && owner >= 0 ? [owner] : []
+  }))]))
+  const incomes = sectorIncomes(people, householdHomes(structures, rows), craftOwners)
+  const money = (value: number | null) => (value === null ? "—" : formatMoney(value))
+  const beer = beerSoldYear(town)
+  const expected = incomes.households * 0.3 * (beer.months / 12)
+  const beerSaturation = beer.months === 0 || expected <= 0 ? "—" : `${Math.round((beer.tons / expected) * 100)}%`
+  let exported = 0
+  let capacity = 0
+  for (const house of caravans) {
+    const way = ships.find((ship) => ship.structureId === house.structureId)?.out ?? 0
+    const recent = house.history.slice(-12)
+    if (way <= 0 || recent.length === 0) continue
+    exported += recent.reduce((sum, month) => sum + month.tons, 0)
+    capacity += way * recent.length
+  }
+  const tradeSaturation = capacity <= 0 ? "—" : `${Math.round((exported / capacity) * 100)}%`
+  return [
+    { name: "Agriculture", profit: money(incomes.farmer), firms: String(standing("farmstead").length), saturation: null },
+    { name: "Trade", profit: money(incomes.trader), firms: String(standing("trading-post").length + standing("caravan-house").length), saturation: tradeSaturation },
+    ...crafts.map((craft) => ({
+      name: craft.name,
+      profit: money(incomes.craft.get(craft.id) ?? null),
+      firms: String(craft.firms.length),
+      saturation: craft.id === "brewer" ? beerSaturation : null,
+    })),
+  ]
 }
 
 function shipHousesNow(

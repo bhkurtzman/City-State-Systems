@@ -397,7 +397,7 @@ export function workFarms(
       const purse = wealth && owner >= 0 && owner < wealth.length ? wealth[owner] ?? 0 : 0
       const cash = purse - Math.max(0, buildReserve(structure.id))
       const affordable = openingRanks.filter((specialty) => canFoundShop(specialty, cash))
-      record.specialty = pickShopSpecialty(affordable, structure.id, seed, year, month) ?? rollSpecialty(structure.id, seed, cash) ?? undefined
+      record.specialty = pickShopSpecialty(affordable, structure.id, seed, year, month) ?? undefined
     }
     if (structure.kind !== "farmstead") {
       record.owner = owner
@@ -483,13 +483,6 @@ const SHOP_PURSE: Record<ShopSpecialty, number> = {
 
 function canFoundShop(specialty: ShopSpecialty, cash: number): boolean {
   return cash >= SHOP_PURSE[specialty]
-}
-
-function rollSpecialty(id: number, seed: string, cash: number): ShopSpecialty | null {
-  const kinds = (["sawmill", "blacksmith", "smokehouse", "creamery", "brewer", "cooper", "tanner"] as const).filter((kind) => canFoundShop(kind, cash))
-  if (kinds.length === 0) return null
-  const roll = mulberry32(hashSeed(`${seed}:shop:${id}`))()
-  return kinds[Math.min(kinds.length - 1, Math.floor(roll * kinds.length))]
 }
 
 /** Hundredths of a ton. Nested: under 0.5, under 1.0, then under 1.2. */
