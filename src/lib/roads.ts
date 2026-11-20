@@ -14,11 +14,22 @@ const WOODLAND_YIELD = 200
 const FOREST_YIELD = 500
 const WETLAND_WOOD = 100
 const SUPPLY_LOT = 10
-/** A staffed office keeps these on hand for buildings under construction. */
+/** A staffed office keeps these on hand for buildings under construction. Steel parts refill like a market shelf: at half or below, the gap is bought in whole tons. */
 const OFFICE_PANTRY: readonly { good: Good; hundredths: number }[] = [
   { good: "lumber", hundredths: 5000 },
-  { good: "steel-parts", hundredths: 50 },
+  { good: "steel-parts", hundredths: 100 },
 ]
+
+/** Hundredths still wanted for the pantry. Steel parts wait until the pile is at half, then round the gap up to a ton. */
+function pantryGap(good: Good, target: number, held: number): number {
+  if (good === "steel-parts") {
+    if (held * 2 > target) return 0
+    const gap = target - held
+    if (gap <= 0) return 0
+    return Math.ceil(gap / 100) * 100
+  }
+  return held < target ? target - held : 0
+}
 
 const BRIDGE_HOURS = 300
 /** 5 t of lumber and 0.1 t of steel parts, in hundredths. */
@@ -245,8 +256,8 @@ export function pantryOrders(farms: Farms, structures: readonly Structure[], sta
     const row = farms.rows.find((item) => item.structureId === structure.id)
     if (!row) continue
     for (const item of OFFICE_PANTRY) {
-      const held = row.store[item.good] ?? 0
-      if (held < item.hundredths) orders.push({ structureId: structure.id, good: item.good, hundredths: item.hundredths - held })
+      const gap = pantryGap(item.good, item.hundredths, row.store[item.good] ?? 0)
+      if (gap > 0) orders.push({ structureId: structure.id, good: item.good, hundredths: gap })
     }
   }
   return orders
