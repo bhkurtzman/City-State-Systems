@@ -393,11 +393,21 @@ function paintStroke(
 ): Settlement {
   let next = settlement
   let canCreate = allowNew
+  let extendId: number | null = null
   for (const index of indices) {
-    if (findStructure(next, index) || adjacentFarms(next, index, size).length > 0) canCreate = false
+    const occupied = findStructure(next, index)
+    if (occupied) {
+      if (extendId === null && occupied.kind === "farmstead" && !occupied.removing) extendId = occupied.id
+      continue
+    }
     const before = next
-    next = addFarm(next, index, size, terrain, feature, canCreate, roads)
-    if (next !== before) canCreate = false
+    next = addFarm(next, index, size, terrain, feature, canCreate, roads, extendId)
+    if (next === before) continue
+    canCreate = false
+    if (extendId === null) {
+      const created = findStructure(next, index)
+      if (created) extendId = created.id
+    }
   }
   if (next === settlement) return settlement
   return closeFarms(next, size, terrain, feature, roads)
@@ -405,8 +415,8 @@ function paintStroke(
 
 /**
  * One planned farm from a rectangle. Road and building tiles are left out.
- * Tiles separated from the rest by those gaps are dropped. A piece that touches
- * an existing farm merges into it.
+ * Tiles separated from the rest by those gaps are dropped. A farm beside
+ * another stays its own farmstead.
  */
 function stampRectangle(
   settlement: Settlement,
@@ -417,12 +427,8 @@ function stampRectangle(
   roads: ReadonlySet<number>,
 ): Settlement {
   const occupied = new Set<number>()
-  const farmAt = new Map<number, Structure>()
   for (const structure of settlement.structures) {
     for (const tile of structure.tiles) occupied.add(tile)
-    if (structure.kind === "farmstead" && !structure.removing) {
-      for (const tile of structure.tiles) farmAt.set(tile, structure)
-    }
   }
   const open = new Set<number>()
   const order: number[] = []
@@ -446,33 +452,8 @@ function stampRectangle(
       stack.push(neighbor)
     }
   }
-  const near = new Map<number, Structure>()
-  for (const index of keep) {
-    for (const neighbor of edgeNeighbors(index, size)) {
-      const structure = farmAt.get(neighbor)
-      if (structure) near.set(structure.id, structure)
-    }
-  }
-  let next: Settlement
-  if (near.size === 0) {
-    const tiles = uniqueSorted(keep)
-    next = append(settlement, { kind: "farmstead", tiles, fresh: tiles, pending: true, removing: false, home: null })
-  } else {
-    const hosts = [...near.values()].sort((a, b) => a.id - b.id)
-    const host = hosts[0]
-    const others = hosts.slice(1)
-    const drop = new Set(others.map((structure) => structure.id))
-    const tiles = uniqueSorted([...keep, ...host.tiles, ...others.flatMap((structure) => structure.tiles)])
-    const pending = host.pending && others.every((structure) => structure.pending)
-    const fresh = pending
-      ? tiles
-      : uniqueSorted([...keep, ...host.fresh, ...others.flatMap((structure) => (structure.pending ? structure.tiles : structure.fresh))])
-    const merged = retile(host, tiles, fresh, pending, terrain, feature, size, false)
-    next = {
-      ...settlement,
-      structures: settlement.structures.filter((structure) => !drop.has(structure.id)).map((structure) => (structure.id === host.id ? merged : structure)),
-    }
-  }
+  const tiles = uniqueSorted(keep)
+  const next = append(settlement, { kind: "farmstead", tiles, fresh: tiles, pending: true, removing: false, home: null })
   return closeFarms(next, size, terrain, feature, roads)
 }
 
@@ -501,39 +482,40 @@ function addFarm(
   feature: Uint8Array,
   allowNew: boolean,
   roads: ReadonlySet<number>,
+  extendId: number | null = null,
 ): Settlement {
   if (index < 0 || index >= size * size) return settlement
   if (roads.has(index) || findStructure(settlement, index)) return settlement
-  const near = adjacentFarms(settlement, index, size)
-  if (near.length === 0) {
-    if (!allowNew) return settlement
-    return append(settlement, {
-      kind: "farmstead",
-      tiles: [index],
-      fresh: [index],
-      pending: true,
-      removing: false,
-      home: null,
-    })
+  if (extendId !== null) {
+    const host = settlement.structures.find((structure) => structure.id === extendId)
+    if (!host || host.kind !== "farmstead" || host.removing || !sharesEdge(host.tiles, index, size)) return settlement
+    return extendFarm(settlement, host, index, terrain, feature, size)
   }
-  const host = [...near].sort((a, b) => a.id - b.id)[0]
-  const others = near.filter((structure) => structure.id !== host.id)
-  const drop = new Set(others.map((structure) => structure.id))
-  const tiles = uniqueSorted([index, ...host.tiles, ...others.flatMap((structure) => structure.tiles)])
-  const pending = host.pending && others.every((structure) => structure.pending)
-  const fresh = pending
-    ? tiles
-    : uniqueSorted([
-        index,
-        ...host.fresh,
-        ...others.flatMap((structure) => (structure.pending ? structure.tiles : structure.fresh)),
-      ])
-  const merged = retile(host, tiles, fresh, pending, terrain, feature, size, false)
+  if (!allowNew) return settlement
+  return append(settlement, {
+    kind: "farmstead",
+    tiles: [index],
+    fresh: [index],
+    pending: true,
+    removing: false,
+    home: null,
+  })
+}
+
+function extendFarm(
+  settlement: Settlement,
+  host: Structure,
+  index: number,
+  terrain: Uint8Array,
+  feature: Uint8Array,
+  size: number,
+): Settlement {
+  const tiles = uniqueSorted([index, ...host.tiles])
+  const fresh = host.pending ? tiles : uniqueSorted([index, ...host.fresh])
+  const shaped = retile(host, tiles, fresh, host.pending, terrain, feature, size, host.removing)
   return {
     ...settlement,
-    structures: settlement.structures
-      .filter((structure) => !drop.has(structure.id))
-      .map((structure) => (structure.id === host.id ? merged : structure)),
+    structures: settlement.structures.map((item) => (item.id === host.id ? shaped : item)),
   }
 }
 
@@ -826,12 +808,9 @@ function enclose(
   }
 
   const added: number[] = []
-  const merge = new Map<number, Structure>()
   for (let head = 0; head < queue.length; head++) {
     const index = queue[head]
-    const near = adjacentFarms(settlement, index, size).filter((item) => item.id !== structure.id && !merge.has(item.id))
     added.push(index)
-    for (const item of near) merge.set(item.id, item)
     const x = index % size
     const y = (index - x) / size
     if (x > minX) enqueue(index - 1)
@@ -841,22 +820,12 @@ function enclose(
   }
   if (added.length === 0) return settlement
 
-  const merged = [...merge.values()]
-  const tiles = uniqueSorted([...structure.tiles, ...added, ...merged.flatMap((item) => item.tiles)])
-  const pending = structure.pending && merged.every((item) => item.pending)
-  const fresh = pending
-    ? tiles
-    : uniqueSorted([
-        ...added,
-        ...structure.fresh,
-        ...merged.flatMap((item) => (item.pending ? item.tiles : item.fresh)),
-      ])
-  const shaped = retile(structure, tiles, fresh, pending, terrain, feature, size, structure.removing)
+  const tiles = uniqueSorted([...structure.tiles, ...added])
+  const fresh = structure.pending ? tiles : uniqueSorted([...added, ...structure.fresh])
+  const shaped = retile(structure, tiles, fresh, structure.pending, terrain, feature, size, structure.removing)
   return {
     ...settlement,
-    structures: settlement.structures
-      .filter((item) => !merge.has(item.id))
-      .map((item) => (item.id === structure.id ? shaped : item)),
+    structures: settlement.structures.map((item) => (item.id === structure.id ? shaped : item)),
   }
 }
 
@@ -888,13 +857,9 @@ function append(settlement: Settlement, structure: Omit<Structure, "id">): Settl
   }
 }
 
-function adjacentFarms(settlement: Settlement, index: number, size: number): Structure[] {
-  const found = new Map<number, Structure>()
-  for (const neighbor of edgeNeighbors(index, size)) {
-    const structure = findStructure(settlement, neighbor)
-    if (structure?.kind === "farmstead" && !structure.removing) found.set(structure.id, structure)
-  }
-  return [...found.values()]
+function sharesEdge(tiles: readonly number[], index: number, size: number): boolean {
+  const owned = new Set(tiles)
+  return edgeNeighbors(index, size).some((neighbor) => owned.has(neighbor))
 }
 
 function findStructure(settlement: Settlement, index: number): Structure | undefined {

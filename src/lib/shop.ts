@@ -173,13 +173,6 @@ export function rankRetail(input: RetailRank): RetailScore[] {
   return ranked
 }
 
-/** Cheapest qualifying specialty's stock, or infinity when none qualifies. */
-export function cheapestShopFill(input: RetailRank): number {
-  const ranked = rankRetail(input)
-  if (ranked.length === 0) return Number.POSITIVE_INFINITY
-  return Math.min(...ranked.map((item) => fillDollars(item.kind, input.prices)))
-}
-
 /**
  * 45 / 25 / 15, and the rest split across whatever is still left.
  * Fewer than four qualifiers drop the empty slots and rescale.
@@ -197,6 +190,20 @@ export function pickRetail(ranked: readonly RetailScore[], roll: number): Retail
     if (roll < cursor) return ranked[index].kind
   }
   return ranked[ranked.length - 1].kind
+}
+
+/** One specialty this purse can stock, using the same ranking and roll as an open shop. */
+export function chooseShopSpecialty(
+  input: RetailRank,
+  structureId: number,
+  seed: string,
+  year: number,
+  month: number,
+  purse: number,
+): RetailSpecialty | null {
+  const ranked = rankRetail(input)
+  const affordable = ranked.filter((item) => fillDollars(item.kind, input.prices) <= purse)
+  return pickRetail(affordable, mulberry32(hashSeed(`${seed}:retail:${structureId}:${year}:${month}`))())
 }
 
 /** The first open month a shop can pay for a specialty, it takes one. Later shops that month are marked down. */

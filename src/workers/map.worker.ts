@@ -17,6 +17,7 @@ scope.onmessage = (event: MessageEvent<GenerateRequest>) => {
       world.terrain.buffer,
       world.feature.buffer,
       world.fertility.buffer,
+      world.soilGain.buffer,
       world.groundwater.buffer,
       world.resourceType.buffer,
       world.resourceAmount.buffer,

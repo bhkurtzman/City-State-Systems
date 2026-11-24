@@ -99,7 +99,7 @@ export function settleHoldings(
   workshopsOpen = true,
   foundedYear = year,
   caravan: CaravanOffer | null = null,
-): { holdings: Holdings; people: People; toTreasury: number; vacated: number[] } {
+): { holdings: Holdings; people: People; toTreasury: number; vacated: number[]; shops: ReadonlyMap<number, string> } {
   void seed
   const byId = new Map(structures.map((structure) => [structure.id, structure]))
   const rows = holdings.rows
@@ -145,6 +145,7 @@ export function settleHoldings(
   const unsold = rows.filter((row) => row.owner < 0)
   let opened = holdings.opened
   let vacated: number[] = []
+  let shops: ReadonlyMap<number, string> = new Map()
   if (unsold.length > 0) {
     const quotes = new Map(unsold.map((row) => [row.structureId, quoteFor(byId.get(row.structureId) as Structure, terrain, feature, size, schedule)]))
     const owned = new Set<number>()
@@ -152,10 +153,11 @@ export function settleHoldings(
     const offered = offerByWealth(unsold, quotes, byId, people, owned, wealth, income, incomeLog, month, adultCost, workshopsOpen, year, foundedYear, rows, caravan)
     toTreasury += offered.paid
     vacated = offered.vacated
+    shops = offered.shops
     opened = true
   }
 
-  return { holdings: { opened, rows }, people: { ...openedBooks, wealth, income, incomeLog }, toTreasury, vacated }
+  return { holdings: { opened, rows }, people: { ...openedBooks, wealth, income, incomeLog }, toTreasury, vacated, shops }
 }
 
 /** Extra inspector lines for the plot on this cell. */
@@ -232,6 +234,11 @@ type CaravanOffer = {
   linked: (structure: Structure) => boolean
   /** Man-hour bill paid to the treasury when the family buys. */
   labor: (structure: Structure) => number
+  /** A specialty this purse can stock, or null when none of the ranked specialties fit. */
+  shop?: {
+    choose: (structure: Structure, purse: number) => string | null
+    commit: (specialty: string) => void
+  }
 }
 
 function offerByWealth(
@@ -250,10 +257,11 @@ function offerByWealth(
   foundedYear: number,
   rows: Holding[],
   caravan: CaravanOffer | null,
-): { paid: number; vacated: number[] } {
+): { paid: number; vacated: number[]; shops: Map<number, string> } {
   let traders = caravanTraders(rows, byId, people)
   let seekers = propertySeekers(people, owned)
   const vacated: number[] = []
+  const shops = new Map<number, string>()
   const open = [...unsold].sort((a, b) => {
     const left = byId.get(a.structureId) as Structure
     const right = byId.get(b.structureId) as Structure
@@ -266,10 +274,24 @@ function offerByWealth(
     if (row.owner >= 0) continue
     const structure = byId.get(row.structureId) as Structure
     if (structure.kind === "workshop" && !workshopsOpen) continue
-    if (structure.kind === "shop" && !Number.isFinite(caravan?.extra(structure) ?? Number.POSITIVE_INFINITY)) continue
     if (structure.kind === "caravan-house" && !caravan?.linked(structure)) continue
     const quote = quotes.get(row.structureId) as Quote
-    const builds = structure.kind === "caravan-house" || structure.kind === "workshop" || structure.kind === "shop"
+    if (structure.kind === "shop") {
+      const chosen = settleShop(structure, quote, seekers, wealth, adultCost, caravan)
+      if (!chosen) continue
+      paid += assign(row, structure, quote, chosen.id, wealth, income, incomeLog, month)
+      const labor = caravan?.labor(structure) ?? 0
+      if (labor > 0 && chosen.id < wealth.length) {
+        wealth[chosen.id] -= labor
+        noteOperatingIncome(income, incomeLog, chosen.id, -labor, month)
+        paid += labor
+      }
+      caravan?.shop?.commit(chosen.specialty)
+      shops.set(structure.id, chosen.specialty)
+      seekers = seekers.filter((id) => id !== chosen.id)
+      continue
+    }
+    const builds = structure.kind === "caravan-house" || structure.kind === "workshop"
     const extra = builds ? caravan?.extra(structure) ?? (structure.kind === "caravan-house" ? Number.POSITIVE_INFINITY : 0) : 0
     const pool = structure.kind === "caravan-house" ? [...new Set([...traders, ...seekers])] : seekers
     const choices = pool
@@ -278,7 +300,7 @@ function offerByWealth(
     const pick = choices[0]
     if (pick === undefined) continue
     paid += assign(row, structure, quote, pick, wealth, income, incomeLog, month)
-    if ((structure.kind === "caravan-house" || structure.kind === "workshop" || structure.kind === "shop") && caravan) {
+    if ((structure.kind === "caravan-house" || structure.kind === "workshop") && caravan) {
       const labor = caravan.labor(structure)
       if (labor > 0 && pick < wealth.length) {
         wealth[pick] -= labor
@@ -290,7 +312,30 @@ function offerByWealth(
     seekers = seekers.filter((id) => id !== pick)
     traders = traders.filter((id) => id !== pick)
   }
-  return { paid, vacated }
+  return { paid, vacated, shops }
+}
+
+/** The wealthiest seeker who can stock a ranked specialty. The purse is what remains after the land, the build, and a year of keep. */
+function settleShop(
+  structure: Structure,
+  quote: Quote,
+  seekers: readonly number[],
+  wealth: Int32Array,
+  adultCost: number,
+  caravan: CaravanOffer | null,
+): { id: number; specialty: string } | null {
+  if (!caravan?.shop) return null
+  const build = caravan.extra(structure)
+  if (!Number.isFinite(build)) return null
+  const keep = Math.max(0, Math.floor(adultCost))
+  const ordered = [...seekers].sort((a, b) => (wealth[b] ?? 0) - (wealth[a] ?? 0) || a - b)
+  for (const id of ordered) {
+    const purse = (wealth[id] ?? 0) - quote.due - build - keep
+    const specialty = caravan.shop.choose(structure, purse)
+    if (!specialty) continue
+    return { id, specialty }
+  }
+  return null
 }
 
 /** Heads who already run a trading post. They are offered a caravan house ahead of everyone else. */

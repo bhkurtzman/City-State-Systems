@@ -315,7 +315,10 @@ function improvesSoil(layout: Layout, uses: readonly Crop[]): boolean {
  * woodland first at one point and forest at two. One wetland tile is drained every year.
  * A farmstead's April fish haul stops at 15 tons. Salt is taken in that same month.
  */
-type Land = { feature: Uint8Array; fertility: Uint8Array; changed: boolean }
+type Land = { feature: Uint8Array; fertility: Uint8Array; soilGain: Uint8Array; changed: boolean }
+
+/** Points one tile can gain from farming. Fertility itself still stops at 100. */
+const SOIL_GAIN_CAP = 10
 
 /** A trading post left empty by a move into a caravan house. Its barn is added to that house. */
 function carriedPantry(
@@ -348,6 +351,7 @@ export function workFarms(
   terrain: Uint8Array,
   featureIn: Uint8Array,
   fertilityIn: Uint8Array,
+  soilGainIn: Uint8Array,
   preset: PresetId,
   month: number,
   year: number,
@@ -357,18 +361,20 @@ export function workFarms(
   openingRanks: readonly ShopSpecialty[] = [],
   wealth: Int32Array | null = null,
   buildReserve: (structureId: number) => number = () => 0,
-): { farms: Farms; feature: Uint8Array; fertility: Uint8Array; changedLand: boolean } {
+  shopRetail: ReadonlyMap<number, string> = new Map(),
+): { farms: Farms; feature: Uint8Array; fertility: Uint8Array; soilGain: Uint8Array; changedLand: boolean } {
   const ownerOf = new Map(owners.map((row) => [row.structureId, row.owner]))
   const standing = structures.filter((structure) => {
     if (structure.removing) return false
     if (structure.pending) return structure.kind === "caravan-house" && (ownerOf.get(structure.id) ?? -1) >= 0
     return structure.kind === "farmstead" || structure.kind === "shack" || structure.kind === "construction-office" || isBusiness(structure.kind)
   })
-  const land: Land = { feature: featureIn, fertility: fertilityIn, changed: false }
+  const land: Land = { feature: featureIn, fertility: fertilityIn, soilGain: soilGainIn, changed: false }
   const writeLand = () => {
     if (land.changed) return
     land.feature = new Uint8Array(featureIn)
     land.fertility = new Uint8Array(fertilityIn)
+    land.soilGain = new Uint8Array(soilGainIn)
     land.changed = true
   }
 
@@ -399,6 +405,10 @@ export function workFarms(
       const affordable = openingRanks.filter((specialty) => canFoundShop(specialty, cash))
       record.specialty = pickShopSpecialty(affordable, structure.id, seed, year, month) ?? undefined
     }
+    if (structure.kind === "shop" && !record.retail) {
+      const chosen = shopRetail.get(structure.id)
+      if (chosen === "baker" || chosen === "grocer" || chosen === "butcher" || chosen === "hardware" || chosen === "draper") record.retail = chosen
+    }
     if (structure.kind !== "farmstead") {
       record.owner = owner
       const brought = carried.get(structure.id)
@@ -410,7 +420,7 @@ export function workFarms(
     const harvest = monthWork(structure, record, terrain, land, preset, month, year, seed, writeLand, aridity)
     rows.push(harvest.record)
   }
-  return { farms: { rows }, feature: land.feature, fertility: land.fertility, changedLand: land.changed }
+  return { farms: { rows }, feature: land.feature, fertility: land.fertility, soilGain: land.soilGain, changedLand: land.changed }
 }
 
 function rollRecord(
@@ -544,7 +554,9 @@ function monthWork(
   if (month === 0 && improvesSoil(next.layout, next.uses)) {
     writeLand()
     for (const tile of tilesWhere(structure.tiles, feature(), Feature.Prairie)) {
-      if (land.fertility[tile] < 80) land.fertility[tile] += 1
+      if (land.soilGain[tile] >= SOIL_GAIN_CAP || land.fertility[tile] >= 100) continue
+      land.fertility[tile] += 1
+      land.soilGain[tile] += 1
     }
   }
 

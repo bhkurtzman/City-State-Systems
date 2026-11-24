@@ -1627,6 +1627,7 @@ export function generateDetailed(
   onProgress?.(0.82, "Measuring soil and water")
   const distance = edt(fresh, width, height)
   const fertility = new Uint8Array(n)
+  const soilGain = new Uint8Array(n)
   const groundwater = new Uint8Array(n)
   const rainPart = clamp(indices.annualPrecip / 1500, 0, 1)
   const aridPart = clamp(indices.aridity / 1.5, 0, 1)
@@ -1686,6 +1687,7 @@ export function generateDetailed(
     terrain,
     feature,
     fertility,
+    soilGain,
     groundwater,
     resourceType: resources.type,
     resourceAmount: resources.amount,

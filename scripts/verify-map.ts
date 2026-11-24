@@ -32,6 +32,7 @@ function sameWorld(a: World, b: World): boolean {
     sameBytes(a.terrain, b.terrain) &&
     sameBytes(a.feature, b.feature) &&
     sameBytes(a.fertility, b.fertility) &&
+    sameBytes(a.soilGain, b.soilGain) &&
     sameBytes(a.groundwater, b.groundwater) &&
     sameBytes(a.resourceType, b.resourceType) &&
     sameBytes(a.resourceAmount, b.resourceAmount)

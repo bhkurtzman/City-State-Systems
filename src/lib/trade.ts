@@ -418,6 +418,12 @@ export type TownTrade = {
   surplus?: Partial<Record<Good, number[]>>
   /** Months a specialty had a finished firm, oldest first. Each figure is that month's average household profit. A year is the last twelve. */
   craftProfit?: Partial<Record<ShopSpecialty, number[]>>
+  /** Months farmers had an average household profit, oldest first. A year is the last twelve. */
+  farmerProfit?: number[]
+  /** Months traders had an average household profit, oldest first. A year is the last twelve. */
+  traderProfit?: number[]
+  /** Tons bid for import last month, including tons the wagon could not take. */
+  importBids?: Partial<Record<Good, number>>
 }
 
 export function emptyTown(): TownTrade {
@@ -528,7 +534,11 @@ function openInbound(posts: readonly Holding[], shipping: ReadonlyMap<number, Sh
   inboundRoom = new Map(posts.map((post) => [post.structureId, (shipping.get(post.structureId)?.in ?? 1) * TON]))
   exportedGoods = exported
   monthShipments = shipments
+  monthImportBids = new Map()
 }
+
+/** Tons offered to the inbound wagon this month, including tons that did not fit. */
+let monthImportBids = new Map<Good, number>()
 
 function closeInbound() {
   importSlots = []
@@ -536,6 +546,18 @@ function closeInbound() {
   importAllowance = new Map()
   exportedGoods = new Set()
   monthShipments = []
+  monthImportBids = new Map()
+}
+
+function noteImportBid(good: Good, tons: number) {
+  if (tons <= 0) return
+  monthImportBids.set(good, (monthImportBids.get(good) ?? 0) + tons)
+}
+
+function importBidRecord(): Partial<Record<Good, number>> {
+  const bids: Partial<Record<Good, number>> = {}
+  for (const [good, tons] of monthImportBids) if (tons > 0) bids[good] = tons
+  return bids
 }
 
 /** A trading post is open to every buyer. A caravan house uses the workshop link. */
@@ -846,6 +868,9 @@ export function townPriceRows(
       structures,
       terrain,
       feature,
+      month,
+      importBids: town.importBids ?? {},
+      caravanStaff: new Map(shipHouses.map((house) => [house.structureId, house.staff])),
     })
   }
   const selling = marketSale(farms, marketIds)
@@ -1078,7 +1103,7 @@ export function tradeMonth(
     for (const [owner, count] of fires) woodKeep.set(owner, Math.round(count * woodYear * TON))
   }
   dryFruit(nextFarms, structures, owned, targets, high, precip)
-  const coalOwners = makeCoal(nextFarms, structures, owned, feature, month, woodKeep)
+  const coalOwners = makeCoal(nextFarms, structures, owned, feature, month, woodKeep, town.prices)
   makeSpices(nextFarms, structures, owned, month)
   const coalMakers = new Set<number>()
   for (const owner of coalOwners) coalMakers.add(homeHead(protein.headOf, owner))
@@ -1186,6 +1211,9 @@ export function tradeMonth(
     structures,
     terrain,
     feature,
+    month,
+    importBids: importBidRecord(),
+    caravanStaff: new Map(shipHouses.map((house) => [house.structureId, house.staff])),
   })
   runShops(structures, owned, nextFarms, stock, stockOwner, stockAsk, wealth, prices, targets, marketIds, posts, month, shopMarks, closedShops)
   restock(nextFarms, stock, stockOwner, stockAsk, wealth, town.prices, targets, marketIds, posts, protein.orders, protein.headOf)
@@ -1279,6 +1307,9 @@ export function tradeMonth(
     structures,
     terrain,
     feature,
+    month,
+    importBids: importBidRecord(),
+    caravanStaff: new Map(shipHouses.map((house) => [house.structureId, house.staff])),
   })
   for (const good of GOODS) prices[good] = glidePrice(prices[good], desired[good])
   prices.livestock = livestockPrice(prices)
@@ -1295,6 +1326,7 @@ export function tradeMonth(
   sellProtein = () => true
   clearCloset()
   clearWalkScores()
+  const bidRecord = importBidRecord()
   closeInbound()
   const posted = stockPost
   stockPost = {}
@@ -1318,7 +1350,8 @@ export function tradeMonth(
     bought: dealt.bought,
     sold: dealt.sold,
     surplus: dealt.surplus,
-    craftProfit: rollCraftProfit(town.craftProfit, { ...people, income }, structures, holdings, nextFarms),
+    ...rollSectorProfit(town, { ...people, income }, structures, holdings, nextFarms),
+    importBids: bidRecord,
   })
   return {
     people: { ...people, wealth, income, incomeLog, starving, starveDue, starveRoll },
@@ -1554,14 +1587,6 @@ function wholesaleForShelf(cap: number): number {
   return low
 }
 
-function logitShares(margins: readonly number[]): number[] {
-  if (margins.length === 0) return []
-  const peak = Math.max(...margins)
-  const weights = margins.map((margin) => Math.exp((margin - peak) / LOGIT_TAU))
-  const total = weights.reduce((sum, weight) => sum + weight, 0)
-  return weights.map((weight) => (total > 0 ? weight / total : 0))
-}
-
 /**
  * Purchase-year share of the household score. The lot bought that year spends at most this
  * fraction. Retail buyers compare it with the shelf. Beer keeps its own tenth.
@@ -1572,6 +1597,9 @@ const PURCHASE_SHARE: Partial<Record<Good, number>> = {
   clothing: 0.3,
   textiles: 0.1,
   salt: 0.05,
+  "steel-tools": 0.3,
+  "wagon-parts": 0.3,
+  barrels: 0.4,
 }
 
 /** Workshop outputs and farm crafts priced by the profit search. Extracted goods stay on the cover quote. */
@@ -1588,7 +1616,11 @@ const PROFIT_GOODS: readonly Good[] = [
   "clothing",
   "steel-parts",
   "steel-tools",
+  "steel",
+  "wagon-parts",
 ]
+/** Fungible raw materials whose quote follows last month's wagon list. */
+const RAW_TRADE: readonly Good[] = ["grain", "fiber", "coal", "salt", "lime", "wood"]
 
 /** Tons one maker can sell in a year before the releasable pile is added. */
 const YEAR_OUTPUT: Partial<Record<Good, { specialty: ShopSpecialty; tons: number }>> = {
@@ -1619,6 +1651,9 @@ type ProfitQuote = {
   structures: readonly Structure[]
   terrain: Uint8Array
   feature: Uint8Array
+  month: number
+  importBids: Partial<Record<Good, number>>
+  caravanStaff: ReadonlyMap<number, number>
 }
 
 type PayStep = { tons: number; ceiling: number }
@@ -1776,6 +1811,7 @@ function paySteps(good: Good, context: ProfitQuote): PayStep[] {
     }
     const score = income + wealth / 30
     scoreOf.set(head, score)
+    for (const id of list) scoreOf.set(id, score)
     const wear = wearChances(ages, CLOTH_CHANCE[context.rank.get(head) ?? "poor"])
     const lot = closetFloor(context.rank.get(head) ?? "poor") / TON
     if (good === "clothing") {
@@ -1789,63 +1825,41 @@ function paySteps(good: Good, context: ProfitQuote): PayStep[] {
       if (step) steps.push(step)
     }
   }
-  if (good !== "leather" && good !== "textiles") return steps
   for (const structure of context.structures) {
     if (structure.pending || structure.removing) continue
     const row = context.farms.rows.find((item) => item.structureId === structure.id)
     if (!row || row.owner < 0) continue
     const score = scoreOf.get(row.owner) ?? 0
-    if (structure.kind === "farmstead") {
-      const scale = dryFarmScale(structure, context.terrain, context.feature)
+    const scale = structure.kind === "farmstead" ? dryFarmScale(structure, context.terrain, context.feature) : 0
+    if (structure.kind === "farmstead" && (good === "leather" || good === "textiles")) {
       const tons = (good === "leather" ? FARM_LEATHER_PER_THOUSAND : FARM_TEXTILE_PER_THOUSAND) * scale
       const step = payStep(tons, score, 0.1, share, true)
+      if (step) steps.push(step)
+    }
+    if (structure.kind === "farmstead" && good === "steel-tools") {
+      const step = payStep(FARM_STEEL_PER_THOUSAND * scale, score, 0.1, share, true)
       if (step) steps.push(step)
     }
     if (good === "textiles" && row.specialty === "creamery" && !context.closedShops.has(structure.id)) {
       const step = payStep(0.005, score, 0.1, share, true)
       if (step) steps.push(step)
     }
+    if (good === "barrels" && row.specialty === "brewer" && !context.closedShops.has(structure.id)) {
+      const step = payStep(0.05, score, 1, share, false)
+      if (step) steps.push(step)
+    }
+    if (structure.kind === "trading-post" && (good === "leather" || good === "steel-tools")) {
+      const step = payStep(0.005, score, 0.1, share, true)
+      if (step) steps.push(step)
+    }
+    if (structure.kind === "caravan-house" && context.caravanStaff?.has(structure.id)) {
+      const tons = good === "leather" || good === "steel-tools" ? 0.01 : good === "wagon-parts" ? 0.1 : good === "barrels" ? 0.05 : 0
+      const lot = good === "barrels" ? 1 : 0.1
+      const step = payStep(tons, score, lot, share, good !== "barrels")
+      if (step) steps.push(step)
+    }
   }
   return steps
-}
-
-/** This good's share of the inbound tons. Rivals use last month's prices. A wider gap over the foreign price wins a larger share. */
-function importShareOf(good: Good, price: number, priorPrices: Record<Good, number>): number {
-  const foreign = WEST_EUROPE[good]
-  if (!foreign || foreign.import === false || foreign.price <= 0 || price < foreign.price + MIN_SPREAD) return 0
-  const margins = [(price - foreign.price) / foreign.price]
-  for (const other of GOODS) {
-    if (other === good) continue
-    const quote = WEST_EUROPE[other]
-    if (!quote || quote.import === false || quote.price <= 0) continue
-    const domestic = priorPrices[other] ?? 0
-    if (domestic < quote.price + MIN_SPREAD) continue
-    margins.push((domestic - quote.price) / quote.price)
-  }
-  return logitShares(margins)[0] ?? 0
-}
-
-/**
- * Foreign price plus the margin that wins enough inbound tons to cover a year of use.
- * The margin is at least $20. The result stops at the good's search cap.
- */
-function securePrice(good: Good, context: ProfitQuote): number {
-  const foreign = WEST_EUROPE[good]
-  if (!foreign || foreign.import === false) return clampPrice(foreign?.price ?? PRICE_FLOOR)
-  const ask = foreign.price + MIN_SPREAD
-  const cap = Math.max(ask, searchCap(good))
-  const need = Math.max(0, (context.use[good] ?? 0) * 12)
-  const slots = context.inSlots * 12
-  if (need <= 0 || importShareOf(good, ask, context.priorPrices) * slots >= need) return clampPrice(Math.min(cap, ask))
-  if (importShareOf(good, cap, context.priorPrices) * slots < need) return clampPrice(cap)
-  let low = ask
-  let high = cap
-  while (low < high) {
-    const mid = Math.floor((low + high) / 2)
-    if (importShareOf(good, mid, context.priorPrices) * slots >= need) high = mid
-    else low = mid + 1
-  }
-  return clampPrice(low)
 }
 
 /** Lowest quote in the search. The lower of 1.2 times the recipe and the import ask. A good that cannot be imported keeps the recipe floor. */
@@ -1859,19 +1873,19 @@ function quoteFloor(good: Good, cost: number): number {
  * Town quote for one processed good. Every dollar from the floor to the cap is in play.
  * Profit rises with the price while the tons stay put, so each plateau is scored at its top dollar:
  * a household walk-away, the dollar that still beats a rival's export spread, and the foreign price minus $20.
- * Export tons are a rank fill of last month's slots. Imports still take a logit share once the quote clears the ask.
+ * Export tons are a rank fill of last month's slots. Imports are last month's inbound slots at the price each one implies, repeated across the year.
  */
 function profitClearing(good: Good, context: ProfitQuote): number {
   const cap = searchCap(good)
   const recipe = recipeCost(good, context.priorPrices)
   const cost = clampPrice(Math.round(recipe ?? importCeiling(good) ?? PRICE_FLOOR))
   const makers = makerCount(good, context.farms, context.closedShops)
-  if (recipe === null || makers <= 0) return securePrice(good, context)
+  if (recipe === null || makers <= 0) return importCoverPrice(good, context.priorPrices[good] ?? PRICE_FLOOR, context)
   const floor = quoteFloor(good, cost)
   if (floor >= cap) return clampPrice(cap)
   const steps = paySteps(good, context)
   const stepped = steps.reduce((sum, step) => sum + step.tons, 0)
-  const block = Math.max(0, (context.use[good] ?? 0) * 12 - stepped)
+  const block = PURCHASE_SHARE[good] === undefined ? Math.max(0, (context.use[good] ?? 0) * 12 - stepped) : 0
   const leftover = exportable(context.farms, context.stock, context.targets, good, context.includePool) / TON
   const room = yearTons(good) + leftover / makers
   const supply = (context.priorRelease[good] ?? 0) + yearTons(good) * makers
@@ -1891,15 +1905,27 @@ function profitClearing(good: Good, context: ProfitQuote): number {
     }
   }
   for (const step of steps) if (step.ceiling >= floor && step.ceiling <= cap) candidates.add(step.ceiling)
-  const ask = importCeiling(good)
+  if (foreign && foreign.import !== false && context.inSlots > 0) {
+    const ask = foreign.price + MIN_SPREAD
+    if (ask >= floor && ask <= cap) candidates.add(ask)
+    for (const other of GOODS) {
+      if (other === good) continue
+      const tons = context.importBids[other] ?? 0
+      const quote = WEST_EUROPE[other]
+      if (tons <= 0 || !quote || quote.import === false) continue
+      const margin = (context.priorPrices[other] ?? 0) - quote.price
+      if (margin < MIN_SPREAD) continue
+      const ahead = foreign.price + margin + 1
+      if (ahead >= floor && ahead <= cap) candidates.add(ahead)
+    }
+  }
   let bestProfit = 0
   let best = floor
   for (const price of candidates) {
     let elastic = 0
     for (const step of steps) if (price <= step.ceiling) elastic += step.tons
     const domestic = elastic + block
-    const share = ask !== null && price > ask ? importShareOf(good, price, context.priorPrices) : 0
-    const imports = Math.min(domestic, context.inSlots * 12 * share)
+    const imports = Math.min(domestic, importSupply(good, price, context) * 12)
     const releasable = Math.max(0, supply - Math.max(0, domestic - imports))
     const exports = exportTons(good, price, context.priorPrices, context.priorRelease, context.outSlots, releasable)
     const profit = Math.min((Math.max(0, domestic - imports) + exports) / makers, room) * (price - cost)
@@ -1936,9 +1962,181 @@ function saltCeiling(people: People, headOf: Int32Array): number | null {
   return best > 0 ? best : null
 }
 
-/** Replace cover quotes for processed goods. Salt keeps the cover quote, then takes its household ceiling. */
+/** Months of stock that count as the reserve. Harvest goods use the months left; coal, salt, and wood hold a year. */
+function rawReserve(good: Good, month: number): { short: number; long: number } {
+  if (good === "coal" || good === "salt" || good === "wood") return { short: 12, long: 12 }
+  if (good === "lime") return { short: COVER_SHORT, long: COVER_LONG }
+  const season = seasonReserve(good, month)
+  return { short: season ?? COVER_SHORT, long: season ?? COVER_LONG }
+}
+
+/** Monthly tons of this good the inbound wagon would carry at this price. Other goods fill slots at last month's dollar margin. Empty room, and any slot this price outbids, is available once the price clears the foreign list by $20. */
+function importSupply(good: Good, price: number, context: ProfitQuote): number {
+  const foreign = WEST_EUROPE[good]
+  if (!foreign || foreign.import === false || context.inSlots <= 0) return 0
+  if (price < foreign.price + MIN_SPREAD) return 0
+  return importBidTons(good, price, context.inSlots, context)
+}
+
+/** Tons of the inbound wagon this price wins against last month's real bids. A wider dollar margin loads first. */
+function importBidTons(good: Good, price: number, offer: number, context: ProfitQuote): number {
+  const foreign = WEST_EUROPE[good]
+  if (!foreign || foreign.import === false || context.inSlots <= 0 || offer <= 0) return 0
+  if (price < foreign.price + MIN_SPREAD) return 0
+  const rows: { margin: number; tons: number; self: boolean }[] = [{ margin: price - foreign.price, tons: offer, self: true }]
+  for (const other of GOODS) {
+    if (other === good) continue
+    const tons = context.importBids[other] ?? 0
+    const quote = WEST_EUROPE[other]
+    if (tons <= 0 || !quote || quote.import === false) continue
+    const margin = (context.priorPrices[other] ?? 0) - quote.price
+    if (margin < MIN_SPREAD) continue
+    rows.push({ margin, tons, self: false })
+  }
+  rows.sort((a, b) => b.margin - a.margin || (a.self ? 1 : 0) - (b.self ? 1 : 0))
+  let slots = context.inSlots
+  let won = 0
+  for (const row of rows) {
+    if (slots <= 0) break
+    const take = Math.min(row.tons, slots)
+    if (row.self) won = take
+    slots -= take
+  }
+  return won
+}
+
+/**
+ * Lowest town price that wins the tons this good actually bid.
+ * No bid, or a bid list that fits on the wagon, stays at the foreign price plus $20.
+ */
+function importCoverPrice(good: Good, posted: number, context: ProfitQuote): number {
+  const foreign = WEST_EUROPE[good]
+  if (!foreign || foreign.import === false) return posted
+  const offer = context.importBids[good] ?? 0
+  if (offer <= 0 || context.inSlots <= 0) return foreign.price + MIN_SPREAD
+  let total = 0
+  for (const item of GOODS) total += context.importBids[item] ?? 0
+  if (total <= context.inSlots) return foreign.price + MIN_SPREAD
+  const want = Math.min(offer, context.inSlots)
+  const candidates = [foreign.price + MIN_SPREAD]
+  for (const other of GOODS) {
+    if (other === good) continue
+    const tons = context.importBids[other] ?? 0
+    const quote = WEST_EUROPE[other]
+    if (tons <= 0 || !quote || quote.import === false) continue
+    const margin = (context.priorPrices[other] ?? 0) - quote.price
+    if (margin < MIN_SPREAD) continue
+    candidates.push(foreign.price + margin + 1)
+  }
+  let qualified: number | null = null
+  let most = 0
+  let mostPrice = foreign.price + MIN_SPREAD
+  for (const price of candidates) {
+    if (price < PRICE_FLOOR || price > PRICE_CEILING) continue
+    const won = importBidTons(good, price, want, context)
+    if (won + 1e-9 >= want && (qualified === null || price < qualified)) qualified = price
+    if (won > most + 1e-9 || (Math.abs(won - most) <= 1e-9 && price < mostPrice)) {
+      most = won
+      mostPrice = price
+    }
+  }
+  if (qualified !== null) return Math.round(qualified)
+  if (most > 0) return Math.round(mostPrice)
+  return foreign.price + MIN_SPREAD
+}
+
+/** Tons of the monthly export wagon this price wins against last month's list. A wider dollar spread loads first. */
+function exportCoverTons(good: Good, price: number, offer: number, context: ProfitQuote): number {
+  const foreign = WEST_EUROPE[good]
+  if (!foreign?.export || context.outSlots <= 0 || offer <= 0) return 0
+  if (foreign.price - price < MIN_SPREAD) return 0
+  const rows: { spread: number; tons: number; self: boolean }[] = [{ spread: foreign.price - price, tons: offer, self: true }]
+  for (const other of GOODS) {
+    if (other === good) continue
+    const quote = WEST_EUROPE[other]
+    const release = context.priorRelease[other] ?? 0
+    if (!quote?.export || release <= 0) continue
+    const spread = quote.price - (context.priorPrices[other] ?? 0)
+    if (spread < MIN_SPREAD) continue
+    rows.push({ spread, tons: release, self: false })
+  }
+  rows.sort((a, b) => b.spread - a.spread || (a.self ? 1 : 0) - (b.self ? 1 : 0))
+  let slots = context.outSlots
+  let won = 0
+  for (const row of rows) {
+    if (slots <= 0) break
+    const take = Math.min(row.tons, slots)
+    if (row.self) won = take
+    slots -= take
+  }
+  return won
+}
+
+/** A spare pile with no wagon pulls the posted price toward $1 by spare / (reserve + spare). A small spare barely moves it. */
+function surplusFloor(posted: number, reserveTons: number, spare: number): number {
+  const reserve = Math.max(0, reserveTons)
+  const extra = Math.max(0, spare)
+  if (extra <= 0) return Math.max(PRICE_FLOOR, Math.round(posted))
+  return Math.max(PRICE_FLOOR, Math.round((posted * reserve) / (reserve + extra)))
+}
+
+/**
+ * Highest town price that still places this month's share of the surplus.
+ * Open capacity stays at the foreign price minus $20. The quote steps down only while the tons are still short.
+ * A pile that cannot win a ton at any price eases toward $1 with the size of the spare.
+ */
+function exportCoverPrice(good: Good, surplus: number, months: number, posted: number, reserveTons: number, context: ProfitQuote): number {
+  const foreign = WEST_EUROPE[good]
+  if (surplus <= 0 || months <= 0) return Math.max(PRICE_FLOOR, Math.round(posted))
+  if (!foreign?.export || context.outSlots <= 0 || foreign.price - MIN_SPREAD < PRICE_FLOOR) return surplusFloor(posted, reserveTons, surplus)
+  const want = Math.min(surplus / months, context.outSlots)
+  if (want <= 0) return posted
+  const candidates = [foreign.price - MIN_SPREAD, PRICE_FLOOR]
+  for (const other of GOODS) {
+    if (other === good) continue
+    const quote = WEST_EUROPE[other]
+    const release = context.priorRelease[other] ?? 0
+    if (!quote?.export || release <= 0) continue
+    const spread = quote.price - (context.priorPrices[other] ?? 0)
+    if (spread < MIN_SPREAD) continue
+    candidates.push(foreign.price - (spread + 1))
+  }
+  let qualified: number | null = null
+  let most = 0
+  let mostPrice = posted
+  for (const price of candidates) {
+    if (price < PRICE_FLOOR || price > PRICE_CEILING) continue
+    const won = exportCoverTons(good, price, want, context)
+    if (won + 1e-9 >= want && (qualified === null || price > qualified)) qualified = price
+    if (won > most + 1e-9 || (Math.abs(won - most) <= 1e-9 && price > mostPrice)) {
+      most = won
+      mostPrice = price
+    }
+  }
+  if (qualified !== null) return Math.round(qualified)
+  if (most > 0) return Math.round(mostPrice)
+  return surplusFloor(posted, reserveTons, surplus)
+}
+
+/** Above the reserve, export the surplus over the months it covers. Below it, the quote follows last month's import bids. On the reserve, the posted price holds. */
+function rawTradePrice(good: Good, posted: number, stockTons: number, monthly: number, context: ProfitQuote): number {
+  const fuel = good === "wood" || good === "coal"
+  const use = monthly > 0 ? monthly : fuel ? 0 : ASSUMED_MONTHLY_USE
+  const band = rawReserve(good, context.month)
+  const reserveTons = band.long * use
+  if (use > 0 && stockTons < band.short * use) return importCoverPrice(good, posted, context)
+  if (stockTons > reserveTons) return exportCoverPrice(good, stockTons - reserveTons, band.long, posted, reserveTons, context)
+  return posted
+}
+
+/** Processed goods use the profit search. Raw materials follow the wagon list, and salt still takes its household ceiling. */
 function applyProfitQuotes(quote: Record<Good, number>, context: ProfitQuote) {
   for (const good of PROFIT_GOODS) quote[good] = profitClearing(good, context)
+  const sale = forSaleStock(context.farms, context.stock, context.targets)
+  for (const good of RAW_TRADE) {
+    const posted = context.priorPrices[good] ?? quote[good] ?? PRICE_FLOOR
+    quote[good] = rawTradePrice(good, posted, (sale[good] ?? 0) / TON, context.use[good] ?? 0, context)
+  }
   const salt = saltCeiling(context.people, context.headOf)
   if (salt !== null) quote.salt = Math.min(quote.salt ?? PRICE_FLOOR, salt)
 }
@@ -2056,13 +2254,13 @@ function rankedExports(
   return ranked
 }
 
-/** Share of the wagon. The margin is the gap as a fraction of the foreign price, and τ is a tenth. */
+/** Share of the wagon. The margin is the dollar gap under the foreign price, and τ is a tenth. */
 function logitExport(goods: readonly Good[], prices: Record<Good, number>, rng: () => number): Good {
   if (goods.length === 1) return goods[0]
   const scores = goods.map((good) => {
     const foreign = WEST_EUROPE[good]?.price ?? 0
     if (foreign <= 0) return 0
-    return (foreign - (prices[good] ?? 0)) / foreign
+    return foreign - (prices[good] ?? 0)
   })
   const peak = Math.max(...scores)
   const weights = scores.map((score) => Math.exp((score - peak) / LOGIT_TAU))
@@ -2161,6 +2359,7 @@ function loadImportWagons(
   month: number,
 ) {
   const bids = gatherImportBids(farms, prices, targets, buildNeeds)
+  for (const bid of bids) noteImportBid(bid.good, Math.floor(bid.hundredths / TON))
   for (const post of posts) {
     let room = shipping.get(post.structureId)?.in ?? 1
     const reachable = () => bids.filter((bid) => bid.hundredths >= TON && traderOpen(bid.buyer, post.structureId))
@@ -4770,32 +4969,42 @@ function craftPresence(
   return found
 }
 
-/** Append this month's average profit for every specialty that has a firm. A missing average is not a month. */
-function rollCraftProfit(
-  prior: TownTrade["craftProfit"],
+/** Keep a missing month out of the series. A year is the last twelve readings. */
+function rollProfitYear(history: readonly number[] | undefined, value: number | null | undefined): number[] | undefined {
+  if (value === null || value === undefined) return history && history.length > 0 ? [...history] : undefined
+  return [...(history ?? []), value].slice(-12)
+}
+
+/** Append this month's average profit for farmers, traders, and every specialty that has a firm. A missing average is not a month. */
+function rollSectorProfit(
+  town: TownTrade,
   people: People,
   structures: readonly Structure[],
   holdings: Holdings,
   farms: Farms,
-): Partial<Record<ShopSpecialty, number[]>> {
+): { craftProfit: Partial<Record<ShopSpecialty, number[]>>; farmerProfit?: number[]; traderProfit?: number[] } {
   const presence = craftPresence(structures, holdings, farms)
   const owners = new Map<string, ReadonlySet<number>>(CRAFT_ORDER.map((specialty) => [specialty, presence.get(specialty)?.owners ?? new Set()]))
   const incomes = sectorIncomes(people, householdHomes(structures, holdings.rows), owners)
-  const next: Partial<Record<ShopSpecialty, number[]>> = {}
+  const craftProfit: Partial<Record<ShopSpecialty, number[]>> = {}
   for (const specialty of CRAFT_ORDER) {
-    const history = prior?.[specialty] ?? []
+    const history = town.craftProfit?.[specialty] ?? []
     const bag = presence.get(specialty)
     const profit = incomes.craft.get(specialty)
     if (!bag || bag.firms === 0 || profit === null || profit === undefined) {
-      if (history.length > 0) next[specialty] = history
+      if (history.length > 0) craftProfit[specialty] = history
       continue
     }
-    next[specialty] = [...history, profit].slice(-12)
+    craftProfit[specialty] = [...history, profit].slice(-12)
   }
-  return next
+  return {
+    craftProfit,
+    farmerProfit: rollProfitYear(town.farmerProfit, incomes.farmer),
+    traderProfit: rollProfitYear(town.traderProfit, incomes.trader),
+  }
 }
 
-/** Highest profit first. A specialty with no firm scores three times the cost of living, and equal scores are shuffled. */
+/** Missing specialties first, shuffled. Once every specialty has a firm, highest twelve-month profit first. */
 function rankCrafts(
   town: TownTrade,
   presence: Map<ShopSpecialty, { firms: number; owners: Set<number> }>,
@@ -4804,29 +5013,29 @@ function rankCrafts(
   year: number,
   month: number,
 ): ShopSpecialty[] {
+  const rng = mulberry32(hashSeed(`${seed}:craft:${year}:${month}`))
+  const missing = CRAFT_ORDER.filter((specialty) => (presence.get(specialty)?.firms ?? 0) === 0)
+  if (missing.length > 0) {
+    const noise = new Map(missing.map((specialty) => [specialty, rng()]))
+    return [...missing].sort((a, b) => (noise.get(a) ?? 0) - (noise.get(b) ?? 0))
+  }
   const scored: { specialty: ShopSpecialty; profit: number }[] = []
   for (const specialty of CRAFT_ORDER) {
-    const firms = presence.get(specialty)?.firms ?? 0
     const history = town.craftProfit?.[specialty] ?? []
-    if (firms === 0) {
-      scored.push({ specialty, profit: living * 3 })
-      continue
-    }
     if (history.length < 12) continue
     const profit = history.reduce((sum, value) => sum + value, 0) / history.length
     if (profit < living * 2) continue
     scored.push({ specialty, profit })
   }
-  const rng = mulberry32(hashSeed(`${seed}:craft:${year}:${month}`))
   const noise = new Map(scored.map((item) => [item.specialty, rng()]))
   scored.sort((a, b) => b.profit - a.profit || (noise.get(a.specialty) ?? 0) - (noise.get(b.specialty) ?? 0))
   return scored.map((item) => item.specialty)
 }
 
 /**
- * Specialties a new workshop may draw, highest profit first. A specialty with a firm waits
- * for twelve months of household profit, then drops below twice the cost of living. A specialty
- * with no firm scores three times that cost. An occupied workshop keeps the specialty it already has.
+ * Specialties a new workshop may draw. Any specialty with no firm is drawn before the others.
+ * Once one firm of each exists, a specialty waits for twelve months of household profit and
+ * drops below twice the cost of living. An occupied workshop keeps the specialty it already has.
  */
 export function workshopOpening(
   town: TownTrade,
@@ -4879,7 +5088,7 @@ function optionsFor(specialty: ShopSpecialty, month: number, producing: boolean)
   return [FISH_BATCH, MEAT_BATCH]
 }
 
-/** January. A wooded farm turns 50 tons of spare wood into 10 tons of coal, once. Heating wood is left in the barn. */
+/** January. A wooded farm turns 50 tons of spare wood into 10 tons of coal, once, when coal pays four times wood or the wood barn is full. Heating wood is left in the barn. */
 function makeCoal(
   farms: Farms,
   structures: readonly Structure[],
@@ -4887,15 +5096,19 @@ function makeCoal(
   feature: Uint8Array,
   month: number,
   woodKeep: Map<number, number>,
+  prices: Record<Good, number>,
 ): Set<number> {
   const made = new Set<number>()
   if (month !== 0) return made
   const woodIn = 50 * TON
+  const coalPays = (prices.coal ?? PRICE_FLOOR) >= (prices.wood ?? PRICE_FLOOR) * 4
   for (const structure of [...structures].sort((a, b) => a.id - b.id)) {
     if (structure.kind !== "farmstead" || structure.pending || structure.removing || structure.tiles.length === 0) continue
     const holding = owned.get(structure.id)
     const row = farms.rows.find((item) => item.structureId === structure.id)
     if (!holding || !row) continue
+    const woodFull = (row.store.wood ?? 0) >= (FARM_STORE_CAP.wood ?? Number.POSITIVE_INFINITY)
+    if (!coalPays && !woodFull) continue
     let woods = 0
     for (const tile of structure.tiles) {
       const kind = feature[tile]
@@ -5200,6 +5413,7 @@ function importForBatch(
   const slot = importSlots.find((item) => (inboundRoom.get(item.structureId) ?? 0) >= qty && traderOpen(buyer, item.structureId))
   if (!slot) return 0
   payImport(wealth, buyer, { structureId: slot.structureId, owner: slot.owner, price: ask.price, room: qty, fee: ask.fee }, good, qty)
+  noteImportBid(good, qty / TON)
   noteLedger(good, qty, bill, "bought")
   const keep = qty - left
   if (keep > 0) {

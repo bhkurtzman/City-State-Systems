@@ -108,6 +108,8 @@ export type World = {
   terrain: Uint8Array
   feature: Uint8Array
   fertility: Uint8Array
+  /** Points a farm has already added to this tile. Stops at 10. */
+  soilGain: Uint8Array
   groundwater: Uint8Array
   resourceType: Uint8Array
   resourceAmount: Uint8Array
