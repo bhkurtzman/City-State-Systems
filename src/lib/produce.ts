@@ -144,6 +144,12 @@ export type FarmRecord = {
   shelfReady?: Partial<Record<Good, true>>
   /** This month's harvest that did not fit. The household can eat it without lowering the pile. */
   surplus?: Partial<Record<Good, number>>
+  /** Dollars per ton this workshop posts for each output. */
+  ask?: Partial<Record<Good, number>>
+  /** Month the workshop took its specialty. Its prices are set again that month. */
+  openMonth?: number
+  /** Calendar year those prices were last set. */
+  askYear?: number
 }
 
 export type Farms = { rows: FarmRecord[] }
@@ -384,7 +390,13 @@ export function workFarms(
     const owner = ownerOf.get(structure.id) ?? -1
     const previous = farms.rows.find((row) => row.structureId === structure.id)
     let record: FarmRecord | null = previous
-      ? { ...previous, uses: [...previous.uses], store: { ...emptyStore(), ...previous.store }, trade: previous.trade ? { ...previous.trade } : undefined }
+      ? {
+          ...previous,
+          uses: [...previous.uses],
+          store: { ...emptyStore(), ...previous.store },
+          trade: previous.trade ? { ...previous.trade } : undefined,
+          ask: previous.ask ? { ...previous.ask } : undefined,
+        }
       : null
     if (record) {
       for (const good of GOODS) if (!Number.isFinite(record.store[good])) record.store[good] = 0
@@ -398,12 +410,16 @@ export function workFarms(
       continue
     }
     if (!record) record = structure.kind === "farmstead" ? rollRecord(structure, land, preset, owner, seed, year, month) : stockRecord(structure, owner, seed)
-    if (structure.kind === "sawpit" && !record.specialty) record.specialty = "sawmill"
+    if (structure.kind === "sawpit" && !record.specialty) {
+      record.specialty = "sawmill"
+      record.openMonth = month
+    }
     if (structure.kind === "workshop" && !record.specialty) {
       const purse = wealth && owner >= 0 && owner < wealth.length ? wealth[owner] ?? 0 : 0
       const cash = purse - Math.max(0, buildReserve(structure.id))
       const affordable = openingRanks.filter((specialty) => canFoundShop(specialty, cash))
       record.specialty = pickShopSpecialty(affordable, structure.id, seed, year, month) ?? undefined
+      if (record.specialty) record.openMonth = month
     }
     if (structure.kind === "shop" && !record.retail) {
       const chosen = shopRetail.get(structure.id)
@@ -742,6 +758,15 @@ export function productionLines(
   if (!record || record.owner < 0) return []
   const lines: PropertyLine[] = []
   if (record.specialty) lines.push({ label: "Specialty", value: SHOP_LABEL[record.specialty] })
+  if (record.ask) {
+    const posted: string[] = []
+    for (const good of GOODS) {
+      const price = record.ask[good]
+      if (price == null) continue
+      posted.push(`${GOOD_LABEL[good]} $${price.toLocaleString("en-US")}`)
+    }
+    if (posted.length > 0) lines.push({ label: "Ask", value: posted.join(", ") })
+  }
   if (structure.kind === "farmstead") {
     lines.push({ label: "Prairie tiles", value: `${record.prairie ?? 0}` })
     lines.push({

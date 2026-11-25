@@ -20,6 +20,15 @@ export type DemandSector = {
   saturation: string | null
 }
 
+export type DemandGroup = {
+  name: string
+  profit: string
+  /** Twelve-month average, or null when the menu shows a dash. */
+  amount: number | null
+  firms: string
+  rows: DemandSector[]
+}
+
 const BLANK = "—"
 
 const TITLES: Record<LedgerId, string> = {
@@ -97,7 +106,7 @@ export function LedgerPanel({
   structures: readonly Structure[]
   wellbeing: { households: number; adults: number; children: number } | null
   lastStarvationDeaths: number | null
-  demand: DemandSector[]
+  demand: DemandGroup[]
   onClose: () => void
 }) {
   const rows =
@@ -117,7 +126,7 @@ export function LedgerPanel({
     return <EconomyPanel rows={rows} prices={prices} classes={classes} onClose={onClose} />
   }
   if (kind === "demand") {
-    return <DemandPanel sectors={demand} onClose={onClose} />
+    return <DemandPanel groups={demand} onClose={onClose} />
   }
   if (kind === "population") {
     return (
@@ -432,7 +441,15 @@ function treasuryRows(cash: string, ongoingExpenses: number | null, capitalExpen
   ]
 }
 
-function DemandPanel({ sectors, onClose }: { sectors: DemandSector[]; onClose: () => void }) {
+function demandStatRows(profit: string, firms: string, saturation: string | null = null): Row[] {
+  return [
+    { label: "Avg. Profit", value: profit },
+    { label: "No. Firms", value: firms },
+    ...(saturation === null ? [] : [{ label: "Market Saturation", value: saturation }]),
+  ]
+}
+
+function DemandPanel({ groups, onClose }: { groups: DemandGroup[]; onClose: () => void }) {
   const [tab, setTab] = useState("overview")
   return (
     <Card className="w-full shadow-md">
@@ -455,20 +472,28 @@ function DemandPanel({ sectors, onClose }: { sectors: DemandSector[]; onClose: (
             <TabsTrigger value="overview" className="px-1.5 text-xs">Overview</TabsTrigger>
             <TabsTrigger value="sectors" className="px-1.5 text-xs">Sectors</TabsTrigger>
           </TabsList>
-          <TabsContent value="overview" />
-          <TabsContent value="sectors">
-            {sectors.map((sector) => (
-              <section key={sector.name} className="mt-4 first:mt-0">
-                <h3 className="text-sm font-medium">{sector.name}</h3>
+          <TabsContent value="overview">
+            {groups.map((group) => (
+              <section key={group.name} className="mt-4 rounded-md border p-3 first:mt-0">
+                <h3 className="text-sm font-medium">{group.name}</h3>
                 <div className="mt-2">
-                  <RowList
-                    rows={[
-                      { label: "Avg. Profit", value: sector.profit },
-                      { label: "No. Firms", value: sector.firms },
-                      ...(sector.saturation === null ? [] : [{ label: "Market Saturation", value: sector.saturation }]),
-                    ]}
-                  />
+                  <RowList rows={demandStatRows(group.profit, group.firms)} />
                 </div>
+              </section>
+            ))}
+          </TabsContent>
+          <TabsContent value="sectors">
+            {groups.map((group) => (
+              <section key={group.name} className="mt-4 rounded-md border p-3 first:mt-0">
+                <h3 className="text-sm font-medium">{group.name}</h3>
+                {group.rows.map((sector) => (
+                  <div key={sector.name} className="mt-4">
+                    <h4 className="text-sm font-medium">{sector.name}</h4>
+                    <div className="mt-2">
+                      <RowList rows={demandStatRows(sector.profit, sector.firms, sector.saturation)} />
+                    </div>
+                  </div>
+                ))}
               </section>
             ))}
           </TabsContent>

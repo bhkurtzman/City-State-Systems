@@ -681,7 +681,7 @@ type HouseholdRoll = {
   size: number
 }
 
-/** Average household income for farmers, traders, and workshop owners. A workshop is counted by the specialty it owns, not by the craftsman job. */
+/** Average household income for farmers, traders, and owners of a workshop or shop specialty. A firm is counted by the specialty it owns, not by the craftsman or shopkeeper job. */
 export function sectorIncomes(
   people: People,
   homes: readonly HouseholdHome[],
@@ -1490,9 +1490,9 @@ function handToSon(state: KinState, holder: number, son: number, split: boolean)
     estate += takePurse(state, wife)
     from.push(wife)
   }
-  movePlots(state, from, son, "keep")
+  receivePlots(state, from, son, "keep")
   if (split) splitFatherPurse(state, holder, son, estate)
-  else if (estate > 0) state.wealth[son] += estate
+  else creditHeir(state, son, estate)
   retireWith(state, holder, son)
   if (wife >= 0) retireWith(state, wife, son)
 }
@@ -1502,7 +1502,7 @@ function settleDead(state: KinState, dead: number, seen: Set<number>) {
   if (state.retired[dead] !== 0) {
     const heir = livingId(state, state.livesWith[dead]) ? state.livesWith[dead] : -1
     givePurse(state, dead, heir)
-    movePlots(state, [dead], heir, "keep")
+    receivePlots(state, [dead], heir, "keep")
     return
   }
   const mate = state.spouse[dead]
@@ -1511,7 +1511,7 @@ function settleDead(state: KinState, dead: number, seen: Set<number>) {
   const adultSon = eldestAdultSon(kids, state)
   if (mateAlive && !(state.sex[dead] === Sex.Male && adultSon >= 0)) {
     givePurse(state, dead, mate)
-    movePlots(state, [dead], mate, "keep")
+    receivePlots(state, [dead], mate, "keep")
     return
   }
   if (adultSon >= 0) {
@@ -1523,9 +1523,9 @@ function settleDead(state: KinState, dead: number, seen: Set<number>) {
       if (mateAlive) retireWith(state, mate, adultSon)
       else seen.add(mate)
     }
-    movePlots(state, from, adultSon, "keep")
+    receivePlots(state, from, adultSon, "keep")
     if (state.sex[dead] === Sex.Male) splitFatherPurse(state, dead, adultSon, estate)
-    else state.wealth[adultSon] += estate
+    else creditHeir(state, adultSon, estate)
     return
   }
   const minors = kids.filter((id) => state.age[id] < ADOPT_AGE)
@@ -1536,7 +1536,7 @@ function settleDead(state: KinState, dead: number, seen: Set<number>) {
   const waitingSon = eldestSon(sons, state)
   if (waitingSon >= 0) {
     givePurse(state, dead, waitingSon)
-    movePlots(state, [dead], waitingSon, "keep")
+    receivePlots(state, [dead], waitingSon, "keep")
     for (const child of minors) if (child !== waitingSon) state.livesWith[child] = waitingSon
     return
   }
@@ -1555,9 +1555,9 @@ function settleDead(state: KinState, dead: number, seen: Set<number>) {
     return
   }
   const oldest = oldestHeir(siblings, state.age)
-  movePlots(state, [dead], siblingPlotHeir(state, oldest), "keep")
+  receivePlots(state, [dead], siblingPlotHeir(state, oldest), "keep")
   const estate = takePurse(state, dead)
-  divideEstate(estate, siblings, true, state.sex, state.age, state.spouse, state.alive, state.wealth, state.mother, state.father)
+  divideEstate(state, estate, siblings, true)
 }
 
 function adoptMinors(state: KinState, dead: number, minors: readonly number[], seen: Set<number>): boolean {
@@ -1574,8 +1574,8 @@ function adoptMinors(state: KinState, dead: number, minors: readonly number[], s
     seen.add(other)
   }
   for (const child of minors) state.livesWith[child] = adopter
-  movePlots(state, from, adopter, "spill")
-  state.wealth[adopter] += estate
+  receivePlots(state, from, adopter, "spill")
+  creditHeir(state, adopter, estate)
   return true
 }
 
@@ -1597,7 +1597,7 @@ function splitFatherPurse(state: KinState, fatherId: number, son: number, estate
   if (estate <= 0) return
   const half = Math.floor(estate / 2)
   const rest = estate - half
-  state.wealth[son] += half
+  creditHeir(state, son, half)
   const younger = childrenOf(state, fatherId).filter((id) => id !== son && state.sex[id] === Sex.Male)
   if (younger.length > 0) {
     divideAmong(state, rest, younger)
@@ -1605,16 +1605,16 @@ function splitFatherPurse(state: KinState, fatherId: number, son: number, estate
   }
   const daughters = childrenOf(state, fatherId).filter((id) => state.sex[id] === Sex.Female)
   if (daughters.length > 0) divideAmong(state, rest, daughters)
-  else state.wealth[son] += rest
+  else creditHeir(state, son, rest)
 }
 
 function splitDaughterPurse(state: KinState, daughters: readonly number[], estate: number) {
   if (estate <= 0 || daughters.length === 0) return
   const eldest = oldestHeir(daughters, state.age)
   const half = Math.floor(estate / 2)
-  payHeir(eldest, half, state.sex, state.spouse, state.alive, state.wealth)
+  creditHeir(state, eldest, half)
   const others = daughters.filter((id) => id !== eldest)
-  if (others.length === 0) payHeir(eldest, estate - half, state.sex, state.spouse, state.alive, state.wealth)
+  if (others.length === 0) creditHeir(state, eldest, estate - half)
   else divideAmong(state, estate - half, others)
 }
 
@@ -1626,7 +1626,7 @@ function divideAmong(state: KinState, amount: number, heirs: readonly number[]) 
   for (const heir of heirs) {
     const extra = heir === oldest ? leftover : 0
     if (heir === oldest) leftover = 0
-    payHeir(heir, share + extra, state.sex, state.spouse, state.alive, state.wealth)
+    creditHeir(state, heir, share + extra)
   }
 }
 
@@ -1662,8 +1662,39 @@ function takePurse(state: KinState, id: number): number {
 function givePurse(state: KinState, from: number, to: number) {
   const amount = takePurse(state, from)
   if (amount <= 0) return
-  if (to >= 0) state.wealth[to] += amount
+  if (to >= 0) creditHeir(state, to, amount)
   else state.toTreasury += amount
+}
+
+/** The household a retired person lives in. Anyone else is their own heir. */
+function residenceHead(state: KinState, id: number): number {
+  if (!livingId(state, id)) return id
+  let current = id
+  const seen = new Set<number>()
+  while (state.retired[current] !== 0 && !seen.has(current)) {
+    seen.add(current)
+    const next = state.livesWith[current]
+    if (!livingId(state, next)) break
+    current = next
+  }
+  return current
+}
+
+/** Land left to a retired heir goes to the head of the household they live in, and then follows the extra-plot rule. */
+function receivePlots(state: KinState, from: readonly number[], heir: number, policy: "keep" | "spill") {
+  if (heir < 0) {
+    movePlots(state, from, -1, policy)
+    return
+  }
+  const head = residenceHead(state, heir)
+  movePlots(state, from, head, head === heir ? policy : "spill")
+}
+
+/** A retired heir's cash is paid to that same household head. A wife is still paid through her husband. */
+function creditHeir(state: KinState, heir: number, amount: number) {
+  if (amount <= 0 || heir < 0) return
+  const head = residenceHead(state, heir)
+  payHeir(head, amount, state.sex, state.spouse, state.alive, state.wealth)
 }
 
 function retireWith(state: KinState, person: number, head: number) {
@@ -1678,6 +1709,7 @@ function siblingPlotHeir(state: KinState, sibling: number): number {
     const mom = state.mother[sibling]
     if (livingId(state, mom)) return mom
   }
+  if (state.retired[sibling] !== 0) return sibling
   const mate = state.spouse[sibling]
   if (state.sex[sibling] === Sex.Female && livingId(state, mate)) return mate
   return sibling
@@ -1897,50 +1929,31 @@ function livingSiblings(dead: number, alive: Uint8Array, mother: Int32Array, fat
   return heirs
 }
 
-function divideEstate(
-  estate: number,
-  heirs: readonly number[],
-  minorsToHousehold: boolean,
-  sex: Uint8Array,
-  age: Uint8Array,
-  spouse: Int32Array,
-  alive: Uint8Array,
-  wealth: Int32Array,
-  mother: Int32Array,
-  father: Int32Array,
-) {
+function divideEstate(state: KinState, estate: number, heirs: readonly number[], minorsToHousehold: boolean) {
   const share = Math.floor(estate / heirs.length)
   let leftover = estate - share * heirs.length
-  const oldest = oldestHeir(heirs, age)
+  const oldest = oldestHeir(heirs, state.age)
   for (const heir of heirs) {
     const amount = share + (heir === oldest ? leftover : 0)
     if (heir === oldest) leftover = 0
-    if (minorsToHousehold && age[heir] < 16 && payLivingParent(heir, amount, alive, wealth, mother, father)) continue
-    payHeir(heir, amount, sex, spouse, alive, wealth)
+    if (minorsToHousehold && state.age[heir] < 16) {
+      const parent = livingParent(state, heir)
+      if (parent >= 0) {
+        creditHeir(state, parent, amount)
+        continue
+      }
+    }
+    creditHeir(state, heir, amount)
   }
 }
 
 /** A child under 16 does not keep a purse while a parent is alive. */
-function payLivingParent(
-  heir: number,
-  amount: number,
-  alive: Uint8Array,
-  wealth: Int32Array,
-  mother: Int32Array,
-  father: Int32Array,
-): boolean {
-  if (amount <= 0) return true
-  const dad = father[heir]
-  if (dad >= 0 && alive[dad] !== 0) {
-    wealth[dad] += amount
-    return true
-  }
-  const mom = mother[heir]
-  if (mom >= 0 && alive[mom] !== 0) {
-    wealth[mom] += amount
-    return true
-  }
-  return false
+function livingParent(state: KinState, heir: number): number {
+  const dad = state.father[heir]
+  if (livingId(state, dad)) return dad
+  const mom = state.mother[heir]
+  if (livingId(state, mom)) return mom
+  return -1
 }
 
 function oldestHeir(heirs: readonly number[], age: Uint8Array): number {

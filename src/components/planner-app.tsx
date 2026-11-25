@@ -1,9 +1,9 @@
 "use client"
 
-import { useEffect, useMemo, useRef, useState } from "react"
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react"
 import { BuildInfoBar, BuildingMenu, CategoryBar, type BuildCategory, type FarmDraw } from "@/components/building-bars"
 import { BuildingInspector, InspectorPanel } from "@/components/inspector-panel"
-import { LedgerPanel, type DemandSector, type LedgerId } from "@/components/ledger-panel"
+import { LedgerPanel, type DemandGroup, type LedgerId } from "@/components/ledger-panel"
 import { MapPane, type MapPaneHandle } from "@/components/map-pane"
 import { SetupPanel } from "@/components/setup-panel"
 import { WeatherIcon } from "@/components/weather-icon"
@@ -59,11 +59,11 @@ import { applyBuild, canBuild, commitSettlement, emptySettlement, structureAt, s
 import { LINEAGES, type Lineage } from "@/lib/surname-banks"
 import { applyBought, caravanLines, emptyCaravans, isOpen, laborBill, materialOrders, moveInCash, openCaps, roadLinked, staffCaravans, teamsterIds, wayTons, workCaravans, type CaravanHouse } from "@/lib/caravan"
 import { applyWorkshopBought, closedWorkshops, emptyWorkshops, materialReserve, trackWorkshops, workshopCash, workshopLabor, workshopLines, workshopOrders, type WorkshopSite } from "@/lib/workshop"
-import { chooseShopSpecialty, shopCash, shopLabor, shopLines, trackShops, type RetailSpecialty } from "@/lib/shop"
+import { chooseShopSpecialty, RETAIL_NAME, RETAIL_ORDER, shopCash, shopLabor, shopLines, trackShops } from "@/lib/shop"
 import { defaultLandSchedule, emptyHoldings, plotSalePrice, propertyLines, settleHoldings, yearlyUrbanTile, type Holding, type LandSchedule } from "@/lib/land"
 import { emptyFarms, productionLines, workFarms, type Good, type ShopSpecialty } from "@/lib/produce"
 import { assignOffices, emptyRoads, eraseRoad, idleOffices, paintRoad, projectAt, projectLines, projectOfOffice, roadCells, runRoads, supplyOrders, type RoadBook } from "@/lib/roads"
-import { beerSoldYear, caravanFee, caravanSupplies, emptyTown, familyAllowance, householdSupplyBill, livingCosts, marketLines, marketSale, operatingSupplies, rollTradingFee, townPriceRows, tradeLines, tradeMonth, tradingBill, workshopOpening, type ShipHouse } from "@/lib/trade"
+import { beerSoldYear, caravanFee, caravanSupplies, emptyTown, familyAllowance, householdSupplyBill, livingCosts, marketLines, marketSale, operatingSupplies, rollTradingFee, shopOpening, townPriceRows, tradeLines, tradeMonth, tradingBill, workshopOpening, type ShipHouse } from "@/lib/trade"
 import { runGeneration } from "@/lib/run-generation"
 import { monthWeather } from "@/lib/weather"
 import { LAYERS, type Coast, type LayerId, type MapSize, type MonthClimate, type World } from "@/lib/types"
@@ -173,16 +173,21 @@ function BarStat({
   value,
   pressed,
   onClick,
+  meter,
+  described,
 }: {
   label: string
   value: string
   pressed: boolean
   onClick: () => void
+  meter?: ReactNode
+  described?: string
 }) {
   return (
     <button
       type="button"
       aria-pressed={pressed}
+      aria-label={described}
       onClick={onClick}
       className={cn(
         "rounded-md px-1.5 py-0.5 text-left leading-tight hover:bg-muted",
@@ -192,9 +197,51 @@ function BarStat({
       <div className="text-[10px] font-medium tracking-wide text-muted-foreground uppercase">
         {label}
       </div>
-      <div className="text-sm font-medium tabular-nums">{value}</div>
+      {meter ?? <div className="text-sm font-medium tabular-nums">{value}</div>}
     </button>
   )
+}
+
+const DEMAND_BARS = [
+  { name: "Extraction", color: "#e6b800" },
+  { name: "Manufacturing", color: "#e07a1a" },
+  { name: "Retail", color: "#2c6cb5" },
+  { name: "Trade/Transport", color: "#722F37" },
+] as const
+
+/** A missing reading stays at a quarter. A real reading is its share of the tallest one, and a loss is empty. */
+function demandBarHeight(amount: number | null, peak: number): number {
+  if (amount === null) return 25
+  if (amount <= 0 || peak <= 0) return 0
+  return Math.min(100, (amount / peak) * 100)
+}
+
+function DemandMeter({ groups }: { groups: readonly DemandGroup[] }) {
+  const amounts = DEMAND_BARS.map((bar) => groups.find((group) => group.name === bar.name)?.amount ?? null)
+  const peak = Math.max(0, ...amounts.filter((amount): amount is number => amount !== null && amount > 0))
+  return (
+    <span className="mt-0.5 flex h-5 items-end gap-1" aria-hidden="true">
+      {DEMAND_BARS.map((bar, index) => {
+        const amount = amounts[index]
+        const height = demandBarHeight(amount, peak)
+        return (
+          <span
+            key={bar.name}
+            title={`${bar.name} ${amount === null ? "—" : formatMoney(amount)}`}
+            className="block w-2 rounded-sm"
+            style={{ height: `${(height / 100) * 20}px`, backgroundColor: bar.color }}
+          />
+        )
+      })}
+    </span>
+  )
+}
+
+function demandSummary(groups: readonly DemandGroup[]): string {
+  return DEMAND_BARS.map((bar) => {
+    const group = groups.find((item) => item.name === bar.name)
+    return `${bar.name} ${group?.profit ?? "—"}`
+  }).join(", ")
 }
 
 function readYear(raw: string): number | null {
@@ -392,6 +439,7 @@ export function PlannerApp() {
       ? caravanFee(caravan.crew.length, wayTons(caravan.crew.length, caravanLink), feeBill.wage, feeBill.allowance, caravanSupplies(town.feePrices ?? town.prices, caravan.crew.length, {}, true), feeBill.tile)
       : undefined
     const shipHouses = shipHousesNow(caravans, settlement.structures, holdings.rows, roads, world.size, feeBill.wage, feeBill.allowance, town.feePrices ?? town.prices, feeBill.tile)
+    const demand = demandRows(people, settlement.structures, holdings.rows, farms, town, caravans, shipHouses)
     const buildNeeds = [
       ...supplyOrders(roads, farms, settlement.structures, calendarMonth, new Set(offices.filter((office) => office.crew.length > 0).map((office) => office.structureId))),
       ...materialOrders(caravans, holdings.rows),
@@ -466,6 +514,8 @@ export function PlannerApp() {
               <BarStat
                 label="Demand"
                 value="—"
+                meter={<DemandMeter groups={demand} />}
+                described={`Demand. ${demandSummary(demand)}`}
                 pressed={ledger === "demand"}
                 onClick={() => setLedger((current) => (current === "demand" ? null : "demand"))}
               />
@@ -619,7 +669,7 @@ export function PlannerApp() {
                   structures={settlement.structures}
                   wellbeing={wellbeing}
                   lastStarvationDeaths={starvation.lastDeaths}
-                  demand={demandRows(people, settlement.structures, holdings.rows, farms, town, caravans, shipHouses)}
+                  demand={demand}
                   onClose={() => setLedger(null)}
                 />
               </div>
@@ -764,7 +814,19 @@ export function PlannerApp() {
                 foundedYear,
                 nextMonth,
               )
-              const shopPrior: Partial<Record<RetailSpecialty, number>> = {}
+              const retailOpening = shopOpening(
+                feeTown,
+                farms,
+                committed.structures,
+                step.holdings ?? holdings,
+                step.people,
+                world.months[nextMonth].low,
+                world.months.map((item) => item.low),
+                gameSeed,
+                nextYear,
+                yearlyUrbanTile(landSchedule),
+                nextMonth,
+              )
               const landStep = settleHoldings(
                 step.holdings ?? holdings,
                 committed.structures,
@@ -789,28 +851,8 @@ export function PlannerApp() {
                   },
                   shop: {
                     choose: (structure, purse) =>
-                      chooseShopSpecialty(
-                        {
-                          monthly: town.use ?? {},
-                          prices: town.prices,
-                          retail: town.retail,
-                          farms,
-                          structures: committed.structures,
-                          footprint: structure.tiles,
-                          size: world.size,
-                          stock: town.stock,
-                          prior: shopPrior,
-                        },
-                        structure.id,
-                        gameSeed,
-                        nextYear,
-                        nextMonth,
-                        purse,
-                      ),
-                    commit: (specialty) => {
-                      const kind = specialty as RetailSpecialty
-                      shopPrior[kind] = (shopPrior[kind] ?? 0) + 1
-                    },
+                      chooseShopSpecialty(retailOpening, structure.id, gameSeed, nextYear, nextMonth, purse, town.prices),
+                    commit: () => {},
                   },
                   linked: (structure) => roadLinked(structure, roads, world.size),
                   labor: (structure) => {
@@ -879,6 +921,7 @@ export function PlannerApp() {
                 new Set(staffed.offices.filter((office) => office.crew.length > 0).map((office) => office.structureId)),
                 roads,
                 foundedYear,
+                retailOpening,
               )
               const ground = worked.changedLand ? worked.feature : world.feature
               const built = runRoads(claimed, traded.farms, ground, staffed.offices, placed.structures, nextMonth, nextYear, gameSeed)
@@ -1154,36 +1197,70 @@ export function PlannerApp() {
   )
 }
 
+type DemandDraft = { name: string; profit: number | null; firms: number; saturation: string | null }
+
+function yearMean(history: readonly number[] | undefined): number | null {
+  if (!history || history.length < 12) return null
+  return Math.round(history.reduce((sum, value) => sum + value, 0) / history.length)
+}
+
+/** One row keeps its own average. Several rows weight each ready specialty by its current firms. */
+function groupProfit(rows: readonly DemandDraft[]): number | null {
+  if (rows.length === 1) return rows[0].profit
+  let weighted = 0
+  let ready = 0
+  for (const row of rows) {
+    if (row.profit === null || row.firms <= 0) continue
+    weighted += row.profit * row.firms
+    ready += row.firms
+  }
+  return ready === 0 ? null : Math.round(weighted / ready)
+}
+
+function demandGroup(name: string, rows: readonly DemandDraft[]): DemandGroup {
+  const profit = groupProfit(rows)
+  return {
+    name,
+    profit: profit === null ? "—" : formatMoney(profit),
+    amount: profit,
+    firms: String(rows.reduce((sum, row) => sum + row.firms, 0)),
+    rows: rows.map((row) => ({
+      name: row.name,
+      profit: row.profit === null ? "—" : formatMoney(row.profit),
+      firms: String(row.firms),
+      saturation: row.saturation,
+    })),
+  }
+}
+
 function demandRows(
   people: People | null,
   structures: readonly Structure[],
   rows: readonly Holding[],
-  farms: { rows: { structureId: number; specialty?: string }[] },
+  farms: { rows: { structureId: number; specialty?: string; retail?: string }[] },
   town: Parameters<typeof beerSoldYear>[0],
   caravans: readonly CaravanHouse[],
   ships: readonly ShipHouse[],
-): DemandSector[] {
+): DemandGroup[] {
   if (!people) return []
   const owned = new Set(rows.filter((row) => row.owner >= 0).map((row) => row.structureId))
   const standing = (kind: Structure["kind"]) => structures.filter((structure) => structure.kind === kind && !structure.pending && !structure.removing && owned.has(structure.id))
+  const ofSpecialty = (kind: Structure["kind"], field: "specialty" | "retail", id: string) =>
+    standing(kind).filter((structure) => farms.rows.some((row) => row.structureId === structure.id && row[field] === id))
   const crafts: { id: ShopSpecialty; name: string; firms: Structure[] }[] = [
-    { id: "sawmill", name: "Sawmill", firms: [...standing("workshop").filter((structure) => farms.rows.some((row) => row.structureId === structure.id && row.specialty === "sawmill")), ...standing("sawpit")] },
-    { id: "blacksmith", name: "Blacksmith", firms: standing("workshop").filter((structure) => farms.rows.some((row) => row.structureId === structure.id && row.specialty === "blacksmith")) },
-    { id: "smokehouse", name: "Smokehouse", firms: standing("workshop").filter((structure) => farms.rows.some((row) => row.structureId === structure.id && row.specialty === "smokehouse")) },
-    { id: "creamery", name: "Creamery", firms: standing("workshop").filter((structure) => farms.rows.some((row) => row.structureId === structure.id && row.specialty === "creamery")) },
-    { id: "brewer", name: "Brewing", firms: standing("workshop").filter((structure) => farms.rows.some((row) => row.structureId === structure.id && row.specialty === "brewer")) },
-    { id: "cooper", name: "Cooper", firms: standing("workshop").filter((structure) => farms.rows.some((row) => row.structureId === structure.id && row.specialty === "cooper")) },
-    { id: "tanner", name: "Tanner", firms: standing("workshop").filter((structure) => farms.rows.some((row) => row.structureId === structure.id && row.specialty === "tanner")) },
+    { id: "sawmill", name: "Sawmill", firms: [...ofSpecialty("workshop", "specialty", "sawmill"), ...standing("sawpit")] },
+    { id: "blacksmith", name: "Blacksmith", firms: ofSpecialty("workshop", "specialty", "blacksmith") },
+    { id: "smokehouse", name: "Smokehouse", firms: ofSpecialty("workshop", "specialty", "smokehouse") },
+    { id: "creamery", name: "Creamery", firms: ofSpecialty("workshop", "specialty", "creamery") },
+    { id: "brewer", name: "Brewing", firms: ofSpecialty("workshop", "specialty", "brewer") },
+    { id: "cooper", name: "Cooper", firms: ofSpecialty("workshop", "specialty", "cooper") },
+    { id: "tanner", name: "Tanner", firms: ofSpecialty("workshop", "specialty", "tanner") },
   ]
   const craftOwners = new Map(crafts.map((craft) => [craft.id, new Set(craft.firms.flatMap((structure) => {
     const owner = rows.find((row) => row.structureId === structure.id)?.owner
     return owner !== undefined && owner >= 0 ? [owner] : []
   }))]))
   const incomes = sectorIncomes(people, householdHomes(structures, rows), craftOwners)
-  const yearProfit = (history: readonly number[] | undefined) => {
-    if (!history || history.length < 12) return "—"
-    return formatMoney(Math.round(history.reduce((sum, value) => sum + value, 0) / history.length))
-  }
   const beer = beerSoldYear(town)
   const expected = incomes.households * 0.3 * (beer.months / 12)
   const beerSaturation = beer.months === 0 || expected <= 0 ? "—" : `${Math.round((beer.tons / expected) * 100)}%`
@@ -1197,15 +1274,23 @@ function demandRows(
     capacity += way * recent.length
   }
   const tradeSaturation = capacity <= 0 ? "—" : `${Math.round((exported / capacity) * 100)}%`
+  const manufacturing: DemandDraft[] = crafts.map((craft) => ({
+    name: craft.name,
+    profit: yearMean(town.craftProfit?.[craft.id]),
+    firms: craft.firms.length,
+    saturation: craft.id === "brewer" ? beerSaturation : null,
+  }))
+  const retail: DemandDraft[] = RETAIL_ORDER.map((id) => ({
+    name: RETAIL_NAME[id],
+    profit: yearMean(town.retailProfit?.[id]),
+    firms: ofSpecialty("shop", "retail", id).length,
+    saturation: null,
+  }))
   return [
-    { name: "Agriculture", profit: yearProfit(town.farmerProfit), firms: String(standing("farmstead").length), saturation: null },
-    { name: "Trade", profit: yearProfit(town.traderProfit), firms: String(standing("trading-post").length + standing("caravan-house").length), saturation: tradeSaturation },
-    ...crafts.map((craft) => ({
-      name: craft.name,
-      profit: yearProfit(town.craftProfit?.[craft.id]),
-      firms: String(craft.firms.length),
-      saturation: craft.id === "brewer" ? beerSaturation : null,
-    })),
+    demandGroup("Extraction", [{ name: "Agriculture", profit: yearMean(town.farmerProfit), firms: standing("farmstead").length, saturation: null }]),
+    demandGroup("Manufacturing", manufacturing),
+    demandGroup("Retail", retail),
+    demandGroup("Trade/Transport", [{ name: "Trade", profit: yearMean(town.traderProfit), firms: standing("trading-post").length + standing("caravan-house").length, saturation: tradeSaturation }]),
   ]
 }
 
